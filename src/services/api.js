@@ -33,15 +33,15 @@ function getAuthHeader() {
 }
 
 // ---------- Auth ----------
-const LOGIN_TIMEOUT_MS = 45000; // 45s for LDAP/AD which can be slow
+export async function signIn(email, password) {
+  const { data } = await api.post('/auth/login', { email, password });
+  if (data.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+  return { session: data.session, profile: data.profile };
+}
 
-/** Sign in with email (app user) or AD username (domain user). One field, backend detects which. */
-export async function signIn(identifier, password) {
-  const { data } = await api.post(
-    '/auth/login',
-    { identifier: (identifier || '').trim(), password: password || '' },
-    { timeout: LOGIN_TIMEOUT_MS }
-  );
+/** Sign in with Active Directory / LDAP (username + password). */
+export async function signInWithAD(adUsername, password) {
+  const { data } = await api.post('/auth/login', { ad_username: adUsername, password });
   if (data.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
   return { session: data.session, profile: data.profile };
 }
@@ -84,7 +84,7 @@ export async function clockIn(userId, branchId = null) {
   return data;
 }
 
-export async function clockOut(logId, totalMinutes) {
+export async function clockOut(logId) {
   const id = logId != null ? String(logId) : '';
   if (!id) throw new Error('No clock-in session to clock out');
   const { data } = await api.post('/attendance/clock-out', { log_id: id });
@@ -126,15 +126,15 @@ export async function getFlaggedStaff(filters = {}) {
   return data || [];
 }
 
-/** Daily summary: present, absent, late, on-time, no clock-out; percentages; user lists. */
+/** Daily report summary: present, absent, late, summary, daily_table. */
 export async function getDailyReportSummary(date, branchId = null) {
-  const params = { date: date.slice(0, 10) };
+  const params = { date: (date || '').toString().slice(0, 10) };
   if (branchId) params.branch_id = branchId;
   const { data } = await api.get('/reports/daily-summary', { params });
   return data;
 }
 
-/** Monthly summary: array of daily summaries + aggregate user lists. */
+/** Monthly report: executive_summary, department_summary, staff_monthly, days. */
 export async function getMonthlyReportSummary(year, month, branchId = null) {
   const params = { year, month };
   if (branchId) params.branch_id = branchId;
@@ -166,20 +166,6 @@ export async function setUserRole(userId, role) {
 
 export async function setUserActive(userId, isActive) {
   const { data } = await api.patch(`/users/${userId}/active`, { is_active: isActive });
-  return data;
-}
-
-export async function deleteUser(userId) {
-  await api.delete(`/users/${userId}`);
-}
-
-/** Bulk import users from CSV (columns: username, role). Returns { created, failed, total_rows }. */
-export async function bulkImportUsers(file) {
-  const form = new FormData();
-  form.append('file', file);
-  const { data } = await api.post('/users/bulk-import', form, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
   return data;
 }
 
@@ -255,7 +241,7 @@ export async function addHrDocument(payload) {
   return data;
 }
 
-/** Upload a file to local storage. Returns the created document. */
+/** Upload HR document (file + title). Returns created document. */
 export async function uploadHrDocument(file, title) {
   const formData = new FormData();
   formData.append('file', file);
@@ -266,7 +252,7 @@ export async function uploadHrDocument(file, title) {
   return data;
 }
 
-/** Fetch document file as blob (for download/print). */
+/** Fetch HR document file as blob for download/print. */
 export async function getHrDocumentFileBlob(documentId) {
   const token = localStorage.getItem('copedu_token');
   const res = await fetch(`${API_BASE}/hr-documents/${documentId}/file`, {

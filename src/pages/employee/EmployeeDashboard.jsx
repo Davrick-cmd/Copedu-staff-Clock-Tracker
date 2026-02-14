@@ -1,13 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { fetchTodayAttendance, doClockIn, doClockOut } from '../../store/slices/attendanceSlice';
-import { formatTime, formatDuration, formatDateTime, secondsUntilLate } from '../../utils/formatters';
+import { formatTime, formatDuration, secondsUntilLate } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { useToast } from '../../hooks/useToast';
 import * as api from '../../services/api';
-import { ROUTES } from '../../utils/constants';
 
 const WORK_START = '09:00';
 const WORK_END = '18:00';
@@ -41,7 +39,6 @@ export function EmployeeDashboard() {
   const userId = user?.id;
   const [workHours, setWorkHours] = useState({ work_start: WORK_START, work_end: WORK_END, timezone: KIGALI_TZ, late_threshold_minutes: 15 });
   const [kigaliTime, setKigaliTime] = useState('');
-  const [announcements, setAnnouncements] = useState([]);
 
   useEffect(() => {
     if (userId) dispatch(fetchTodayAttendance(userId));
@@ -49,10 +46,6 @@ export function EmployeeDashboard() {
 
   useEffect(() => {
     api.getWorkHours().then(setWorkHours).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    api.getAnnouncements(false).then(setAnnouncements).catch(() => setAnnouncements([]));
   }, []);
 
   useEffect(() => {
@@ -94,18 +87,13 @@ export function EmployeeDashboard() {
       toast('No active clock-in. Refresh the page.', 'error');
       return;
     }
-    dispatch(doClockOut({ logId: String(logId), clockInAt: todayLog.clock_in_at }))
+    dispatch(doClockOut({ logId }))
       .unwrap()
       .then(() => toast('Clocked out successfully', 'success'))
       .catch((e) => {
-        const isNetwork = !e?.response || e?.message === 'Network Error';
-        if (isNetwork) {
-          toast('Clock-out failed. Check your connection and that the server is running.', 'error');
-          return;
-        }
-        const d = e?.response?.data?.detail;
-        const msg = typeof d === 'string' ? d : Array.isArray(d) && d[0]?.msg ? d.map((x) => x.msg).join('. ') : e?.message || 'Clock-out failed';
-        toast(msg, 'error');
+        const msg = e?.response?.data?.detail ?? e?.message ?? e;
+        const text = typeof msg === 'string' ? msg : 'Clock-out failed. Try again or refresh.';
+        toast(text, 'error');
       });
   };
 
@@ -265,40 +253,6 @@ export function EmployeeDashboard() {
           </ul>
         </motion.div>
       </div>
-
-      {/* Announcements */}
-      <motion.section
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-md border border-gray-100 dark:border-gray-700 overflow-hidden"
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.2 }}
-      >
-        <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-700 flex items-center justify-between flex-wrap gap-2">
-          <h2 className="text-lg font-semibold text-gray-800 dark:text-white">Announcements</h2>
-          <Link to={ROUTES.EMPLOYEE.ANNOUNCEMENTS} className="text-sm font-medium text-primary-600 dark:text-primary-400 hover:underline">View all</Link>
-        </div>
-        <div className="p-4 space-y-4">
-          {!announcements.length ? (
-            <p className="text-gray-500 dark:text-gray-400 text-sm py-2">No announcements right now.</p>
-          ) : (
-            announcements.slice(0, 5).map((a) => (
-              <div
-                key={a.id}
-                className="rounded-lg border border-gray-100 dark:border-gray-700 bg-gray-50 dark:bg-gray-700/30 p-4"
-              >
-                <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
-                  <h3 className="font-semibold text-gray-900 dark:text-white">{a.title}</h3>
-                  <span className="text-xs text-gray-500 dark:text-gray-400">{formatDateTime(a.created_at)}</span>
-                </div>
-                <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-3">{a.body || '—'}</p>
-                {a.priority === 'high' && (
-                  <span className="inline-block mt-2 text-xs font-medium text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 px-2 py-0.5 rounded">High priority</span>
-                )}
-              </div>
-            ))
-          )}
-        </div>
-      </motion.section>
     </motion.div>
   );
 }

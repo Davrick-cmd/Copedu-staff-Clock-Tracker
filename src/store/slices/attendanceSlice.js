@@ -18,12 +18,12 @@ export const doClockIn = createAsyncThunk('attendance/clockIn', async ({ userId,
   }
 });
 
-export const doClockOut = createAsyncThunk('attendance/clockOut', async ({ logId, clockInAt }, { rejectWithValue }) => {
+export const doClockOut = createAsyncThunk('attendance/clockOut', async ({ logId }, { rejectWithValue }) => {
   try {
-    const totalMinutes = minutesBetween(clockInAt, new Date());
-    return await api.clockOut(logId, totalMinutes);
+    return await api.clockOut(logId);
   } catch (e) {
-    return rejectWithValue(e.message);
+    const msg = e.response?.data?.detail || e.message;
+    return rejectWithValue(typeof msg === 'string' ? msg : 'Clock-out failed');
   }
 });
 
