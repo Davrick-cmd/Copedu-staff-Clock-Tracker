@@ -4,6 +4,8 @@ import { motion } from 'framer-motion';
 import { fetchTodayAttendance, doClockIn, doClockOut } from '../../store/slices/attendanceSlice';
 import { formatTime, formatDuration, secondsUntilLate } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
+import { RecognitionFeed } from '../../components/RecognitionFeed';
+import { DashboardAnnouncements } from '../../components/DashboardAnnouncements';
 import { useToast } from '../../hooks/useToast';
 import * as api from '../../services/api';
 
@@ -253,6 +255,9 @@ export function EmployeeDashboard() {
           </ul>
         </motion.div>
       </div>
+
+      <DashboardAnnouncements />
+      <RecognitionFeed />
     </motion.div>
   );
 }

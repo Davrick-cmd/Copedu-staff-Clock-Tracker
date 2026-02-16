@@ -397,11 +397,19 @@ def register(req: RegisterRequest):
 def attendance_today(user_id: str = Depends(get_current_user_id)):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     with cursor() as c:
+        # Prefer today's log by date (substr works with ISO strings)
         c.execute(
-            "SELECT * FROM attendance_logs WHERE user_id = ? AND date(clock_in_at) = ? ORDER BY clock_in_at DESC LIMIT 1",
+            "SELECT * FROM attendance_logs WHERE user_id = ? AND substr(clock_in_at, 1, 10) = ? ORDER BY clock_in_at DESC LIMIT 1",
             (user_id, today),
         )
         row = c.fetchone()
+        # If no match (e.g. timezone boundary), return current open session so clock-out always has a log_id
+        if not row:
+            c.execute(
+                "SELECT * FROM attendance_logs WHERE user_id = ? AND clock_out_at IS NULL ORDER BY clock_in_at DESC LIMIT 1",
+                (user_id,),
+            )
+            row = c.fetchone()
     return row_to_dict(row)
 
 
@@ -615,6 +623,14 @@ def clock_in(req: ClockInRequest, request: Request, user_id: str = Depends(get_c
         start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         late_cutoff = start_of_day + timedelta(minutes=threshold_min)
         status = "late" if now_utc > late_cutoff else "present"
+    today_str = now_utc.strftime("%Y-%m-%d")
+    with cursor() as c:
+        c.execute(
+            "SELECT id FROM attendance_logs WHERE user_id = ? AND substr(clock_in_at, 1, 10) = ? LIMIT 1",
+            (user_id, today_str),
+        )
+        if c.fetchone():
+            raise HTTPException(status_code=400, detail="Already clocked in today")
     with cursor() as c:
         try:
             c.execute(
@@ -647,8 +663,10 @@ def clock_out(req: ClockOutRequest, user_id: str = Depends(get_current_user_id))
     row = dict(row)
     if str(row.get("user_id")) != str(user_id):
         raise HTTPException(status_code=403, detail="You can only clock out your own session")
-    out_now = datetime.utcnow()
+    out_now = datetime.now(timezone.utc)
     in_dt = _parse_iso(row.get("clock_in_at"))
+    if in_dt.tzinfo is None:
+        in_dt = in_dt.replace(tzinfo=timezone.utc)
     raw_minutes = int((out_now - in_dt).total_seconds() / 60)
     lunch_deduction = _get_lunch_deduction_minutes()
     total_minutes = max(0, raw_minutes - lunch_deduction)
@@ -1177,6 +1195,7 @@ class CreateUserRequest(BaseModel):
     full_name: str
     role: str = "employee"
     ad_username: str | None = None
+    branch_id: str | None = None
     department: str | None = None
 
 
@@ -1215,24 +1234,28 @@ def create_user(req: CreateUserRequest, current_user_id: str = Depends(get_curre
         password_hash = hash_password(req.password)
     uid = new_id()
     dept = (req.department or "").strip() or None
+    branch_id = (req.branch_id or "").strip() or None
     with cursor() as c:
         if ad_user:
             c.execute(
-                "INSERT INTO users (id, email, password_hash, full_name, role, ad_username, department) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (uid, email_val, password_hash, req.full_name.strip(), req.role, ad_user, dept),
+                "INSERT INTO users (id, email, password_hash, full_name, role, ad_username, branch_id, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (uid, email_val, password_hash, req.full_name.strip(), req.role, ad_user, branch_id, dept),
             )
         else:
             c.execute(
-                "INSERT INTO users (id, email, password_hash, full_name, role, department) VALUES (?, ?, ?, ?, ?, ?)",
-                (uid, email_val, password_hash, req.full_name.strip(), req.role, dept),
+                "INSERT INTO users (id, email, password_hash, full_name, role, branch_id, department) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (uid, email_val, password_hash, req.full_name.strip(), req.role, branch_id, dept),
             )
     with cursor() as c:
-        c.execute("SELECT * FROM users WHERE id = ?", (uid,))
+        c.execute(
+            "SELECT u.*, b.name as branch_name, b.code as branch_code FROM users u LEFT JOIN branches b ON u.branch_id = b.id WHERE u.id = ?",
+            (uid,),
+        )
         row = c.fetchone()
     d = row_to_dict(row)
     if d:
         d.pop("password_hash", None)
-        d["branches"] = {"name": None, "code": None}
+        d["branches"] = {"name": d.pop("branch_name", None), "code": d.pop("branch_code", None)}
     return d
 
 
@@ -1317,7 +1340,7 @@ def bulk_import_users(
         raise HTTPException(status_code=400, detail="CSV has no headers")
     fieldnames = [f.strip().lower() for f in (reader.fieldnames or [])]
     if "username" not in fieldnames or "role" not in fieldnames:
-        raise HTTPException(status_code=400, detail="CSV must have columns: username, role")
+        raise HTTPException(status_code=400, detail="CSV must have columns: username, role. Optional: full_name, email, department, branch")
     for row in reader:
         raw = {k.strip(): v.strip() if isinstance(v, str) else "" for k, v in row.items() if k}
         row_lower = {k.lower(): v for k, v in raw.items()}
@@ -1331,6 +1354,14 @@ def bulk_import_users(
         full_name = (row_lower.get("full_name") or raw.get("full_name") or "").strip()
         email = (row_lower.get("email") or raw.get("email") or "").strip().lower()
         department = (row_lower.get("department") or raw.get("department") or "").strip() or None
+        branch_id = None
+        branch_val = (row_lower.get("branch") or raw.get("branch") or "").strip()
+        if branch_val:
+            with cursor() as c:
+                c.execute("SELECT id FROM branches WHERE LOWER(TRIM(name)) = LOWER(?) OR LOWER(TRIM(code)) = LOWER(?) LIMIT 1", (branch_val, branch_val))
+                row_b = c.fetchone()
+                if row_b:
+                    branch_id = row_b[0]
         if not full_name or not email:
             ad_data, _ = _ldap_lookup_user(username)
             if ad_data:
@@ -1354,8 +1385,8 @@ def bulk_import_users(
             uid = new_id()
             with cursor() as c:
                 c.execute(
-                    "INSERT INTO users (id, email, password_hash, full_name, role, ad_username, department) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (uid, email, LDAP_ONLY_PASSWORD_PLACEHOLDER, full_name, role, username, department),
+                    "INSERT INTO users (id, email, password_hash, full_name, role, ad_username, branch_id, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (uid, email, LDAP_ONLY_PASSWORD_PLACEHOLDER, full_name, role, username, branch_id, department),
                 )
             created += 1
         except Exception as e:
@@ -1439,14 +1470,22 @@ def set_user_active(uid: str, req: ActiveUpdate, current_user_id: str = Depends(
 
 
 # ---------- Announcements ----------
+def _get_total_staff_count():
+    """Count active users (staff who can see announcements)."""
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+        return c.fetchone()[0]
+
+
 @app.get("/announcements")
-def list_announcements(expired: bool = False, _: str = Depends(get_current_user_id)):
+def list_announcements(expired: bool = False, user_id: str = Depends(get_current_user_id)):
     with cursor() as c:
         c.execute("""
             SELECT an.*, u.full_name as creator_name FROM announcements an
             LEFT JOIN users u ON an.created_by = u.id ORDER BY an.published_at DESC
         """)
         rows = c.fetchall()
+    total_staff = _get_total_staff_count()
     out = []
     for row in rows:
         d = row_to_dict(row)
@@ -1455,6 +1494,13 @@ def list_announcements(expired: bool = False, _: str = Depends(get_current_user_
             if not expired and d.get("expires_at"):
                 if d["expires_at"] < datetime.utcnow().isoformat():
                     continue
+            aid = d.get("id")
+            with cursor() as c:
+                c.execute("SELECT COUNT(*) FROM announcement_reads WHERE announcement_id = ?", (aid,))
+                d["acknowledged_count"] = c.fetchone()[0]
+                c.execute("SELECT 1 FROM announcement_reads WHERE announcement_id = ? AND user_id = ?", (aid, user_id))
+                d["acknowledged_by_me"] = c.fetchone() is not None
+            d["total_staff"] = total_staff
             out.append(d)
     return out
 
@@ -1464,6 +1510,7 @@ class AnnouncementCreate(BaseModel):
     body: str
     created_by: str | None = None
     priority: str = "normal"
+    deadline_at: str | None = None
 
 
 @app.post("/announcements")
@@ -1475,10 +1522,11 @@ def create_announcement(req: AnnouncementCreate, user_id: str = Depends(get_curr
         raise HTTPException(status_code=403, detail="Forbidden")
     aid = new_id()
     now = datetime.utcnow().isoformat() + "Z"
+    deadline = (req.deadline_at or "").strip() or None
     with cursor() as c:
         c.execute(
-            "INSERT INTO announcements (id, title, body, created_by, priority, published_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (aid, req.title, req.body, user_id, req.priority, now),
+            "INSERT INTO announcements (id, title, body, created_by, priority, published_at, deadline_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (aid, req.title, req.body, user_id, req.priority, now, deadline),
         )
     with cursor() as c:
         c.execute("SELECT an.*, u.full_name as creator_name FROM announcements an LEFT JOIN users u ON an.created_by = u.id WHERE an.id = ?", (aid,))
@@ -1487,6 +1535,47 @@ def create_announcement(req: AnnouncementCreate, user_id: str = Depends(get_curr
     if d:
         d["users"] = {"full_name": d.pop("creator_name", None)}
     return d
+
+
+@app.post("/announcements/{aid}/acknowledge")
+def acknowledge_announcement(aid: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT id FROM announcements WHERE id = ?", (aid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Announcement not found")
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with cursor() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO announcement_reads (announcement_id, user_id, acknowledged_at) VALUES (?, ?, ?)",
+            (aid, user_id, now_iso),
+        )
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) FROM announcement_reads WHERE announcement_id = ?", (aid,))
+        count = c.fetchone()[0]
+    total_staff = _get_total_staff_count()
+    return {"acknowledged": True, "acknowledged_count": count, "total_staff": total_staff}
+
+
+@app.get("/announcements/{aid}/read-receipts")
+def list_announcement_read_receipts(aid: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with cursor() as c:
+        c.execute("SELECT id FROM announcements WHERE id = ?", (aid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Announcement not found")
+        c.execute("""
+            SELECT ar.user_id, ar.acknowledged_at, u.full_name, u.email
+            FROM announcement_reads ar
+            JOIN users u ON ar.user_id = u.id
+            WHERE ar.announcement_id = ?
+            ORDER BY ar.acknowledged_at DESC
+        """, (aid,))
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows]
 
 
 @app.delete("/announcements/{aid}")
@@ -1566,6 +1655,190 @@ def delete_branch(bid: str, user_id: str = Depends(get_current_user_id)):
     with cursor() as c:
         c.execute("DELETE FROM branches WHERE id = ?", (bid,))
     return {"ok": True}
+
+
+# ---------- Recognitions ----------
+RECOGNITION_TYPES = ["Teamwork", "Innovation", "Customer focus", "Going the extra mile", "Leadership", "Support", "Other"]
+
+
+class RecognitionCreate(BaseModel):
+    recognition_type: str
+    message: str
+
+
+class RecognitionCommentCreate(BaseModel):
+    body: str
+
+
+@app.get("/recognitions/types")
+def list_recognition_types(_: str = Depends(get_current_user_id)):
+    return RECOGNITION_TYPES
+
+
+@app.post("/recognitions")
+def create_recognition(req: RecognitionCreate, from_user_id: str = Depends(get_current_user_id)):
+    msg = (req.message or "").strip()
+    if not msg or len(msg) > 2000:
+        raise HTTPException(status_code=400, detail="Message required (max 2000 chars)")
+    rtype = (req.recognition_type or "").strip() or "Other"
+    if rtype not in RECOGNITION_TYPES:
+        rtype = "Other"
+    rid = new_id()
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO recognitions (id, from_user_id, to_user_id, message, recognition_type, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, from_user_id, from_user_id, msg, rtype, now),
+        )
+    with cursor() as c:
+        c.execute(
+            """SELECT r.*, u1.full_name as from_name
+               FROM recognitions r
+               JOIN users u1 ON r.from_user_id = u1.id
+               WHERE r.id = ?""",
+            (rid,),
+        )
+        row = c.fetchone()
+    d = row_to_dict(row)
+    if d:
+        d["to_name"] = None
+        d["like_count"] = 0
+        d["comment_count"] = 0
+        d["liked_by_me"] = False
+    return d
+
+
+@app.get("/recognitions")
+def list_recognitions(limit: int = 50, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute(
+            """SELECT r.*, u1.full_name as from_name, u2.full_name as to_name
+               FROM recognitions r
+               JOIN users u1 ON r.from_user_id = u1.id
+               LEFT JOIN users u2 ON r.to_user_id = u2.id AND r.to_user_id != r.from_user_id
+               ORDER BY r.created_at DESC LIMIT ?""",
+            (min(limit, 100),),
+        )
+        rows = c.fetchall()
+    recs = [row_to_dict(r) for r in rows]
+    for rec in recs:
+        rec.setdefault("recognition_type", "Other")
+        rec.setdefault("to_name", None)
+    with cursor() as c:
+        for rec in recs:
+            rid = rec.get("id")
+            c.execute("SELECT COUNT(*) FROM recognition_likes WHERE recognition_id = ?", (rid,))
+            rec["like_count"] = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM recognition_comments WHERE recognition_id = ?", (rid,))
+            rec["comment_count"] = c.fetchone()[0]
+            c.execute("SELECT 1 FROM recognition_likes WHERE recognition_id = ? AND user_id = ?", (rid, user_id))
+            rec["liked_by_me"] = c.fetchone() is not None
+    return recs
+
+
+@app.post("/recognitions/{rid}/like")
+def toggle_recognition_like(rid: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT id FROM recognitions WHERE id = ?", (rid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Recognition not found")
+        c.execute("SELECT 1 FROM recognition_likes WHERE recognition_id = ? AND user_id = ?", (rid, user_id))
+        exists = c.fetchone()
+        if exists:
+            c.execute("DELETE FROM recognition_likes WHERE recognition_id = ? AND user_id = ?", (rid, user_id))
+            liked = False
+        else:
+            c.execute("INSERT INTO recognition_likes (recognition_id, user_id, created_at) VALUES (?, ?, ?)", (rid, user_id, datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")))
+            liked = True
+        c.execute("SELECT COUNT(*) FROM recognition_likes WHERE recognition_id = ?", (rid,))
+        count = c.fetchone()[0]
+    return {"liked": liked, "like_count": count}
+
+
+@app.get("/recognitions/{rid}/comments")
+def list_recognition_comments(rid: str, _: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT id FROM recognitions WHERE id = ?", (rid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Recognition not found")
+        c.execute(
+            """SELECT c.*, u.full_name as user_name
+               FROM recognition_comments c
+               JOIN users u ON c.user_id = u.id
+               WHERE c.recognition_id = ?
+               ORDER BY c.created_at ASC""",
+            (rid,),
+        )
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@app.post("/recognitions/{rid}/comments")
+def create_recognition_comment(rid: str, req: RecognitionCommentCreate, user_id: str = Depends(get_current_user_id)):
+    body = (req.body or "").strip()
+    if not body or len(body) > 1000:
+        raise HTTPException(status_code=400, detail="Comment required (max 1000 chars)")
+    with cursor() as c:
+        c.execute("SELECT id FROM recognitions WHERE id = ?", (rid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Recognition not found")
+    cid = new_id()
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO recognition_comments (id, recognition_id, user_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
+            (cid, rid, user_id, body, now),
+        )
+    with cursor() as c:
+        c.execute(
+            """SELECT c.*, u.full_name as user_name FROM recognition_comments c JOIN users u ON c.user_id = u.id WHERE c.id = ?""",
+            (cid,),
+        )
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/reports/recognitions")
+def report_recognitions(
+    limit: int = 100,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    """Recognition report for HR/Admin: counts by type, recent recognitions."""
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) FROM recognitions")
+        total_count = c.fetchone()[0]
+        c.execute(
+            """SELECT COALESCE(recognition_type, 'Other') as recognition_type, COUNT(*) as count
+               FROM recognitions GROUP BY COALESCE(recognition_type, 'Other') ORDER BY count DESC"""
+        )
+        by_type = [{"recognition_type": row[0], "count": row[1]} for row in c.fetchall()]
+        c.execute(
+            """SELECT r.id, r.recognition_type, r.message, r.created_at, u.full_name as from_name
+               FROM recognitions r JOIN users u ON r.from_user_id = u.id
+               ORDER BY r.created_at DESC LIMIT ?""",
+            (min(limit, 200),),
+        )
+        rows = c.fetchall()
+    recent = []
+    for row in rows:
+        d = row_to_dict(row)
+        if from_date and (d.get("created_at") or "")[:10] < from_date[:10]:
+            continue
+        if to_date and (d.get("created_at") or "")[:10] > to_date[:10]:
+            continue
+        with cursor() as c2:
+            c2.execute("SELECT COUNT(*) FROM recognition_likes WHERE recognition_id = ?", (d["id"],))
+            d["like_count"] = c2.fetchone()[0]
+            c2.execute("SELECT COUNT(*) FROM recognition_comments WHERE recognition_id = ?", (d["id"],))
+            d["comment_count"] = c2.fetchone()[0]
+        recent.append(d)
+    return {"total_count": total_count, "by_type": by_type, "recent": recent}
 
 
 # ---------- Audit ----------

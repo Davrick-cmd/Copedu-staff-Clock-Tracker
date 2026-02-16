@@ -7,14 +7,20 @@ import { createAuditLog } from '../../services/api';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
+import { ROLE_LABELS, ROLES, DEPARTMENTS } from '../../utils/constants';
 
 export function AdminUsers() {
   const toast = useToast();
   const { user: currentUser } = useSelector((s) => s.auth);
   const [users, setUsers] = useState([]);
+  const [branches, setBranches] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [showAddForm, setShowAddForm] = useState(false);
+  const [showBulkImport, setShowBulkImport] = useState(false);
+  const [bulkFile, setBulkFile] = useState(null);
+  const [bulkUploading, setBulkUploading] = useState(false);
+  const [bulkResult, setBulkResult] = useState(null);
   const [adLookupLoading, setAdLookupLoading] = useState(false);
   const { register, handleSubmit, reset, setValue, watch } = useForm();
 
@@ -22,6 +28,10 @@ export function AdminUsers() {
 
   useEffect(() => {
     loadUsers().finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    api.getBranches().then(setBranches).catch(() => setBranches([]));
   }, []);
 
   const fetchFromAD = () => {
@@ -63,6 +73,10 @@ export function AdminUsers() {
       full_name: (data.full_name || '').trim(),
       role: data.role || 'employee',
     };
+    const branchId = (data.branch_id || '').trim() || undefined;
+    const department = (data.department || '').trim() || undefined;
+    if (branchId) payload.branch_id = branchId;
+    if (department) payload.department = department;
     if (useAD) {
       payload.ad_username = data.ad_username.trim();
       const email = (data.email || '').trim();
@@ -106,6 +120,26 @@ export function AdminUsers() {
       .catch((e) => toast(e.response?.data?.detail || e.message || 'Update failed', 'error'));
   };
 
+  const onBulkImport = () => {
+    if (!bulkFile) {
+      toast('Choose a CSV file first', 'error');
+      return;
+    }
+    setBulkUploading(true);
+    setBulkResult(null);
+    api.bulkImportUsers(bulkFile)
+      .then((res) => {
+        setBulkResult(res);
+        if (res.created > 0) loadUsers();
+        toast(`Created ${res.created}, failed ${res.failed?.length ?? 0}`, res.failed?.length ? 'warning' : 'success');
+      })
+      .catch((e) => {
+        toast(e.response?.data?.detail || e.message || 'Bulk import failed', 'error');
+        setBulkResult(null);
+      })
+      .finally(() => { setBulkUploading(false); setBulkFile(null); });
+  };
+
   if (loading) return <div className="flex justify-center py-12"><LoadingSpinner size="lg" /></div>;
 
   return (
@@ -127,7 +161,55 @@ export function AdminUsers() {
         >
           {showAddForm ? 'Cancel' : 'Add user'}
         </button>
+        <button
+          type="button"
+          onClick={() => setShowBulkImport((v) => !v)}
+          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
+        >
+          {showBulkImport ? 'Cancel' : 'Bulk import (CSV)'}
+        </button>
       </div>
+
+      {showBulkImport && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3 max-w-lg">
+          <h2 className="font-semibold text-gray-800 dark:text-white">Bulk import users from CSV</h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            Upload a CSV with columns: <strong>username</strong> (AD sAMAccountName), <strong>role</strong> (admin, hr, employee). Optional: full_name, email, department, branch (branch name or code).
+          </p>
+          <a href="/users-bulk-import-sample.csv" download="users-bulk-import-sample.csv" className="inline-block text-sm text-primary-600 dark:text-primary-400 hover:underline">
+            Download sample CSV
+          </a>
+          <div className="flex flex-wrap gap-2 items-center">
+            <input
+              type="file"
+              accept=".csv"
+              onChange={(e) => { setBulkFile(e.target.files?.[0] || null); setBulkResult(null); }}
+              className="text-sm text-gray-700 dark:text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:bg-primary-600 file:text-white"
+            />
+            <button
+              type="button"
+              onClick={onBulkImport}
+              disabled={bulkUploading || !bulkFile}
+              className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {bulkUploading ? 'Importing…' : 'Upload & import'}
+            </button>
+          </div>
+          {bulkResult && (
+            <div className="text-sm border border-gray-200 dark:border-gray-600 rounded-lg p-3">
+              <p className="font-medium text-gray-800 dark:text-white">Created: {bulkResult.created} · Failed: {bulkResult.failed?.length ?? 0}</p>
+              {bulkResult.failed?.length > 0 && (
+                <ul className="mt-2 text-red-600 dark:text-red-400 list-disc list-inside">
+                  {bulkResult.failed.slice(0, 5).map((f, i) => (
+                    <li key={i}>{f.row?.username || 'Row'} — {f.error}</li>
+                  ))}
+                  {bulkResult.failed.length > 5 && <li>… and {bulkResult.failed.length - 5} more</li>}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {showAddForm && (
         <form onSubmit={handleSubmit(onAddUser)} className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3 max-w-md">
@@ -171,10 +253,34 @@ export function AdminUsers() {
             {...register('role')}
             className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
           >
-            <option value="employee">employee</option>
-            <option value="hr">hr</option>
-            <option value="admin">admin</option>
+            <option value="employee">{ROLE_LABELS[ROLES.EMPLOYEE]}</option>
+            <option value="hr">{ROLE_LABELS[ROLES.HR]}</option>
+            <option value="admin">{ROLE_LABELS[ROLES.ADMIN]}</option>
           </select>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Branch</label>
+            <select
+              {...register('branch_id')}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="">No branch</option>
+              {branches.map((b) => (
+                <option key={b.id} value={b.id}>{b.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Department</label>
+            <select
+              {...register('department')}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="">No department</option>
+              {DEPARTMENTS.map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+          </div>
           <button type="submit" className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">Create user</button>
         </form>
       )}
@@ -189,6 +295,8 @@ export function AdminUsers() {
                 <tr>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Email</th>
+                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Branch</th>
+                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Department</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Actions</th>
@@ -199,6 +307,8 @@ export function AdminUsers() {
                   <tr key={u.id} className="text-gray-700 dark:text-gray-300">
                     <td className="px-4 py-2">{u.full_name}</td>
                     <td className="px-4 py-2">{u.email}</td>
+                    <td className="px-4 py-2">{u.branches?.name || '—'}</td>
+                    <td className="px-4 py-2">{u.department || '—'}</td>
                     <td className="px-4 py-2">
                       <select
                         value={u.role || 'employee'}
@@ -206,9 +316,9 @@ export function AdminUsers() {
                         disabled={u.id === currentUser?.id}
                         className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-sm text-gray-900 dark:text-white"
                       >
-                        <option value="employee">employee</option>
-                        <option value="hr">hr</option>
-                        <option value="admin">admin</option>
+                        <option value="employee">{ROLE_LABELS[ROLES.EMPLOYEE]}</option>
+                        <option value="hr">{ROLE_LABELS[ROLES.HR]}</option>
+                        <option value="admin">{ROLE_LABELS[ROLES.ADMIN]}</option>
                       </select>
                     </td>
                     <td className="px-4 py-2">{u.is_active === 1 || u.is_active === true ? 'Active' : 'Inactive'}</td>

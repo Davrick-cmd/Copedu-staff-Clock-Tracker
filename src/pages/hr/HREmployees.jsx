@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import * as api from '../../services/api';
+import { ROLE_LABELS } from '../../utils/constants';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 
@@ -51,7 +52,7 @@ export function HREmployees() {
                   <tr key={u.id} className="text-gray-700 dark:text-gray-300">
                     <td className="px-4 py-2">{u.full_name}</td>
                     <td className="px-4 py-2">{u.email}</td>
-                    <td className="px-4 py-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-700">{u.role}</span></td>
+                    <td className="px-4 py-2"><span className="px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-700">{ROLE_LABELS[u.role] || u.role}</span></td>
                     <td className="px-4 py-2">{u.branches?.name || '—'}</td>
                   </tr>
                 ))}

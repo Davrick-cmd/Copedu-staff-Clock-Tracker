@@ -44,13 +44,21 @@ export function HRDocuments() {
     }
   };
 
+  /** Use stored file_path (id_originalname.ext) so download keeps correct filename and format. */
+  const getDownloadFilename = (doc) => {
+    const fp = doc.file_path;
+    if (fp && fp.includes('_')) return fp.substring(fp.indexOf('_') + 1);
+    if (fp) return fp;
+    return doc.title || 'document';
+  };
+
   const handleDownload = async (doc) => {
     try {
       const blob = await api.getHrDocumentFileBlob(doc.id);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = doc.title || 'document';
+      a.download = getDownloadFilename(doc);
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {

@@ -6,6 +6,8 @@ import * as api from '../../services/api';
 import { formatTime } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
+import { RecognitionFeed } from '../../components/RecognitionFeed';
+import { DashboardAnnouncements } from '../../components/DashboardAnnouncements';
 import { ROUTES } from '../../utils/constants';
 
 function UserListModal({ title, users, onClose }) {
@@ -146,6 +148,7 @@ export function HRDashboard() {
         </motion.div>
       </div>
 
+      <DashboardAnnouncements viewAllTo={ROUTES.HR.ANNOUNCEMENTS} />
       {modal && <UserListModal title={modal.title} users={modal.list} onClose={() => setModal(null)} />}
 
       {/* Absent today – visible list of staff who didn't clock in */}
@@ -196,6 +199,7 @@ export function HRDashboard() {
           )}
         </div>
       </div>
+      <RecognitionFeed />
     </motion.div>
   );
 }

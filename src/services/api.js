@@ -33,15 +33,16 @@ function getAuthHeader() {
 }
 
 // ---------- Auth ----------
-export async function signIn(email, password) {
-  const { data } = await api.post('/auth/login', { email, password });
+/** Login: identifier = email (app user) or AD username / UPN (domain user). Backend expects "identifier" + "password". */
+export async function signIn(identifier, password) {
+  const { data } = await api.post('/auth/login', { identifier: identifier || '', password: password || '' });
   if (data.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
   return { session: data.session, profile: data.profile };
 }
 
-/** Sign in with Active Directory / LDAP (username + password). */
+/** Sign in with Active Directory / LDAP (username + password). Same endpoint, sends identifier. */
 export async function signInWithAD(adUsername, password) {
-  const { data } = await api.post('/auth/login', { ad_username: adUsername, password });
+  const { data } = await api.post('/auth/login', { identifier: adUsername || '', password: password || '' });
   if (data.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
   return { session: data.session, profile: data.profile };
 }
@@ -169,6 +170,16 @@ export async function setUserActive(userId, isActive) {
   return data;
 }
 
+/** Bulk import users from CSV. CSV must have: username, role. Optional: full_name, email, department, branch (name or code). */
+export async function bulkImportUsers(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post('/users/bulk-import', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+}
+
 // ---------- Announcements ----------
 export async function getAnnouncements(expired = false) {
   const { data } = await api.get('/announcements', { params: { expired } });
@@ -182,6 +193,21 @@ export async function createAnnouncement(payload) {
 
 export async function deleteAnnouncement(id) {
   await api.delete(`/announcements/${id}`);
+}
+
+export async function acknowledgeAnnouncement(announcementId) {
+  const { data } = await api.post(`/announcements/${announcementId}/acknowledge`);
+  return data;
+}
+
+export async function getAnnouncementReadReceipts(announcementId) {
+  const { data } = await api.get(`/announcements/${announcementId}/read-receipts`);
+  return data || [];
+}
+
+export async function getRecognitionReport(params = {}) {
+  const { data } = await api.get('/reports/recognitions', { params: { limit: params.limit ?? 100, from_date: params.fromDate, to_date: params.toDate } });
+  return data;
 }
 
 // ---------- Branches ----------
@@ -260,6 +286,37 @@ export async function getHrDocumentFileBlob(documentId) {
   });
   if (!res.ok) throw new Error(res.statusText || 'Failed to load file');
   return res.blob();
+}
+
+// ---------- Recognitions ----------
+export async function getRecognitionTypes() {
+  const { data } = await api.get('/recognitions/types');
+  return data || [];
+}
+
+export async function getRecognitions(limit = 50) {
+  const { data } = await api.get('/recognitions', { params: { limit } });
+  return data || [];
+}
+
+export async function createRecognition(recognitionType, message) {
+  const { data } = await api.post('/recognitions', { recognition_type: recognitionType, message });
+  return data;
+}
+
+export async function toggleRecognitionLike(recognitionId) {
+  const { data } = await api.post(`/recognitions/${recognitionId}/like`);
+  return data;
+}
+
+export async function getRecognitionComments(recognitionId) {
+  const { data } = await api.get(`/recognitions/${recognitionId}/comments`);
+  return data || [];
+}
+
+export async function addRecognitionComment(recognitionId, body) {
+  const { data } = await api.post(`/recognitions/${recognitionId}/comments`, { body });
+  return data;
 }
 
 // No realtime with local DB; polling can be added in components if needed

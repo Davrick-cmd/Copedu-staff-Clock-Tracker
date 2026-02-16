@@ -38,6 +38,32 @@ def init_db():
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Seed default branches if none exist (so "Create user" can fetch them)
+        c.execute("SELECT COUNT(*) FROM branches")
+        if c.fetchone()[0] == 0:
+            import uuid
+            now = __import__("datetime").datetime.utcnow().isoformat()
+            defaults = [
+                ("HEAD OFFICE", "HO"),
+                ("NYABUGOGO", "NYA"),
+                ("CHIC", "CHIC"),
+                ("Extra br", "EXTRA"),
+                ("REMERA", "REM"),
+                ("GISOZI", "GIS"),
+                ("KIMIRONKO", "KIM"),
+                ("SIEGE", "SIEGE"),
+                ("KIGALI CITY MARKET", "KCM"),
+                ("RWAMAGANA", "RWA"),
+                ("BATSINDA", "BAT"),
+                ("KABUGA", "KAB"),
+                ("KICUKIRO_CENTER", "KIC"),
+            ]
+            for name, code in defaults:
+                bid = "branch-" + uuid.uuid4().hex[:8]
+                c.execute(
+                    "INSERT INTO branches (id, name, code, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (bid, name, code, "", now, now),
+                )
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
@@ -74,9 +100,14 @@ def init_db():
                 c.execute(f"ALTER TABLE attendance_logs ADD COLUMN {col} TEXT")
             except sqlite3.OperationalError:
                 pass
+        # One clock-in per user per calendar day. Use substr so ISO timestamps (2025-02-15T08:00:00.000Z) work.
+        try:
+            c.execute("DROP INDEX IF EXISTS idx_attendance_user_date")
+        except Exception:
+            pass
         c.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_user_date
-            ON attendance_logs(user_id, date(clock_in_at))
+            ON attendance_logs(user_id, substr(clock_in_at, 1, 10))
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS announcements (
@@ -87,8 +118,21 @@ def init_db():
                 priority TEXT DEFAULT 'normal',
                 published_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 expires_at TEXT,
+                deadline_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("PRAGMA table_info(announcements)")
+        ann_cols = [row[1] for row in c.fetchall()]
+        if "deadline_at" not in ann_cols:
+            c.execute("ALTER TABLE announcements ADD COLUMN deadline_at TEXT")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS announcement_reads (
+                announcement_id TEXT NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                acknowledged_at TEXT NOT NULL,
+                PRIMARY KEY (announcement_id, user_id)
             )
         """)
         c.execute("""
@@ -139,6 +183,38 @@ def init_db():
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_ad_username ON users(ad_username) WHERE ad_username IS NOT NULL")
         if "department" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN department TEXT")
+        # Recognitions: staff can recognize another staff (visible to all, with likes and comments)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS recognitions (
+                id TEXT PRIMARY KEY,
+                from_user_id TEXT NOT NULL REFERENCES users(id),
+                to_user_id TEXT NOT NULL REFERENCES users(id),
+                message TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS recognition_likes (
+                recognition_id TEXT NOT NULL REFERENCES recognitions(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (recognition_id, user_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS recognition_comments (
+                id TEXT PRIMARY KEY,
+                recognition_id TEXT NOT NULL REFERENCES recognitions(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                body TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # recognition_type for dropdown (Teamwork, Innovation, etc.); to_user_id becomes optional in logic
+        c.execute("PRAGMA table_info(recognitions)")
+        rec_cols = [row[1] for row in c.fetchall()]
+        if "recognition_type" not in rec_cols:
+            c.execute("ALTER TABLE recognitions ADD COLUMN recognition_type TEXT")
 
 
 def row_to_dict(row):

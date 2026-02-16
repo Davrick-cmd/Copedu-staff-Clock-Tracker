@@ -5,24 +5,27 @@ import { ROLES, ROUTES, APP_DISPLAY_NAME } from '../utils/constants';
 import { toggleTheme } from '../store/slices/uiSlice';
 import { logout } from '../store/slices/authSlice';
 
+const staffLinks = [
+  { to: ROUTES.EMPLOYEE.DASHBOARD, label: 'Dashboard' },
+  { to: ROUTES.EMPLOYEE.ATTENDANCE, label: 'My Attendance' },
+  { to: ROUTES.EMPLOYEE.ANNOUNCEMENTS, label: 'Announcements' },
+  { to: ROUTES.EMPLOYEE.DOCUMENTS, label: 'Documents' },
+];
+
 const nav = {
-  [ROLES.EMPLOYEE]: [
-    { to: ROUTES.EMPLOYEE.DASHBOARD, label: 'Dashboard' },
-    { to: ROUTES.EMPLOYEE.ATTENDANCE, label: 'My Attendance' },
-    { to: ROUTES.EMPLOYEE.ANNOUNCEMENTS, label: 'Announcements' },
-    { to: ROUTES.EMPLOYEE.DOCUMENTS, label: 'Documents' },
-    { to: ROUTES.EMPLOYEE.WELLNESS, label: 'Wellness & News' },
-  ],
+  [ROLES.EMPLOYEE]: staffLinks,
   [ROLES.HR]: [
-    { to: ROUTES.HR.DASHBOARD, label: 'Dashboard' },
+    ...staffLinks,
+    { to: ROUTES.HR.DASHBOARD, label: 'HR Dashboard' },
     { to: ROUTES.HR.EMPLOYEES, label: 'Employees' },
     { to: ROUTES.HR.REPORTS, label: 'Reports' },
     { to: ROUTES.HR.FLAGGED, label: 'Flagged Staff' },
-    { to: ROUTES.HR.ANNOUNCEMENTS, label: 'Announcements' },
-    { to: ROUTES.HR.DOCUMENTS, label: 'Documents' },
+    { to: ROUTES.HR.ANNOUNCEMENTS, label: 'HR Announcements' },
+    { to: ROUTES.HR.DOCUMENTS, label: 'HR Documents' },
   ],
   [ROLES.ADMIN]: [
-    { to: ROUTES.ADMIN.DASHBOARD, label: 'Dashboard' },
+    ...staffLinks,
+    { to: ROUTES.ADMIN.DASHBOARD, label: 'Admin Dashboard' },
     { to: ROUTES.ADMIN.USERS, label: 'Users' },
     { to: ROUTES.ADMIN.BRANCHES, label: 'Branches' },
     { to: ROUTES.ADMIN.AUDIT, label: 'Audit Log' },

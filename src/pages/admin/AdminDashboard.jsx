@@ -3,6 +3,8 @@ import { motion } from 'framer-motion';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import * as api from '../../services/api';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
+import { RecognitionFeed } from '../../components/RecognitionFeed';
+import { DashboardAnnouncements } from '../../components/DashboardAnnouncements';
 
 export function AdminDashboard() {
   const [usersCount, setUsersCount] = useState(0);
@@ -51,6 +53,8 @@ export function AdminDashboard() {
           </ResponsiveContainer>
         </div>
       )}
+      <DashboardAnnouncements />
+      <RecognitionFeed />
     </motion.div>
   );
 }

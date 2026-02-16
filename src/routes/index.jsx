@@ -10,7 +10,6 @@ import { EmployeeDashboard } from '../pages/employee/EmployeeDashboard';
 import { EmployeeAttendance } from '../pages/employee/EmployeeAttendance';
 import { EmployeeAnnouncements } from '../pages/employee/EmployeeAnnouncements';
 import { EmployeeDocuments } from '../pages/employee/EmployeeDocuments';
-import { EmployeeWellness } from '../pages/employee/EmployeeWellness';
 import { HRDashboard } from '../pages/hr/HRDashboard';
 import { HREmployees } from '../pages/hr/HREmployees';
 import { HRReports } from '../pages/hr/HRReports';
@@ -40,7 +39,6 @@ const router = createBrowserRouter([
       { path: 'employee/attendance', element: wrapRole(<EmployeeAttendance />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN]) },
       { path: 'employee/announcements', element: wrapRole(<EmployeeAnnouncements />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN]) },
       { path: 'employee/documents', element: wrapRole(<EmployeeDocuments />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN]) },
-      { path: 'employee/wellness', element: wrapRole(<EmployeeWellness />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN]) },
       { path: 'hr', element: wrapRole(<HRDashboard />, [ROLES.HR, ROLES.ADMIN]) },
       { path: 'hr/employees', element: wrapRole(<HREmployees />, [ROLES.HR, ROLES.ADMIN]) },
       { path: 'hr/reports', element: wrapRole(<HRReports />, [ROLES.HR, ROLES.ADMIN]) },

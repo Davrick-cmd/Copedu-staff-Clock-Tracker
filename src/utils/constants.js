@@ -8,6 +8,28 @@ export const ROLES = {
   EMPLOYEE: 'employee',
 };
 
+/** Display labels for roles (Admin, HR, Employee) */
+export const ROLE_LABELS = {
+  [ROLES.ADMIN]: 'Admin',
+  [ROLES.HR]: 'HR',
+  [ROLES.EMPLOYEE]: 'Employee',
+};
+
+/** Department options for user creation (dropdown) */
+export const DEPARTMENTS = [
+  'IT Department',
+  'Business Department',
+  'Operation',
+  'Human Resources',
+  'CEO offices',
+  'Executive Office',
+  'Legal',
+  'Risk & Compliance',
+  'Finance',
+  'Credit',
+  'Audit',
+];
+
 export const ROUTES = {
   LOGIN: '/login',
   EMPLOYEE: {
@@ -15,7 +37,6 @@ export const ROUTES = {
     ATTENDANCE: '/employee/attendance',
     ANNOUNCEMENTS: '/employee/announcements',
     DOCUMENTS: '/employee/documents',
-    WELLNESS: '/employee/wellness',
   },
   HR: {
     DASHBOARD: '/hr',

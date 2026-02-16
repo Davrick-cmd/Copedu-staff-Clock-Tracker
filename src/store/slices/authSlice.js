@@ -12,7 +12,9 @@ export const loadSession = createAsyncThunk('auth/loadSession', async (_, { reje
   }
 });
 
-export const login = createAsyncThunk('auth/login', async ({ identifier, password }, { rejectWithValue }) => {
+export const login = createAsyncThunk('auth/login', async (payload, { rejectWithValue }) => {
+  const identifier = payload?.identifier ?? payload?.email ?? '';
+  const password = payload?.password ?? '';
   try {
     const data = await api.signIn(identifier, password);
     return { session: data.session, profile: data.profile };

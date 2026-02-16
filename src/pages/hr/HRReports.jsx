@@ -7,7 +7,7 @@ import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
 
-const REPORT_MODE = { DAILY: 'daily', MONTHLY: 'monthly', RAW: 'raw' };
+const REPORT_MODE = { DAILY: 'daily', MONTHLY: 'monthly', RAW: 'raw', RECOGNITION: 'recognition' };
 
 function escapeCsvCell(v) {
   const s = String(v ?? '');
@@ -80,10 +80,17 @@ export function HRReports() {
   const [branchId, setBranchId] = useState('');
   const [reportType, setReportType] = useState('all');
   const [modal, setModal] = useState(null);
+  const [recognitionReport, setRecognitionReport] = useState(null);
 
   useEffect(() => {
     api.getBranches().then(setBranches).catch(() => setBranches([]));
   }, []);
+
+  useEffect(() => {
+    if (reportMode !== REPORT_MODE.RECOGNITION) return;
+    setLoading(true);
+    api.getRecognitionReport().then(setRecognitionReport).catch(() => setRecognitionReport(null)).finally(() => setLoading(false));
+  }, [reportMode]);
 
   useEffect(() => {
     if (reportMode !== REPORT_MODE.DAILY) return;
@@ -220,6 +227,7 @@ export function HRReports() {
           <option value={REPORT_MODE.DAILY}>Daily report</option>
           <option value={REPORT_MODE.MONTHLY}>Monthly report</option>
           <option value={REPORT_MODE.RAW}>Raw attendance (date range)</option>
+          <option value={REPORT_MODE.RECOGNITION}>Recognition report</option>
         </select>
         <select value={branchId} onChange={(e) => setBranchId(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white">
           <option value="">All branches</option>
@@ -488,6 +496,73 @@ export function HRReports() {
                         <td className="px-4 py-2">{formatDuration(log.total_minutes)}</td>
                         <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded text-xs ${log.status === 'late' ? 'bg-amber-100 dark:bg-amber-900/30' : 'bg-gray-100 dark:bg-gray-700'}`}>{log.status || 'present'}</span></td>
                         <td className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">{log.client_ip || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Recognition report */}
+      {reportMode === REPORT_MODE.RECOGNITION && (
+        <>
+          {loading ? (
+            <div className="flex justify-center py-8"><LoadingSpinner /></div>
+          ) : !recognitionReport ? (
+            <EmptyState title="No data" message="Could not load recognition report." />
+          ) : (
+            <div className="space-y-6">
+              <h2 className="font-semibold text-gray-800 dark:text-white">Recognition summary</h2>
+              <div className="grid gap-4 grid-cols-1 md:grid-cols-3">
+                <div className="bg-white dark:bg-gray-800 rounded-xl shadow-md border border-gray-100 dark:border-gray-700 p-4">
+                  <p className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase">Total recognitions</p>
+                  <p className="text-2xl font-bold text-primary-600 dark:text-primary-400">{recognitionReport.total_count ?? 0}</p>
+                </div>
+              </div>
+              <h2 className="font-semibold text-gray-800 dark:text-white mt-6">By type</h2>
+              <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                  <thead className="bg-gray-50 dark:bg-gray-700">
+                    <tr>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Type</th>
+                      <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Count</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                    {(recognitionReport.by_type || []).map((row, i) => (
+                      <tr key={i} className="text-gray-700 dark:text-gray-300">
+                        <td className="px-4 py-2 font-medium">{row.recognition_type || '—'}</td>
+                        <td className="px-4 py-2 text-right">{row.count ?? 0}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <h2 className="font-semibold text-gray-800 dark:text-white mt-6">Recent recognitions</h2>
+              <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                  <thead className="bg-gray-50 dark:bg-gray-700">
+                    <tr>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Date</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">From</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Type</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Message</th>
+                      <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Likes</th>
+                      <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Comments</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                    {(recognitionReport.recent || []).map((r) => (
+                      <tr key={r.id} className="text-gray-700 dark:text-gray-300 text-sm">
+                        <td className="px-4 py-2">{formatDateTime(r.created_at)}</td>
+                        <td className="px-4 py-2 font-medium">{r.from_name || '—'}</td>
+                        <td className="px-4 py-2">{r.recognition_type || '—'}</td>
+                        <td className="px-4 py-2 max-w-xs truncate">{r.message || '—'}</td>
+                        <td className="px-4 py-2 text-right">{r.like_count ?? 0}</td>
+                        <td className="px-4 py-2 text-right">{r.comment_count ?? 0}</td>
                       </tr>
                     ))}
                   </tbody>

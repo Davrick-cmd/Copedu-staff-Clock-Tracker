@@ -1,0 +1,6 @@
+username,role,full_name,email,department,branch
+dmuganga,employee,John Doe,john.doe@copeduplc.rw,IT Department,HEAD OFFICE
+jane.smith,hr,Jane Smith,jane.smith@copeduplc.rw,Human Resources,REMERA
+admin.user,admin,Admin User,admin@copeduplc.rw,CEO offices,HEAD OFFICE
+staff1,employee,,,Finance,KIGALI CITY MARKET
+staff2,employee,,,Legal,GISOZI
