@@ -5,13 +5,17 @@ Auth: JWT. All data in SQLite.
 import csv
 import io
 import ipaddress
-import ipaddress
 import json
 import logging
 import os
 import re
+import smtplib
 import sqlite3
-from datetime import datetime, timedelta, time, timezone
+import ssl
+import threading
+import time as _time
+from datetime import date, datetime, timedelta, time, timezone
+from email.message import EmailMessage
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +26,7 @@ except ImportError:
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from database import cursor, init_db, row_to_dict, get_conn
@@ -67,12 +71,16 @@ def _get_ldap_config():
     return out
 
 
-def _ldap_authenticate(username: str, password: str):
+def _escape_ldap_filter(value: str) -> str:
+    return (value or "").replace("\\", "\\5c").replace("*", "\\2a").replace("(", "\\28").replace(")", "\\29").replace("\x00", "\\00")
+
+
+def _ldap_search_and_user_bind(search_filter: str, password: str) -> tuple:
     """
-    Bind with service account, search for user by sAMAccountName, verify by binding with user DN + password.
-    Returns (True, None) on success; (False, None) on auth failure; (False, error_msg) on config/connection error.
+    Service-account search (exactly one entry), then verify password by binding as that user.
+    Returns (True, None) on success; (False, None) on wrong password / not found; (False, error_msg) on config/connection error.
     """
-    if not username or not password:
+    if not search_filter or not password:
         return False, None
     cfg = _get_ldap_config()
     if not cfg.get("ldap_enabled"):
@@ -88,8 +96,6 @@ def _ldap_authenticate(username: str, password: str):
         from ldap3 import Server, Connection, ALL, SUBTREE
     except ImportError:
         return False, "LDAP support not installed"
-    safe = (username or "").replace("\\", "\\5c").replace("*", "\\2a").replace("(", "\\28").replace(")", "\\29").replace("\x00", "\\00")
-    search_filter = f"({username_attr}={safe})"
     bases_to_try = [search_base]
     if "dc=" in search_base.lower():
         parts = [p for p in search_base.split(",") if p.strip().lower().startswith("dc=")]
@@ -111,6 +117,7 @@ def _ldap_authenticate(username: str, password: str):
                     return True, None
                 if conn.entries and len(conn.entries) > 1:
                     conn.unbind()
+                    logger.warning("LDAP auth: multiple entries for filter=%s", search_filter)
                     break
                 conn.unbind()
             except Exception as e:
@@ -123,6 +130,33 @@ def _ldap_authenticate(username: str, password: str):
         if "config" in err_msg.lower() or "bind" in err_msg.lower() or "connect" in err_msg.lower():
             return False, err_msg
         return False, None
+
+
+def _ldap_authenticate(username: str, password: str):
+    """
+    Bind with service account, search for user by sAMAccountName, verify by binding with user DN + password.
+    Returns (True, None) on success; (False, None) on auth failure; (False, error_msg) on config/connection error.
+    """
+    if not username or not password:
+        return False, None
+    cfg = _get_ldap_config()
+    if not cfg.get("ldap_enabled"):
+        return False, None
+    username_attr = (cfg.get("ldap_username_attribute") or "sAMAccountName").strip()
+    safe = _escape_ldap_filter(username)
+    search_filter = f"({username_attr}={safe})"
+    return _ldap_search_and_user_bind(search_filter, password)
+
+
+def _ldap_authenticate_by_mail_or_upn(mail_or_upn: str, password: str):
+    """Verify AD password when the user signs in with their work email or UPN (matches mail / userPrincipalName)."""
+    if not mail_or_upn or not password:
+        return False, None
+    if not _get_ldap_config().get("ldap_enabled"):
+        return False, None
+    safe = _escape_ldap_filter(mail_or_upn.strip())
+    search_filter = f"(|(mail={safe})(userPrincipalName={safe}))"
+    return _ldap_search_and_user_bind(search_filter, password)
 
 
 def _ldap_lookup_user(username: str):
@@ -148,7 +182,7 @@ def _ldap_lookup_user(username: str):
         from ldap3 import Server, Connection, ALL, SUBTREE
     except ImportError:
         return None, "LDAP support not installed (ldap3)"
-    safe = (username or "").replace("\\", "\\5c").replace("*", "\\2a").replace("(", "\\28").replace(")", "\\29").replace("\x00", "\\00")
+    safe = _escape_ldap_filter(username)
     search_filter = f"({username_attr}={safe})"
     attrs = [username_attr, name_attr, email_attr]
 
@@ -268,10 +302,90 @@ def get_current_user_id(authorization: str | None = Header(default=None, alias="
     return payload["sub"]
 
 
+def _auto_clock_out_loop():
+    """Background loop: run auto clock-out every 10 minutes."""
+    _time.sleep(60)  # wait 1 min after startup before first run
+    while True:
+        try:
+            _run_auto_clock_out_over_max_hours()
+        except Exception as e:
+            logger.warning("Auto clock-out loop error: %s", e)
+        _time.sleep(600)  # 10 minutes
+
+
+def _apply_annual_leave_days_from_env():
+    """If HR_SUITE_ANNUAL_LEAVE_DAYS is set (e.g. 28.5), set annual policy and current-year balances (overrides DB defaults)."""
+    raw = (os.getenv("HR_SUITE_ANNUAL_LEAVE_DAYS") or "").strip()
+    if not raw:
+        return
+    try:
+        d = float(raw)
+    except ValueError:
+        logger.warning("HR_SUITE_ANNUAL_LEAVE_DAYS is not a valid number: %r", raw)
+        return
+    y = datetime.utcnow().year
+    now = datetime.utcnow().isoformat()
+    try:
+        with cursor() as c:
+            c.execute("SELECT id FROM leave_types WHERE UPPER(code) = 'ANNUAL' LIMIT 1")
+            r = c.fetchone()
+            if not r:
+                return
+            lt_id = r[0]
+            c.execute(
+                "UPDATE leave_types SET default_days = ?, updated_at = ? WHERE id = ?",
+                (d, now, lt_id),
+            )
+            c.execute(
+                """
+                UPDATE leave_balances
+                SET allocated_days = ?,
+                    remaining_days = MAX(0, ? - COALESCE(used_days, 0)),
+                    updated_at = ?
+                WHERE leave_type_id = ? AND year = ?
+                """,
+                (d, d, now, lt_id, y),
+            )
+        logger.info("Applied HR_SUITE_ANNUAL_LEAVE_DAYS=%s for annual leave (year %s)", d, y)
+    except Exception as e:
+        logger.warning("HR_SUITE_ANNUAL_LEAVE_DAYS apply failed: %s", e)
+
+
 # ---------- Startup ----------
 @app.on_event("startup")
 def startup():
     init_db()
+    _apply_annual_leave_days_from_env()
+    from auth_jwt import SECRET_KEY
+    if SECRET_KEY == "change-me-in-production-use-env":
+        logger.warning("SECRET_KEY is still the default. Set SECRET_KEY in environment for production.")
+    # Auto clock-out sessions that already exceed max work hours, then run periodically
+    try:
+        _run_auto_clock_out_over_max_hours()
+    except Exception as e:
+        logger.warning("Startup auto clock-out check failed: %s", e)
+    t = threading.Thread(target=_auto_clock_out_loop, daemon=True)
+    t.start()
+    # Materialize per-user leave_balances for current year so staff are not all showing the same policy fallback.
+    try:
+        y = datetime.utcnow().year
+        with cursor() as c:
+            c.execute(
+                """
+                SELECT u.id FROM users u
+                WHERE u.is_active = 1
+                  AND u.id NOT IN (SELECT DISTINCT user_id FROM leave_balances WHERE year = ?)
+                """,
+                (y,),
+            )
+            uids = [r[0] for r in c.fetchall()]
+        for uid in uids:
+            _ensure_leave_balance_rows_for_user(uid, y)
+        if uids:
+            logger.info("Leave: backfilled balance rows for %s users (year %s)", len(uids), y)
+        _refresh_all_annual_leave_balances_for_year(y)
+    except Exception as e:
+        logger.warning("Leave balance startup backfill failed: %s", e)
 
 
 @app.get("/health")
@@ -282,6 +396,43 @@ def health():
 # ---------- Auth routes ----------
 # Placeholder hash for LDAP-only users (they never log in with password locally)
 LDAP_ONLY_PASSWORD_PLACEHOLDER = hash_password("LDAP_ONLY_NO_PASSWORD")
+
+
+SENSITIVE_EMPLOYEE_FIELDS = ("net_salary", "is_married")
+
+
+def _strip_sensitive_employee_fields(d: dict) -> None:
+    """Net salary and marital status are visible to HR and Admin only (not on self-service profile for other roles)."""
+    role = (d.get("role") or "").strip().lower()
+    if role in ("admin", "hr"):
+        return
+    for k in SENSITIVE_EMPLOYEE_FIELDS:
+        d.pop(k, None)
+
+
+def _session_profile_for_user_id(user_id: str) -> dict | None:
+    """Session profile: user row plus branch names and supervisor (manager) display name."""
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT u.*, b.name AS branch_name, b.code AS branch_code, m.full_name AS supervisor_name
+            FROM users u
+            LEFT JOIN branches b ON u.branch_id = b.id
+            LEFT JOIN users m ON u.manager_id = m.id
+            WHERE u.id = ?
+            """,
+            (user_id,),
+        )
+        row = c.fetchone()
+    if not row:
+        return None
+    user = row_to_dict(row)
+    profile = {k: v for k, v in user.items() if k != "password_hash"}
+    if "branch_name" in profile:
+        profile["branches"] = {"name": profile.pop("branch_name", None), "code": profile.pop("branch_code", None)}
+    _strip_sensitive_employee_fields(profile)
+    return profile
+
 
 def _normalize_ad_username(value: str) -> str:
     """Accept sAMAccountName (dmuganga) or UPN (dmuganga@copeduplc.rw); return part used for LDAP/DB."""
@@ -303,48 +454,83 @@ def login(req: LoginRequest):
     email_lower = identifier.lower() if looks_like_email else ""
     logger.info("Login: identifier=%r normalized_ad=%r looks_like_email=%s", identifier, normalized_ad, looks_like_email)
     user = None
-    # Path 1: Looks like email -> try find by email first
+    # Path 1: Looks like email -> find app user, then AD password (if enabled) and/or local hash
     if looks_like_email:
         with cursor() as c:
             c.execute("SELECT * FROM users WHERE LOWER(email) = ? AND is_active = 1", (email_lower,))
             row = c.fetchone()
         if row:
             user = row_to_dict(row)
-            if user.get("ad_username"):
-                # AD user (created from AD): verify with LDAP using domain password
-                cfg = _get_ldap_config()
-                if not cfg.get("ldap_enabled"):
-                    raise HTTPException(status_code=503, detail="AD login is not configured. Contact your administrator.")
-                ok, err = _ldap_authenticate(normalized_ad, password)
-                if not ok:
-                    if err:
-                        raise HTTPException(status_code=503, detail=err)
-                    raise HTTPException(status_code=401, detail="Invalid username or password")
-                logger.info("Login: AD user by email -> success")
+            cfg = _get_ldap_config()
+            ldap_enabled = bool(cfg.get("ldap_enabled"))
+            ldap_ok = False
+            last_ldap_err = None
+
+            def _record_ldap(ok: bool, err):
+                nonlocal last_ldap_err
+                if err:
+                    last_ldap_err = err
+                return ok
+
+            if ldap_enabled:
+                ad_u = (user.get("ad_username") or "").strip()
+                if ad_u:
+                    ok, err = _ldap_authenticate(ad_u, password)
+                    if _record_ldap(ok, err):
+                        ldap_ok = True
+                if not ldap_ok:
+                    ok, err = _ldap_authenticate_by_mail_or_upn(email_lower, password)
+                    if _record_ldap(ok, err):
+                        ldap_ok = True
+                if not ldap_ok and normalized_ad:
+                    if not ad_u or normalized_ad.lower() != ad_u.lower():
+                        ok, err = _ldap_authenticate(normalized_ad, password)
+                        if _record_ldap(ok, err):
+                            ldap_ok = True
+
+            local_ok = verify_password(password, user["password_hash"])
+            if ldap_ok:
+                logger.info("Login: email identifier -> AD success")
+            elif local_ok:
+                logger.info("Login: email identifier -> local password success")
             else:
-                # App user (email/password): verify stored password
-                if not verify_password(password, user["password_hash"]):
-                    raise HTTPException(status_code=401, detail="Invalid username or password")
-                logger.info("Login: app user by email -> success")
-    # Path 2: Try AD (username or UPN, or email not found)
+                if last_ldap_err:
+                    raise HTTPException(status_code=503, detail=last_ldap_err)
+                raise HTTPException(status_code=401, detail="Invalid username or password")
+    # Path 2: Username / UPN / unknown email - try AD, then match linked account
     if user is None:
         cfg = _get_ldap_config()
         if not cfg.get("ldap_enabled"):
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        ok, err = _ldap_authenticate(normalized_ad, password)
-        if not ok:
+        last_err = None
+        ok = False
+        if looks_like_email:
+            ok, err = _ldap_authenticate_by_mail_or_upn(email_lower, password)
             if err:
-                raise HTTPException(status_code=503, detail=err)
+                last_err = err
+        if not ok:
+            ok, err = _ldap_authenticate(normalized_ad, password)
+            if err:
+                last_err = err
+        if not ok:
+            if last_err:
+                raise HTTPException(status_code=503, detail=last_err)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         with cursor() as c:
             c.execute("SELECT * FROM users WHERE LOWER(ad_username) = LOWER(?) AND is_active = 1", (normalized_ad,))
             row = c.fetchone()
+        if not row and looks_like_email:
+            with cursor() as c:
+                c.execute("SELECT * FROM users WHERE LOWER(email) = ? AND is_active = 1", (email_lower,))
+                row = c.fetchone()
         if not row:
             raise HTTPException(status_code=401, detail="No account linked to this username. Ask an admin to add you.")
         user = row_to_dict(row)
-        logger.info("Login: AD user by username -> success")
+        logger.info("Login: AD user by username / mail lookup -> success")
     token = create_access_token({"sub": user["id"]})
-    profile = {k: v for k, v in user.items() if k != "password_hash"}
+    profile = _session_profile_for_user_id(user["id"])
+    if not profile:
+        raise HTTPException(status_code=401, detail="User not found")
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -355,26 +541,25 @@ def login(req: LoginRequest):
 
 @app.get("/auth/me")
 def auth_me(user_id: str = Depends(get_current_user_id)):
-    with cursor() as c:
-        c.execute(
-            "SELECT u.*, b.name as branch_name, b.code as branch_code FROM users u LEFT JOIN branches b ON u.branch_id = b.id WHERE u.id = ?",
-            (user_id,),
-        )
-        row = c.fetchone()
-    if not row:
+    profile = _session_profile_for_user_id(user_id)
+    if not profile:
         raise HTTPException(status_code=404, detail="User not found")
-    user = row_to_dict(row)
-    profile = {k: v for k, v in user.items() if k != "password_hash"}
-    if "branch_name" in profile:
-        profile["branches"] = {"name": profile.pop("branch_name", None), "code": profile.pop("branch_code", None)}
-    return {"session": {"user": {"id": user["id"], "email": user["email"]}}, "profile": profile}
+    return {
+        "session": {
+            "user": {
+                "id": profile["id"],
+                "email": profile.get("email") or profile.get("ad_username") or "",
+            },
+        },
+        "profile": profile,
+    }
 
 
 @app.post("/auth/register")
 def register(req: RegisterRequest):
     if not re.match(r"[^@]+@[^@]+\.[^@]+", req.email):
         raise HTTPException(status_code=400, detail="Invalid email")
-    if req.role not in ("admin", "hr", "employee"):
+    if req.role not in ("admin", "hr", "employee", "manager", "hod"):
         req.role = "employee"
     uid = new_id()
     with cursor() as c:
@@ -383,12 +568,9 @@ def register(req: RegisterRequest):
             (uid, req.email.strip().lower(), hash_password(req.password), req.full_name.strip(), req.role),
         )
     token = create_access_token({"sub": uid})
-    with cursor() as c:
-        c.execute("SELECT * FROM users WHERE id = ?", (uid,))
-        row = c.fetchone()
-    profile = row_to_dict(row)
-    if profile:
-        profile.pop("password_hash", None)
+    profile = _session_profile_for_user_id(uid)
+    if not profile:
+        raise HTTPException(status_code=500, detail="Could not load profile")
     return {"access_token": token, "token_type": "bearer", "session": {"user": {"id": uid, "email": req.email}}, "profile": profile}
 
 
@@ -435,6 +617,54 @@ def _get_lunch_deduction_minutes():
         except (ValueError, TypeError):
             pass
     return 60
+
+
+def _get_max_work_hours_auto_clock_out():
+    """Max hours clocked in before system auto-clocks out (e.g. 10 for 9am–6pm + 1h buffer)."""
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("max_work_hours_auto_clock_out",))
+        row = c.fetchone()
+    if row and row[0] is not None:
+        try:
+            return max(1, min(24, int(row[0]) if isinstance(row[0], int) else int(str(row[0]).strip('"'))))
+        except (ValueError, TypeError):
+            pass
+    return 10
+
+
+def _run_auto_clock_out_over_max_hours():
+    """Find any open attendance sessions that have exceeded max work hours and auto clock-out."""
+    max_hours = _get_max_work_hours_auto_clock_out()
+    lunch_deduction = _get_lunch_deduction_minutes()
+    now_utc = datetime.now(timezone.utc)
+    max_minutes = max_hours * 60
+    with cursor() as c:
+        c.execute("SELECT id, clock_in_at FROM attendance_logs WHERE clock_out_at IS NULL")
+        rows = c.fetchall()
+    for row in rows or []:
+        log_id = row[0]
+        clock_in_str = row[1]
+        if not clock_in_str:
+            continue
+        in_dt = _parse_iso(clock_in_str)
+        if in_dt.tzinfo is None:
+            in_dt = in_dt.replace(tzinfo=timezone.utc)
+        elapsed_hours = (now_utc - in_dt).total_seconds() / 3600
+        if elapsed_hours < max_hours:
+            continue
+        # Auto clock-out at exactly clock_in + max_hours (cap recorded shift)
+        out_dt = in_dt + timedelta(hours=max_hours)
+        out_iso = out_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        total_minutes = max(0, max_minutes - lunch_deduction)
+        try:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE attendance_logs SET clock_out_at = ?, total_minutes = ?, updated_at = ? WHERE id = ?",
+                    (out_iso, total_minutes, out_iso, log_id),
+                )
+            logger.info("Auto clock-out: log_id=%s exceeded %s hours", log_id, max_hours)
+        except Exception as e:
+            logger.warning("Auto clock-out failed for log_id=%s: %s", log_id, e)
 
 
 def _get_work_start_time():
@@ -573,6 +803,7 @@ def _get_clock_in_same_ip_minutes():
 
 @app.post("/attendance/clock-in")
 def clock_in(req: ClockInRequest, request: Request, user_id: str = Depends(get_current_user_id)):
+    """Clock-in: user_id is always from the auth token. Request body must not specify who clocks in (prevents buddy-punching)."""
     now_utc = datetime.utcnow()
     now_iso = now_utc.isoformat() + "Z"
     log_id = new_id()
@@ -1100,7 +1331,7 @@ def report_monthly_summary(
     from collections import defaultdict
     dept_stats = defaultdict(lambda: {"attendance_pcts": [], "absence_pcts": [], "late_pcts": []})
     for s in staff_monthly:
-        dept = s.get("department") or "—"
+        dept = s.get("department") or "-"
         dept_stats[dept]["attendance_pcts"].append(s["attendance_pct"])
         dept_stats[dept]["absence_pcts"].append(s["pct_absent"])
         dept_stats[dept]["late_pcts"].append(s["pct_late"])
@@ -1140,9 +1371,9 @@ def report_monthly_summary(
         prev_avg_late = round(prev_sum_late / prev_n, 1) if prev_n else 0
     except Exception:
         pass
-    trend_attendance = "—"
-    trend_absence = "—"
-    trend_late = "—"
+    trend_attendance = "-"
+    trend_absence = "-"
+    trend_late = "-"
     if prev_avg_absent is not None and prev_avg_late is not None:
         cur_abs = month_averages["avg_pct_absent"]
         cur_late = month_averages["avg_pct_late"]
@@ -1197,6 +1428,38 @@ class CreateUserRequest(BaseModel):
     ad_username: str | None = None
     branch_id: str | None = None
     department: str | None = None
+    manager_id: str | None = None
+    gender: str | None = None
+    phone: str | None = None
+    employee_id: str | None = None
+    employee_code: str | None = None
+    division: str | None = None
+    job_title: str | None = None
+    work_anniversary: str | None = None
+    hr_notes: str | None = None
+
+
+def _return_user_api_dict(uid: str) -> dict | None:
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT u.*, b.name as branch_name, b.code as branch_code, m.full_name as supervisor_name
+            FROM users u
+            LEFT JOIN branches b ON u.branch_id = b.id
+            LEFT JOIN users m ON u.manager_id = m.id
+            WHERE u.id = ?
+            """,
+            (uid,),
+        )
+        row = c.fetchone()
+    if not row:
+        return None
+    d = row_to_dict(row)
+    if d:
+        d.pop("password_hash", None)
+        d["branches"] = {"name": d.pop("branch_name", None), "code": d.pop("branch_code", None)}
+        d["supervisor_name"] = d.pop("supervisor_name", None)
+    return d
 
 
 @app.post("/users")
@@ -1204,9 +1467,11 @@ def create_user(req: CreateUserRequest, current_user_id: str = Depends(get_curre
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
         r = c.fetchone()
-    if not r or r[0] != "admin":
+    if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
-    if req.role not in ("admin", "hr", "employee"):
+    if r[0] == "hr" and req.role in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="HR cannot create admin or HR accounts")
+    if req.role not in ("admin", "hr", "employee", "manager", "hod"):
         req.role = "employee"
     ad_user = (req.ad_username or "").strip() or None
     email_val = (req.email or "").strip().lower() or None
@@ -1235,28 +1500,52 @@ def create_user(req: CreateUserRequest, current_user_id: str = Depends(get_curre
     uid = new_id()
     dept = (req.department or "").strip() or None
     branch_id = (req.branch_id or "").strip() or None
-    with cursor() as c:
-        if ad_user:
-            c.execute(
-                "INSERT INTO users (id, email, password_hash, full_name, role, ad_username, branch_id, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (uid, email_val, password_hash, req.full_name.strip(), req.role, ad_user, branch_id, dept),
-            )
-        else:
-            c.execute(
-                "INSERT INTO users (id, email, password_hash, full_name, role, branch_id, department) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (uid, email_val, password_hash, req.full_name.strip(), req.role, branch_id, dept),
-            )
+    manager_id = (req.manager_id or "").strip() or None
+    gender = (req.gender or "").strip() or None
+    phone = (req.phone or "").strip() or None
+    emp_id = (req.employee_id or "").strip() or None
+    emp_code = (req.employee_code or "").strip() or None
+    division = (req.division or "").strip() or None
+    job_title = (req.job_title or "").strip() or None
+    hr_notes = (req.hr_notes or "").strip() or None
+    work_anniv = (req.work_anniversary or "").strip() or None
+    if work_anniv:
+        _parse_yyyy_mm_dd(work_anniv)
+    else:
+        work_anniv = None
     with cursor() as c:
         c.execute(
-            "SELECT u.*, b.name as branch_name, b.code as branch_code FROM users u LEFT JOIN branches b ON u.branch_id = b.id WHERE u.id = ?",
-            (uid,),
+            """
+            INSERT INTO users (
+                id, email, password_hash, full_name, role, ad_username, branch_id, department, manager_id,
+                gender, phone, employee_id, employee_code, division, job_title, work_anniversary, hr_notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uid,
+                email_val,
+                password_hash,
+                req.full_name.strip(),
+                req.role,
+                ad_user,
+                branch_id,
+                dept,
+                manager_id,
+                gender,
+                phone,
+                emp_id,
+                emp_code,
+                division,
+                job_title,
+                work_anniv,
+                hr_notes,
+            ),
         )
-        row = c.fetchone()
-    d = row_to_dict(row)
-    if d:
-        d.pop("password_hash", None)
-        d["branches"] = {"name": d.pop("branch_name", None), "code": d.pop("branch_code", None)}
-    return d
+    out = _return_user_api_dict(uid)
+    if not out:
+        raise HTTPException(status_code=500, detail="Could not load new user")
+    return out
 
 
 @app.get("/users/lookup-ad")
@@ -1264,11 +1553,11 @@ def lookup_ad_user(
     username: str = Query(..., min_length=1),
     current_user_id: str = Depends(get_current_user_id),
 ):
-    """Look up a user in Active Directory by sAMAccountName. Returns full_name and email for pre-filling the create-user form. Admin only."""
+    """Look up a user in Active Directory by sAMAccountName. Returns full_name and email for pre-filling the create-user form. Admin or HR."""
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
         r = c.fetchone()
-    if not r or r[0] != "admin":
+    if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
     data, err = _ldap_lookup_user(username.strip())
     if err:
@@ -1304,6 +1593,17 @@ def delete_user(uid: str, current_user_id: str = Depends(get_current_user_id)):
         c.execute("UPDATE audit_logs SET user_id = NULL WHERE user_id = ?", (uid,))
         c.execute("UPDATE announcements SET created_by = NULL WHERE created_by = ?", (uid,))
         c.execute("UPDATE hr_documents SET uploaded_by = NULL WHERE uploaded_by = ?", (uid,))
+        c.execute("SELECT file_path FROM staff_documents WHERE user_id = ? OR uploaded_by = ?", (uid, uid))
+        for (fp,) in c.fetchall() or []:
+            if fp and "/" not in str(fp) and "\\" not in str(fp) and not str(fp).startswith(".."):
+                p = os.path.join(UPLOAD_DIR, str(fp))
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+        c.execute("DELETE FROM staff_documents WHERE user_id = ? OR uploaded_by = ?", (uid, uid))
+        c.execute("DELETE FROM notifications WHERE user_id = ?", (uid,))
         c.execute("UPDATE settings SET updated_by = NULL WHERE updated_by = ?", (uid,))
         c.execute("DELETE FROM users WHERE id = ?", (uid,))
     return {"ok": True}
@@ -1403,8 +1703,11 @@ def list_users(current_user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=403, detail="Forbidden")
     with cursor() as c:
         c.execute("""
-            SELECT u.*, b.name as branch_name, b.code as branch_code FROM users u
-            LEFT JOIN branches b ON u.branch_id = b.id ORDER BY u.full_name
+            SELECT u.*, b.name as branch_name, b.code as branch_code, m.full_name as supervisor_name
+            FROM users u
+            LEFT JOIN branches b ON u.branch_id = b.id
+            LEFT JOIN users m ON u.manager_id = m.id
+            ORDER BY u.full_name
         """)
         rows = c.fetchall()
     out = []
@@ -1413,8 +1716,21 @@ def list_users(current_user_id: str = Depends(get_current_user_id)):
         if d:
             d.pop("password_hash", None)
             d["branches"] = {"name": d.pop("branch_name", None), "code": d.pop("branch_code", None)}
+            d["supervisor_name"] = d.pop("supervisor_name", None)
             out.append(d)
     return out
+
+
+@app.get("/users/mention-list")
+def list_users_mention_list(_: str = Depends(get_current_user_id)):
+    """Minimal user list for @mentions (recognition, comments). Any authenticated user can call."""
+    with cursor() as c:
+        c.execute("""
+            SELECT id, full_name, email, is_active FROM users
+            WHERE is_active = 1 ORDER BY full_name
+        """)
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows if row_to_dict(r)]
 
 
 @app.get("/users/me/profile")
@@ -1426,6 +1742,7 @@ def get_user_profile(user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=404, detail="Not found")
     d = row_to_dict(row)
     d.pop("password_hash", None)
+    _strip_sensitive_employee_fields(d)
     return d
 
 
@@ -1452,6 +1769,414 @@ def set_user_role(uid: str, req: RoleUpdate, current_user_id: str = Depends(get_
 
 class ActiveUpdate(BaseModel):
     is_active: bool
+
+
+class SupervisorUpdate(BaseModel):
+    manager_id: str | None = None
+
+
+@app.patch("/users/{uid}/supervisor")
+def set_user_supervisor(uid: str, req: SupervisorUpdate, current_user_id: str = Depends(get_current_user_id)):
+    """HR or Admin assigns the staff's supervisor (manager_id). Used for appraisal approval chain."""
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if req.manager_id is not None:
+        with cursor() as c:
+            c.execute("SELECT id FROM users WHERE id = ?", (req.manager_id,))
+            if not c.fetchone():
+                raise HTTPException(status_code=400, detail="Supervisor user not found")
+    with cursor() as c:
+        c.execute(
+            "UPDATE users SET manager_id = ?, updated_at = ? WHERE id = ?",
+            (req.manager_id, datetime.utcnow().isoformat(), uid),
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM users WHERE id = ?", (uid,))
+        return row_to_dict(c.fetchone())
+
+
+class DepartmentUpdate(BaseModel):
+    department: str | None = None
+
+
+@app.patch("/users/{uid}/department")
+def set_user_department(uid: str, req: DepartmentUpdate, current_user_id: str = Depends(get_current_user_id)):
+    """HR or Admin sets organizational department (used in attendance and leave reports)."""
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    raw = (req.department or "").strip()
+    dept = raw if raw else None
+    if dept and len(dept) > 200:
+        raise HTTPException(status_code=400, detail="Department must be 200 characters or less")
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE id = ?", (uid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+    with cursor() as c:
+        c.execute(
+            "UPDATE users SET department = ?, updated_at = ? WHERE id = ?",
+            (dept, datetime.utcnow().isoformat(), uid),
+        )
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT u.*, b.name as branch_name, b.code as branch_code, m.full_name as supervisor_name
+            FROM users u
+            LEFT JOIN branches b ON u.branch_id = b.id
+            LEFT JOIN users m ON u.manager_id = m.id
+            WHERE u.id = ?
+            """,
+            (uid,),
+        )
+        row = c.fetchone()
+    d = row_to_dict(row)
+    if d:
+        d.pop("password_hash", None)
+        d["branches"] = {"name": d.pop("branch_name", None), "code": d.pop("branch_code", None)}
+        d["supervisor_name"] = d.pop("supervisor_name", None)
+    return d
+
+
+class SetPasswordBody(BaseModel):
+    new_password: str = Field(..., min_length=6, max_length=256)
+
+
+@app.patch("/users/{uid}/password")
+def set_user_password(uid: str, req: SetPasswordBody, current_user_id: str = Depends(get_current_user_id)):
+    """Set local (bcrypt) password so the user can sign in with email + password as well as AD if configured."""
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] != "admin":
+        raise HTTPException(status_code=403, detail="Only an admin can set user passwords")
+    new_password = (req.new_password or "").strip()
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE id = ?", (uid,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+    ph = hash_password(new_password)
+    with cursor() as c:
+        c.execute(
+            "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+            (ph, datetime.utcnow().isoformat(), uid),
+        )
+    return {"ok": True, "user_id": uid}
+
+
+class EmployeeRecordUpdate(BaseModel):
+    full_name: str | None = None
+    gender: str | None = None
+    phone: str | None = None
+    employee_id: str | None = None
+    employee_code: str | None = None
+    department: str | None = None
+    division: str | None = None
+    branch_id: str | None = None
+    manager_id: str | None = None
+    job_title: str | None = None
+    work_anniversary: str | None = None
+    hr_notes: str | None = None
+    date_of_birth: str | None = None
+    net_salary: float | None = None
+    is_married: bool | None = None
+
+
+ALLOWED_RECORD_FIELDS = frozenset({
+    "full_name",
+    "gender",
+    "phone",
+    "employee_id",
+    "employee_code",
+    "department",
+    "division",
+    "branch_id",
+    "manager_id",
+    "job_title",
+    "work_anniversary",
+    "hr_notes",
+    "date_of_birth",
+    "net_salary",
+    "is_married",
+})
+
+
+def _compute_age_stats_for_overview() -> dict:
+    """Age bands for active users with a valid date_of_birth (YYYY-MM-DD)."""
+    buckets = {"18_24": 0, "25_34": 0, "35_44": 0, "45_54": 0, "55_plus": 0}
+    labels = {"18_24": "18–24", "25_34": "25–34", "35_44": "35–44", "45_54": "45–54", "55_plus": "55+"}
+    ages: list[int] = []
+    unknown = 0
+    today = date.today()
+    try:
+        with cursor() as c:
+            c.execute("SELECT date_of_birth FROM users WHERE is_active = 1")
+            rows = c.fetchall()
+    except sqlite3.OperationalError:
+        return {
+            "buckets": buckets,
+            "bucket_labels": labels,
+            "chart_data": [{"band": labels[k], "key": k, "count": buckets[k]} for k in buckets],
+            "min": None,
+            "max": None,
+            "avg": None,
+            "known_count": 0,
+            "unknown_count": 0,
+        }
+    for (dob_raw,) in rows:
+        raw = (dob_raw or "").strip() if dob_raw else ""
+        if not raw:
+            unknown += 1
+            continue
+        try:
+            b = datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            unknown += 1
+            continue
+        y = today.year - b.year - ((today.month, today.day) < (b.month, b.day))
+        if y < 16 or y > 100:
+            unknown += 1
+            continue
+        ages.append(y)
+        if y <= 24:
+            buckets["18_24"] += 1
+        elif y <= 34:
+            buckets["25_34"] += 1
+        elif y <= 44:
+            buckets["35_44"] += 1
+        elif y <= 54:
+            buckets["45_54"] += 1
+        else:
+            buckets["55_plus"] += 1
+    known = len(ages)
+    return {
+        "buckets": buckets,
+        "bucket_labels": labels,
+        "chart_data": [{"band": labels[k], "key": k, "count": buckets[k]} for k in buckets],
+        "min": min(ages) if ages else None,
+        "max": max(ages) if ages else None,
+        "avg": round(sum(ages) / known, 1) if ages else None,
+        "known_count": known,
+        "unknown_count": unknown,
+    }
+
+
+def _upcoming_work_anniversaries(days: int = 30) -> list[dict]:
+    today = datetime.utcnow().date()
+    end = today + timedelta(days=days)
+    out: list[dict] = []
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, full_name, work_anniversary FROM users
+            WHERE is_active = 1 AND work_anniversary IS NOT NULL AND TRIM(work_anniversary) != ''
+            """
+        )
+        for row in c.fetchall():
+            d = row_to_dict(row)
+            wa = (d.get("work_anniversary") or "").strip()
+            try:
+                hire = datetime.strptime(wa[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            m, day = hire.month, hire.day
+            try:
+                next_a = datetime(today.year, m, day).date()
+            except ValueError:
+                next_a = datetime(today.year, 2, 28).date()
+            if next_a < today:
+                try:
+                    next_a = datetime(today.year + 1, m, day).date()
+                except ValueError:
+                    next_a = datetime(today.year + 1, 2, 28).date()
+            if today <= next_a <= end:
+                years = today.year - hire.year
+                if (today.month, today.day) < (hire.month, hire.day):
+                    years -= 1
+                out.append(
+                    {
+                        "user_id": d["id"],
+                        "full_name": d.get("full_name"),
+                        "work_anniversary": wa,
+                        "next_celebration_date": next_a.isoformat(),
+                        "years_of_service": max(0, years),
+                    }
+                )
+    out.sort(key=lambda x: x["next_celebration_date"])
+    return out[:40]
+
+
+@app.get("/hr/organization-overview")
+def hr_organization_overview(current_user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+        active = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE is_active = 0 OR is_active IS NULL")
+        inactive = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users")
+        total_all_users = c.fetchone()[0]
+    by_dept: list[dict] = []
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT TRIM(COALESCE(department, '')) AS d, COUNT(*) AS n
+            FROM users WHERE is_active = 1
+            GROUP BY d ORDER BY n DESC, d COLLATE NOCASE
+            """
+        )
+        for row in c.fetchall():
+            label = row[0] if row[0] else "(Unassigned)"
+            by_dept.append({"department": label, "count": row[1]})
+    by_branch: list[dict] = []
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT u.branch_id, b.name, b.code, COUNT(*) AS n
+            FROM users u
+            LEFT JOIN branches b ON u.branch_id = b.id
+            WHERE u.is_active = 1
+            GROUP BY u.branch_id, b.name, b.code
+            ORDER BY n DESC
+            """
+        )
+        for row in c.fetchall():
+            by_branch.append(
+                {
+                    "branch_id": row[0],
+                    "branch_name": row[1],
+                    "branch_code": row[2],
+                    "count": row[3],
+                }
+            )
+    gender_counts = {"female": 0, "male": 0, "other": 0, "prefer_not_say": 0, "unset": 0}
+    with cursor() as c:
+        c.execute("SELECT LOWER(TRIM(COALESCE(gender, ''))) FROM users WHERE is_active = 1")
+        for (g,) in c.fetchall():
+            if not g:
+                gender_counts["unset"] += 1
+            elif g in gender_counts:
+                gender_counts[g] += 1
+            else:
+                gender_counts["other"] += 1
+    age_stats = _compute_age_stats_for_overview()
+    women = gender_counts.get("female", 0)
+    men = gender_counts.get("male", 0)
+    other_gender = (
+        gender_counts.get("other", 0)
+        + gender_counts.get("prefer_not_say", 0)
+        + gender_counts.get("unset", 0)
+    )
+    return {
+        "active_employees": active,
+        "inactive_accounts": inactive,
+        "total_users": total_all_users,
+        "no_longer_active": inactive,
+        "by_department": by_dept,
+        "by_branch": by_branch,
+        "gender_counts": gender_counts,
+        "women_men": {
+            "women": women,
+            "men": men,
+            "other_or_not_set": other_gender,
+        },
+        "age_stats": age_stats,
+        "upcoming_anniversaries": _upcoming_work_anniversaries(30),
+    }
+
+
+@app.patch("/users/{uid}/record")
+def patch_user_record(uid: str, req: EmployeeRecordUpdate, current_user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    raw = req.model_dump(exclude_unset=True)
+    updates: dict = {}
+    for k, v in raw.items():
+        if k not in ALLOWED_RECORD_FIELDS:
+            continue
+        if isinstance(v, str):
+            stripped = v.strip()
+            updates[k] = None if stripped == "" else stripped
+        else:
+            updates[k] = v
+    if "work_anniversary" in updates and updates["work_anniversary"] is not None:
+        _parse_yyyy_mm_dd(updates["work_anniversary"])
+    if "date_of_birth" in updates and updates["date_of_birth"] is not None:
+        _parse_yyyy_mm_dd(updates["date_of_birth"])
+    if "net_salary" in updates:
+        ns = updates["net_salary"]
+        if ns is not None:
+            try:
+                fv = float(ns)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid net salary")
+            if fv < 0:
+                raise HTTPException(status_code=400, detail="Net salary cannot be negative")
+            updates["net_salary"] = fv
+    if "is_married" in updates:
+        im = updates["is_married"]
+        if im is None:
+            pass
+        else:
+            updates["is_married"] = 1 if bool(im) else 0
+    if "branch_id" in updates:
+        bid = updates["branch_id"]
+        if bid is not None:
+            with cursor() as c:
+                c.execute("SELECT id FROM branches WHERE id = ?", (bid,))
+                if not c.fetchone():
+                    raise HTTPException(status_code=400, detail="Branch not found")
+    if "manager_id" in updates:
+        mid = updates["manager_id"]
+        if mid is not None:
+            if mid == uid:
+                raise HTTPException(status_code=400, detail="Cannot assign self as supervisor")
+            with cursor() as c:
+                c.execute("SELECT id FROM users WHERE id = ?", (mid,))
+                if not c.fetchone():
+                    raise HTTPException(status_code=400, detail="Supervisor not found")
+    if "full_name" in updates:
+        fn = updates["full_name"]
+        if fn is None or (isinstance(fn, str) and not fn.strip()):
+            raise HTTPException(status_code=400, detail="Full name cannot be empty")
+        if isinstance(fn, str):
+            updates["full_name"] = fn.strip()
+    if "department" in updates and updates["department"] is not None and len(updates["department"]) > 200:
+        raise HTTPException(status_code=400, detail="Department must be 200 characters or less")
+    if not updates:
+        out = _return_user_api_dict(uid)
+        if not out:
+            raise HTTPException(status_code=404, detail="User not found")
+        return out
+    sets = []
+    params: list = []
+    for k, v in updates.items():
+        sets.append(f"{k} = ?")
+        params.append(v)
+    params.append(datetime.utcnow().isoformat())
+    params.append(uid)
+    with cursor() as c:
+        c.execute(f"UPDATE users SET {', '.join(sets)}, updated_at = ? WHERE id = ?", tuple(params))
+        if c.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+    out = _return_user_api_dict(uid)
+    if not out:
+        raise HTTPException(status_code=404, detail="User not found")
+    return out
 
 
 @app.patch("/users/{uid}/active")
@@ -1920,6 +2645,1443 @@ def set_setting(req: SettingUpdate, user_id: str = Depends(get_current_user_id))
     return {"ok": True}
 
 
+# ---------- Appraisal module ----------
+def _appraisal_user_role(user_id: str) -> str:
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        r = c.fetchone()
+    return (r[0] or "employee") if r else "employee"
+
+
+def _appraisal_require_roles(user_id: str, allowed: list):
+    role = _appraisal_user_role(user_id)
+    if role not in allowed:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return role
+
+
+def _appraisal_active_cycle():
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
+        return row_to_dict(c.fetchone())
+
+
+def _appraisal_log(ref_type: str, ref_id: str, action: str, from_user_id: str, from_role: str, to_role: str | None = None):
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO workflow_logs (id, reference_type, reference_id, action, from_user_id, from_role, to_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (new_id(), ref_type, ref_id, action, from_user_id, from_role, to_role, datetime.utcnow().isoformat() + "Z"),
+        )
+
+
+class AppraisalCycleCreate(BaseModel):
+    type: str  # annual | quarterly
+    year: int
+    quarter: str | None = None  # Q1-Q4 for quarterly
+    start_date: str
+    end_date: str
+    status: str = "draft"
+
+
+class AppraisalCycleUpdate(BaseModel):
+    type: str | None = None
+    year: int | None = None
+    quarter: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    status: str | None = None
+
+
+@app.get("/appraisal/cycles")
+def appraisal_list_cycles(user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles ORDER BY year DESC, quarter DESC, created_at DESC")
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows if row_to_dict(r)]
+
+
+@app.post("/appraisal/cycles")
+def appraisal_create_cycle(req: AppraisalCycleCreate, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    if req.type not in ("annual", "quarterly"):
+        raise HTTPException(status_code=400, detail="Type must be annual or quarterly")
+    if req.type == "quarterly" and (not req.quarter or req.quarter not in ("Q1", "Q2", "Q3", "Q4")):
+        raise HTTPException(status_code=400, detail="Quarter required for quarterly (Q1-Q4)")
+    if req.status not in ("draft", "active", "closed"):
+        req = req.model_copy(update={"status": "draft"})
+    if req.status == "active":
+        with cursor() as c:
+            c.execute("SELECT id FROM appraisal_cycles WHERE status = 'active' LIMIT 1")
+            if c.fetchone():
+                raise HTTPException(status_code=400, detail="Only one active cycle allowed. Close the current active cycle first.")
+    cid = new_id()
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO appraisal_cycles (id, type, year, quarter, start_date, end_date, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (cid, req.type, req.year, req.quarter, req.start_date, req.end_date, getattr(req, "status", "draft"), datetime.utcnow().isoformat(), datetime.utcnow().isoformat()),
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/cycles/{cycle_id}")
+def appraisal_get_cycle(cycle_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cycle_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Cycle not found")
+    return row_to_dict(row)
+
+
+@app.patch("/appraisal/cycles/{cycle_id}")
+def appraisal_update_cycle(cycle_id: str, req: AppraisalCycleUpdate, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cycle_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Cycle not found")
+    d = row_to_dict(row)
+    updates = {}
+    if req.type is not None:
+        updates["type"] = req.type
+    if req.year is not None:
+        updates["year"] = req.year
+    if req.quarter is not None:
+        updates["quarter"] = req.quarter
+    if req.start_date is not None:
+        updates["start_date"] = req.start_date
+    if req.end_date is not None:
+        updates["end_date"] = req.end_date
+    if req.status is not None:
+        if req.status == "active":
+            with cursor() as c:
+                c.execute("SELECT id FROM appraisal_cycles WHERE status = 'active' AND id != ?", (cycle_id,))
+                if c.fetchone():
+                    raise HTTPException(status_code=400, detail="Only one active cycle allowed")
+        updates["status"] = req.status
+    if not updates:
+        return d
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with cursor() as c:
+        c.execute(f"UPDATE appraisal_cycles SET {set_clause} WHERE id = ?", (*updates.values(), cycle_id))
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cycle_id,))
+        return row_to_dict(c.fetchone())
+
+
+# KPIs
+class KPICreate(BaseModel):
+    cycle_id: str
+    title: str
+    description: str | None = None
+    target: str | None = None
+    weight: float | None = None
+
+
+class KPIUpdate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    target: str | None = None
+    weight: float | None = None
+
+
+@app.get("/appraisal/cycles/{cycle_id}/kpis")
+def appraisal_list_kpis(cycle_id: str, user_id: str = Depends(get_current_user_id)):
+    role = _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cycle_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Cycle not found")
+    with cursor() as c:
+        if role in ("admin", "hr"):
+            c.execute("SELECT k.*, u.full_name as user_name FROM kpis k LEFT JOIN users u ON k.user_id = u.id WHERE k.cycle_id = ? ORDER BY u.full_name, k.created_at", (cycle_id,))
+        else:
+            c.execute("SELECT k.*, u.full_name as user_name FROM kpis k LEFT JOIN users u ON k.user_id = u.id WHERE k.cycle_id = ? AND k.user_id = ? ORDER BY k.created_at", (cycle_id, user_id))
+        rows = c.fetchall()
+    out = []
+    for row in rows:
+        d = row_to_dict(row)
+        if d:
+            d["user_name"] = d.pop("user_name", None)
+            out.append(d)
+    return out
+
+
+@app.post("/appraisal/kpis")
+def appraisal_create_kpi(req: KPICreate, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "employee", "manager", "hod"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ? AND status IN ('active', 'draft')", (req.cycle_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=400, detail="Cycle not found or not open for KPIs")
+    kid = new_id()
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO kpis (id, user_id, cycle_id, title, description, target, weight, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)",
+            (kid, user_id, req.cycle_id, req.title.strip(), (req.description or "").strip() or None, (req.target or "").strip() or None, req.weight, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()),
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/kpis/{kpi_id}")
+def appraisal_get_kpi(kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT k.*, u.full_name as user_name FROM kpis k LEFT JOIN users u ON k.user_id = u.id WHERE k.id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    d = row_to_dict(row)
+    if d:
+        d["user_name"] = d.pop("user_name", None)
+    return d
+
+
+@app.patch("/appraisal/kpis/{kpi_id}")
+def appraisal_update_kpi(kpi_id: str, req: KPIUpdate, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    r = dict(row)
+    if str(r["user_id"]) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr"])
+    status = r.get("status") or "draft"
+    if status not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="Cannot edit KPI in current status")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        return row_to_dict(row)
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with cursor() as c:
+        c.execute(f"UPDATE kpis SET {set_clause} WHERE id = ?", (*updates.values(), kpi_id))
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/kpis/{kpi_id}/submit")
+def appraisal_submit_kpi(kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    r = dict(row)
+    if str(r["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if r.get("status") not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="KPI already submitted or beyond")
+    now = datetime.utcnow().isoformat()
+    owner = str(r["user_id"])
+    first = _get_staff_manager_id(owner)
+    if not first:
+        with cursor() as c:
+            c.execute(
+                "UPDATE kpis SET status = 'verified', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                (now, kpi_id),
+            )
+        _appraisal_log("kpi", kpi_id, "submitted_no_supervisor", user_id, _appraisal_user_role(user_id), None)
+    else:
+        with cursor() as c:
+            c.execute(
+                "UPDATE kpis SET status = 'pending_supervisor', current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (first, now, kpi_id),
+            )
+        _appraisal_log("kpi", kpi_id, "submitted", user_id, _appraisal_user_role(user_id), "supervisor")
+        try:
+            _notify_manager_appraisal_submitted(first, owner, "KPI")
+        except Exception as ex:
+            logger.warning("KPI submit supervisor notify failed: %s", ex)
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+class ReturnComment(BaseModel):
+    comment: str
+
+
+class SupervisorReviewBody(BaseModel):
+    """Required comment when a supervisor completes a review step (forwards in chain or finishes chain)."""
+    comment: str = Field(..., min_length=1)
+
+
+@app.post("/appraisal/kpis/{kpi_id}/return")
+def appraisal_return_kpi(kpi_id: str, req: ReturnComment, user_id: str = Depends(get_current_user_id)):
+    role = _appraisal_user_role(user_id)
+    if role not in ("admin", "hr", "manager", "hod", "employee"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not (req.comment or req.comment.strip()):
+        raise HTTPException(status_code=400, detail="Comment required when returning")
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    r = dict(row)
+    status = r.get("status") or ""
+    cur = (r.get("current_approver_id") or "").strip()
+    if status == "pending_supervisor":
+        if role not in ("admin", "hr") and str(user_id).strip() != cur:
+            raise HTTPException(status_code=403, detail="Only the current supervisor in the chain can return this KPI now")
+    elif status == "verified":
+        if role not in ("hod", "admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only HOD or HR can return a KPI at this stage")
+    else:
+        raise HTTPException(status_code=400, detail="This KPI cannot be returned in its current status")
+    with cursor() as c:
+        c.execute(
+            "UPDATE kpis SET status = 'returned', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), kpi_id),
+        )
+    wid = new_id()
+    with cursor() as c:
+        c.execute("INSERT INTO workflow_comments (id, reference_type, reference_id, from_user_id, from_role, comment, created_at) VALUES (?, 'kpi', ?, ?, ?, ?, ?)", (wid, kpi_id, user_id, role, req.comment.strip(), datetime.utcnow().isoformat() + "Z"))
+    _appraisal_log("kpi", kpi_id, "returned", user_id, role, "staff")
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/kpis/{kpi_id}/verify")
+def appraisal_verify_kpi(kpi_id: str, req: SupervisorReviewBody, user_id: str = Depends(get_current_user_id)):
+    """Supervisor chain: direct manager first, then each manager's manager, each step requires a comment (same order as leave approvals)."""
+    role = _appraisal_user_role(user_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    r = dict(row)
+    if (r.get("status") or "") != "pending_supervisor":
+        raise HTTPException(status_code=400, detail="This KPI is not waiting on a supervisor review step")
+    cur = (r.get("current_approver_id") or "").strip()
+    owner = str(r["user_id"])
+    if role not in ("admin", "hr") and str(user_id).strip() != cur:
+        raise HTTPException(status_code=403, detail="Only the assigned supervisor can complete this review step")
+    comment = (req.comment or "").strip()
+    wid = new_id()
+    now = datetime.utcnow().isoformat() + "Z"
+    fr = role
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO workflow_comments (id, reference_type, reference_id, from_user_id, from_role, comment, created_at) VALUES (?, 'kpi', ?, ?, ?, ?, ?)",
+            (wid, kpi_id, user_id, fr, comment, now),
+        )
+    next_id = _next_leave_approver_after_step(user_id, owner)
+    if next_id:
+        with cursor() as c:
+            c.execute(
+                "UPDATE kpis SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (next_id, datetime.utcnow().isoformat(), kpi_id),
+            )
+        _appraisal_log("kpi", kpi_id, "supervisor_step", user_id, fr, "next_supervisor")
+        try:
+            _notify_manager_appraisal_submitted(next_id, owner, "KPI (next reviewer)")
+        except Exception as ex:
+            logger.warning("KPI chain notify failed: %s", ex)
+    else:
+        with cursor() as c:
+            c.execute(
+                "UPDATE kpis SET status = 'verified', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), kpi_id),
+            )
+        _appraisal_log("kpi", kpi_id, "supervisor_chain_complete", user_id, fr, "hod")
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/kpis/{kpi_id}/approve")
+def appraisal_approve_kpi(kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod"])
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    if (row["status"] or "") != "verified":
+        raise HTTPException(status_code=400, detail="Only verified KPIs can be approved")
+    with cursor() as c:
+        c.execute("UPDATE kpis SET status = 'approved', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), kpi_id))
+    _appraisal_log("kpi", kpi_id, "approved", user_id, _appraisal_user_role(user_id), "hr")
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/kpis/{kpi_id}/receive")
+def appraisal_receive_kpi(kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    if (row["status"] or "") != "approved":
+        raise HTTPException(status_code=400, detail="Only approved KPIs can be received")
+    with cursor() as c:
+        c.execute("UPDATE kpis SET status = 'received', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), kpi_id))
+    _appraisal_log("kpi", kpi_id, "received", user_id, _appraisal_user_role(user_id), "staff")
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/kpis/{kpi_id}/acknowledge")
+def appraisal_acknowledge_kpi(kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI not found")
+    if str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (row["status"] or "") != "received":
+        raise HTTPException(status_code=400, detail="Only received KPIs can be acknowledged")
+    with cursor() as c:
+        c.execute("UPDATE kpis SET status = 'acknowledged', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), kpi_id))
+    aid = new_id()
+    now = datetime.utcnow().isoformat() + "Z"
+    with cursor() as c:
+        c.execute("INSERT INTO acknowledgements (id, reference_type, reference_id, user_id, acknowledged_at, created_at) VALUES (?, 'kpi', ?, ?, ?, ?)", (aid, kpi_id, user_id, now, now))
+    _appraisal_log("kpi", kpi_id, "acknowledged", user_id, _appraisal_user_role(user_id), None)
+    with cursor() as c:
+        c.execute("SELECT * FROM kpis WHERE id = ?", (kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/kpis/{kpi_id}/workflow")
+def appraisal_kpi_workflow(kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM workflow_logs WHERE reference_type = 'kpi' AND reference_id = ? ORDER BY created_at", (kpi_id,))
+        logs = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+        c.execute("SELECT * FROM workflow_comments WHERE reference_type = 'kpi' AND reference_id = ? ORDER BY created_at", (kpi_id,))
+        comments = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    return {"logs": logs, "comments": comments}
+
+
+# Appraisals (self-assessment)
+class AppraisalCreate(BaseModel):
+    cycle_id: str
+    achievements: str | None = None
+    challenges: str | None = None
+    overall_comments: str | None = None
+
+
+class AppraisalUpdate(BaseModel):
+    achievements: str | None = None
+    challenges: str | None = None
+    overall_comments: str | None = None
+
+
+class AppraisalKpiAssessment(BaseModel):
+    kpi_id: str
+    self_assessment: str | None = None
+
+
+class AppraisalScoreUpdate(BaseModel):
+    self_score: float | None = None
+    self_comment: str | None = None
+    supervisor_score: float | None = None
+    supervisor_comment: str | None = None
+    agreed_score: float | None = None
+    hod_comment: str | None = None
+
+
+@app.get("/appraisal/cycles/{cycle_id}/appraisals")
+def appraisal_list_appraisals(cycle_id: str, user_id: str = Depends(get_current_user_id)):
+    role = _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cycle_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Cycle not found")
+    with cursor() as c:
+        if role in ("admin", "hr"):
+            c.execute("SELECT a.*, u.full_name as user_name FROM appraisals a LEFT JOIN users u ON a.user_id = u.id WHERE a.cycle_id = ? ORDER BY u.full_name", (cycle_id,))
+        else:
+            c.execute("SELECT a.*, u.full_name as user_name FROM appraisals a LEFT JOIN users u ON a.user_id = u.id WHERE a.cycle_id = ? AND a.user_id = ?", (cycle_id, user_id))
+        rows = c.fetchall()
+    out = []
+    for row in rows:
+        d = row_to_dict(row)
+        if d:
+            d["user_name"] = d.pop("user_name", None)
+            out.append(d)
+    return out
+
+
+@app.post("/appraisal/appraisals")
+def appraisal_create_appraisal(req: AppraisalCreate, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "employee", "manager", "hod"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE id = ? AND status IN ('active', 'draft')", (req.cycle_id,))
+        cycle = c.fetchone()
+    if not cycle:
+        raise HTTPException(status_code=400, detail="Cycle not found or not open")
+    with cursor() as c:
+        c.execute("SELECT id FROM appraisals WHERE user_id = ? AND cycle_id = ?", (user_id, req.cycle_id))
+        if c.fetchone():
+            raise HTTPException(status_code=400, detail="Appraisal already exists for this cycle")
+    aid = new_id()
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO appraisals (id, user_id, cycle_id, status, achievements, challenges, overall_comments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (aid, user_id, req.cycle_id, "draft", req.achievements or "", req.challenges or "", req.overall_comments or "", now, now),
+        )
+    # Seed appraisal_scores from locked annual KPIs when cycle has a quarter (quarterly appraisal)
+    cycle_year = cycle["year"]
+    cycle_quarter = cycle.get("quarter")
+    if cycle_quarter:
+        with cursor() as c:
+            c.execute("SELECT id FROM appraisal_annual_kpis WHERE user_id = ? AND year = ? AND status = 'locked'", (user_id, cycle_year))
+            annual_row = c.fetchone()
+        if annual_row:
+            with cursor() as c:
+                c.execute(
+                    "SELECT i.id FROM appraisal_kpi_items i JOIN appraisal_kpi_titles t ON i.kpi_title_id = t.id WHERE t.annual_kpi_id = ? ORDER BY t.sort_order, t.created_at, i.sort_order, i.created_at",
+                    (annual_row["id"],),
+                )
+                item_ids = [r["id"] for r in c.fetchall()]
+            for kpi_item_id in item_ids:
+                sid = new_id()
+                with cursor() as c:
+                    c.execute(
+                        "INSERT INTO appraisal_scores (id, appraisal_id, kpi_item_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        (sid, aid, kpi_item_id, now, now),
+                    )
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (aid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/appraisals/{appraisal_id}")
+def appraisal_get_appraisal(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT a.*, u.full_name as user_name FROM appraisals a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    d = row_to_dict(row)
+    if d:
+        d["user_name"] = d.pop("user_name", None)
+        with cursor() as c2:
+            c2.execute("SELECT * FROM appraisal_kpi_assessments WHERE appraisal_id = ?", (appraisal_id,))
+            d["assessments"] = [row_to_dict(r) for r in c2.fetchall() if row_to_dict(r)]
+        with cursor() as c2:
+            c2.execute(
+                "SELECT s.*, i.description, i.weight, i.target FROM appraisal_scores s JOIN appraisal_kpi_items i ON s.kpi_item_id = i.id WHERE s.appraisal_id = ? ORDER BY i.sort_order, i.created_at",
+                (appraisal_id,),
+            )
+            d["scores"] = [row_to_dict(r) for r in c2.fetchall() if row_to_dict(r)]
+    return d
+
+
+@app.patch("/appraisal/appraisals/{appraisal_id}/scores/{kpi_item_id}")
+def appraisal_update_score(appraisal_id: str, kpi_item_id: str, req: AppraisalScoreUpdate, user_id: str = Depends(get_current_user_id)):
+    role = _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT a.*, cy.status as cycle_status FROM appraisals a JOIN appraisal_cycles cy ON a.cycle_id = cy.id WHERE a.id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    if (row["cycle_status"] or "") != "active":
+        raise HTTPException(status_code=400, detail="Scores can only be entered when cycle is Active")
+    is_owner = str(row["user_id"]) == str(user_id)
+    updates = {}
+    if req.self_score is not None:
+        if not is_owner and role not in ("admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only staff can set self score")
+        updates["self_score"] = max(0, min(100, req.self_score))
+    if req.self_comment is not None:
+        if not is_owner and role not in ("admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only staff can set self comment")
+        updates["self_comment"] = (req.self_comment or "").strip() or None
+    if req.supervisor_score is not None:
+        if is_owner and role not in ("admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only supervisor can set supervisor score")
+        _appraisal_require_roles(user_id, ["admin", "hr", "manager"])
+        updates["supervisor_score"] = max(0, min(100, req.supervisor_score))
+    if req.supervisor_comment is not None:
+        if is_owner and role not in ("admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only supervisor can set supervisor comment")
+        _appraisal_require_roles(user_id, ["admin", "hr", "manager"])
+        updates["supervisor_comment"] = (req.supervisor_comment or "").strip() or None
+    if req.agreed_score is not None:
+        if is_owner and role not in ("admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only supervisor can set agreed score")
+        _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager"])
+        updates["agreed_score"] = max(0, min(100, req.agreed_score))
+    if req.hod_comment is not None:
+        _appraisal_require_roles(user_id, ["admin", "hr", "hod"])
+        updates["hod_comment"] = (req.hod_comment or "").strip() or None
+    if not updates:
+        with cursor() as c:
+            c.execute("SELECT * FROM appraisal_scores WHERE appraisal_id = ? AND kpi_item_id = ?", (appraisal_id, kpi_item_id))
+            r = c.fetchone()
+        return row_to_dict(r) if r else None
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with cursor() as c:
+        c.execute(f"UPDATE appraisal_scores SET {set_clause} WHERE appraisal_id = ? AND kpi_item_id = ?", (*updates.values(), appraisal_id, kpi_item_id))
+    _appraisal_recalc_total(appraisal_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_scores WHERE appraisal_id = ? AND kpi_item_id = ?", (appraisal_id, kpi_item_id))
+        r = c.fetchone()
+    return row_to_dict(r)
+
+
+@app.patch("/appraisal/appraisals/{appraisal_id}")
+def appraisal_update_appraisal(appraisal_id: str, req: AppraisalUpdate, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    r = dict(row)
+    if str(r["user_id"]) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr"])
+    status = r.get("status") or "draft"
+    if status not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="Cannot edit appraisal in current status")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        return row_to_dict(row)
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with cursor() as c:
+        c.execute(f"UPDATE appraisals SET {set_clause} WHERE id = ?", (*updates.values(), appraisal_id))
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.put("/appraisal/appraisals/{appraisal_id}/assessments")
+def appraisal_put_assessments(appraisal_id: str, assessments: list[AppraisalKpiAssessment], user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    if str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (row["status"] or "") not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="Cannot edit assessments in current status")
+    with cursor() as c:
+        c.execute("DELETE FROM appraisal_kpi_assessments WHERE appraisal_id = ?", (appraisal_id,))
+        for a in assessments:
+            aid = new_id()
+            c.execute("INSERT INTO appraisal_kpi_assessments (id, appraisal_id, kpi_id, self_assessment, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (aid, appraisal_id, a.kpi_id, (a.self_assessment or "").strip() or None, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()))
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/submit")
+def appraisal_submit_appraisal(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    if str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (row["status"] or "") not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="Appraisal already submitted or beyond")
+    now = datetime.utcnow().isoformat()
+    owner_id = str(row["user_id"])
+    first = _get_staff_manager_id(owner_id)
+    if not first:
+        with cursor() as c:
+            c.execute(
+                "UPDATE appraisals SET status = 'verified', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                (now, appraisal_id),
+            )
+        _appraisal_log("appraisal", appraisal_id, "submitted_no_supervisor", user_id, _appraisal_user_role(user_id), None)
+    else:
+        with cursor() as c:
+            c.execute(
+                "UPDATE appraisals SET status = 'pending_supervisor', current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (first, now, appraisal_id),
+            )
+        _appraisal_log("appraisal", appraisal_id, "submitted", user_id, _appraisal_user_role(user_id), "supervisor")
+        try:
+            _notify_manager_appraisal_submitted(first, owner_id, "Appraisal")
+        except Exception as ex:
+            logger.warning("Appraisal submit supervisor notify failed: %s", ex)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/return")
+def appraisal_return_appraisal(appraisal_id: str, req: ReturnComment, user_id: str = Depends(get_current_user_id)):
+    role = _appraisal_user_role(user_id)
+    if role not in ("admin", "hr", "manager", "hod", "employee"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not (req.comment or req.comment.strip()):
+        raise HTTPException(status_code=400, detail="Comment required when returning")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    ar = dict(row)
+    status = ar.get("status") or ""
+    cur = (ar.get("current_approver_id") or "").strip()
+    if status == "pending_supervisor":
+        if role not in ("admin", "hr") and str(user_id).strip() != cur:
+            raise HTTPException(status_code=403, detail="Only the current supervisor in the chain can return this appraisal now")
+    elif status == "verified":
+        if role not in ("hod", "admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only HOD or HR can return an appraisal at this stage")
+    else:
+        raise HTTPException(status_code=400, detail="This appraisal cannot be returned in its current status")
+    with cursor() as c:
+        c.execute(
+            "UPDATE appraisals SET status = 'returned', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), appraisal_id),
+        )
+    wid = new_id()
+    with cursor() as c:
+        c.execute("INSERT INTO workflow_comments (id, reference_type, reference_id, from_user_id, from_role, comment, created_at) VALUES (?, 'appraisal', ?, ?, ?, ?, ?)", (wid, appraisal_id, user_id, role, req.comment.strip(), datetime.utcnow().isoformat() + "Z"))
+    _appraisal_log("appraisal", appraisal_id, "returned", user_id, role, "staff")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/verify")
+def appraisal_verify_appraisal(appraisal_id: str, req: SupervisorReviewBody, user_id: str = Depends(get_current_user_id)):
+    """Supervisor chain with comments at each level (same manager chain as leave)."""
+    role = _appraisal_user_role(user_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    r = dict(row)
+    if (r.get("status") or "") != "pending_supervisor":
+        raise HTTPException(status_code=400, detail="This appraisal is not waiting on a supervisor review step")
+    cur = (r.get("current_approver_id") or "").strip()
+    owner = str(r["user_id"])
+    if role not in ("admin", "hr") and str(user_id).strip() != cur:
+        raise HTTPException(status_code=403, detail="Only the assigned supervisor can complete this review step")
+    comment = (req.comment or "").strip()
+    wid = new_id()
+    now = datetime.utcnow().isoformat() + "Z"
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO workflow_comments (id, reference_type, reference_id, from_user_id, from_role, comment, created_at) VALUES (?, 'appraisal', ?, ?, ?, ?, ?)",
+            (wid, appraisal_id, user_id, role, comment, now),
+        )
+    next_id = _next_leave_approver_after_step(user_id, owner)
+    if next_id:
+        with cursor() as c:
+            c.execute(
+                "UPDATE appraisals SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (next_id, datetime.utcnow().isoformat(), appraisal_id),
+            )
+        _appraisal_log("appraisal", appraisal_id, "supervisor_step", user_id, role, "next_supervisor")
+        try:
+            _notify_manager_appraisal_submitted(next_id, owner, "Appraisal (next reviewer)")
+        except Exception as ex:
+            logger.warning("Appraisal chain notify failed: %s", ex)
+    else:
+        with cursor() as c:
+            c.execute(
+                "UPDATE appraisals SET status = 'verified', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), appraisal_id),
+            )
+        _appraisal_log("appraisal", appraisal_id, "supervisor_chain_complete", user_id, role, "hod")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/approve")
+def appraisal_approve_appraisal(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    if (row["status"] or "") != "verified":
+        raise HTTPException(status_code=400, detail="Only verified appraisals can be approved")
+    with cursor() as c:
+        c.execute("UPDATE appraisals SET status = 'approved', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), appraisal_id))
+    _appraisal_log("appraisal", appraisal_id, "approved", user_id, _appraisal_user_role(user_id), "hr")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/receive")
+def appraisal_receive_appraisal(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    if (row["status"] or "") != "approved":
+        raise HTTPException(status_code=400, detail="Only approved appraisals can be received")
+    with cursor() as c:
+        c.execute("UPDATE appraisals SET status = 'received', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), appraisal_id))
+    _appraisal_log("appraisal", appraisal_id, "received", user_id, _appraisal_user_role(user_id), "staff")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/acknowledge")
+def appraisal_acknowledge_appraisal(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    if str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (row["status"] or "") != "received":
+        raise HTTPException(status_code=400, detail="Only received appraisals can be acknowledged")
+    with cursor() as c:
+        c.execute("UPDATE appraisals SET status = 'acknowledged', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), appraisal_id))
+    aid = new_id()
+    now = datetime.utcnow().isoformat() + "Z"
+    with cursor() as c:
+        c.execute("INSERT INTO acknowledgements (id, reference_type, reference_id, user_id, acknowledged_at, created_at) VALUES (?, 'appraisal', ?, ?, ?, ?)", (aid, appraisal_id, user_id, now, now))
+    _appraisal_log("appraisal", appraisal_id, "acknowledged", user_id, _appraisal_user_role(user_id), None)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/appraisals/{appraisal_id}/workflow")
+def appraisal_appraisal_workflow(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM workflow_logs WHERE reference_type = 'appraisal' AND reference_id = ? ORDER BY created_at", (appraisal_id,))
+        logs = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+        c.execute("SELECT * FROM workflow_comments WHERE reference_type = 'appraisal' AND reference_id = ? ORDER BY created_at", (appraisal_id,))
+        comments = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    return {"logs": logs, "comments": comments}
+
+
+# Dashboards
+def _get_staff_manager_id(uid: str):
+    uid_clean = (uid or "").strip()
+    if not uid_clean:
+        return None
+    with cursor() as c:
+        c.execute("SELECT manager_id FROM users WHERE id = ?", (uid_clean,))
+        r = c.fetchone()
+    if not r or r[0] is None:
+        return None
+    return (str(r[0]) or "").strip() or None
+
+
+def _get_staff_department(uid: str):
+    with cursor() as c:
+        c.execute("SELECT department FROM users WHERE id = ?", (uid,))
+        r = c.fetchone()
+    return (r[0] or "").strip() if r else ""
+
+
+def _get_hod_for_department(dept: str):
+    if not dept:
+        return None
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE role = 'hod' AND department = ? AND (is_active = 1 OR is_active IS NULL) LIMIT 1", (dept,))
+        r = c.fetchone()
+    return r[0] if r else None
+
+
+@app.get("/appraisal/dashboard/staff")
+def appraisal_dashboard_staff(user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    active = _appraisal_active_cycle()
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles WHERE status IN ('active', 'draft') ORDER BY year DESC, quarter DESC")
+        cycles = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles ORDER BY year DESC, quarter DESC")
+        all_cycles = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute("SELECT k.*, c.type as cycle_type, c.year, c.quarter FROM kpis k JOIN appraisal_cycles c ON k.cycle_id = c.id WHERE k.user_id = ? ORDER BY c.year DESC, c.quarter DESC, k.created_at", (user_id,))
+        kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute("SELECT a.*, c.type as cycle_type, c.year, c.quarter FROM appraisals a JOIN appraisal_cycles c ON a.cycle_id = c.id WHERE a.user_id = ? ORDER BY c.year DESC, c.quarter DESC", (user_id,))
+        appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute("SELECT * FROM acknowledgements WHERE user_id = ? ORDER BY acknowledged_at DESC", (user_id,))
+        acks = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    closed_years = list({c["year"] for c in all_cycles if (c.get("status") or "") == "closed"})
+    return {"active_cycle": active, "cycles": cycles, "all_cycles": all_cycles, "closed_years": closed_years, "kpis": kpis, "appraisals": appraisals, "acknowledgements": acks}
+
+
+@app.get("/appraisal/dashboard/manager")
+def appraisal_dashboard_manager(user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "manager"])
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE manager_id = ?", (user_id,))
+        reportee_ids = [r[0] for r in c.fetchall()]
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT k.*, u.full_name as user_name FROM kpis k
+            JOIN users u ON k.user_id = u.id
+            WHERE k.status = 'pending_supervisor'
+              AND LOWER(TRIM(COALESCE(k.current_approver_id, ''))) = LOWER(?)
+            ORDER BY k.updated_at
+            """,
+            (user_id,),
+        )
+        kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT a.*, u.full_name as user_name FROM appraisals a
+            JOIN users u ON a.user_id = u.id
+            WHERE a.status = 'pending_supervisor'
+              AND LOWER(TRIM(COALESCE(a.current_approver_id, ''))) = LOWER(?)
+            ORDER BY a.updated_at
+            """,
+            (user_id,),
+        )
+        appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    if not reportee_ids:
+        returned_k, returned_a = [], []
+    else:
+        placeholders = ",".join("?" * len(reportee_ids))
+        with cursor() as c:
+            c.execute(
+                f"SELECT k.*, u.full_name as user_name FROM kpis k JOIN users u ON k.user_id = u.id WHERE k.user_id IN ({placeholders}) AND k.status = 'returned'",
+                reportee_ids,
+            )
+            returned_k = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+            c.execute(
+                f"SELECT a.*, u.full_name as user_name FROM appraisals a JOIN users u ON a.user_id = u.id WHERE a.user_id IN ({placeholders}) AND a.status = 'returned'",
+                reportee_ids,
+            )
+            returned_a = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    return {"kpis_pending_verify": kpis, "appraisals_pending_verify": appraisals, "returned_kpis": returned_k, "returned_appraisals": returned_a}
+
+
+@app.get("/appraisal/dashboard/hod")
+def appraisal_dashboard_hod(user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod"])
+    with cursor() as c:
+        c.execute("SELECT department FROM users WHERE id = ?", (user_id,))
+        r = c.fetchone()
+    dept = (r[0] or "").strip() if r else ""
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE department = ? AND (is_active = 1 OR is_active IS NULL)", (dept,))
+        dept_user_ids = [x[0] for x in c.fetchall()]
+    if not dept_user_ids:
+        return {"kpis_pending_approve": [], "appraisals_pending_approve": [], "department_overview": []}
+    placeholders = ",".join("?" * len(dept_user_ids))
+    with cursor() as c:
+        c.execute(f"SELECT k.*, u.full_name as user_name FROM kpis k JOIN users u ON k.user_id = u.id WHERE k.user_id IN ({placeholders}) AND k.status = 'verified' ORDER BY k.updated_at", dept_user_ids)
+        kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute(f"SELECT a.*, u.full_name as user_name FROM appraisals a JOIN users u ON a.user_id = u.id WHERE a.user_id IN ({placeholders}) AND a.status = 'verified' ORDER BY a.updated_at", dept_user_ids)
+        appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    overview = []
+    with cursor() as c:
+        for uid in dept_user_ids:
+            c.execute("SELECT full_name FROM users WHERE id = ?", (uid,))
+            name_row = c.fetchone()
+            c.execute("SELECT COUNT(*) FROM kpis WHERE user_id = ? AND status = 'acknowledged'", (uid,))
+            k_count = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM appraisals WHERE user_id = ? AND status = 'acknowledged'", (uid,))
+            a_count = c.fetchone()[0]
+            overview.append({"user_id": uid, "full_name": name_row[0] if name_row else "", "kpis_acknowledged": k_count, "appraisals_acknowledged": a_count})
+    return {"kpis_pending_approve": kpis, "appraisals_pending_approve": appraisals, "department_overview": overview}
+
+
+@app.get("/appraisal/dashboard/hr")
+def appraisal_dashboard_hr(user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles ORDER BY year DESC, quarter DESC")
+        cycles = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute("SELECT k.*, u.full_name as user_name, u.department FROM kpis k JOIN users u ON k.user_id = u.id WHERE k.status IN ('approved', 'received', 'acknowledged') ORDER BY k.updated_at DESC")
+        kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute("SELECT a.*, u.full_name as user_name, u.department FROM appraisals a JOIN users u ON a.user_id = u.id WHERE a.status IN ('approved', 'received', 'acknowledged') ORDER BY a.updated_at DESC")
+        appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute(
+            "SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a JOIN users u ON a.user_id = u.id WHERE a.status = 'approved_hod' ORDER BY a.year DESC, a.updated_at"
+        )
+        annual_ready_to_lock = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    for d in annual_ready_to_lock:
+        d["user_name"] = d.pop("user_name", None)
+    with cursor() as c:
+        c.execute(
+            "SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a JOIN users u ON a.user_id = u.id WHERE a.status = 'locked' ORDER BY a.year DESC, a.updated_at"
+        )
+        annual_kpis_locked = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    for d in annual_kpis_locked:
+        d["user_name"] = d.pop("user_name", None)
+    return {"cycles": cycles, "kpis": kpis, "appraisals": appraisals, "annual_kpis_ready_to_lock": annual_ready_to_lock, "annual_kpis_locked": annual_kpis_locked}
+
+
+@app.get("/appraisal/export")
+def appraisal_export(cycle_id: str | None = None, department: str | None = None, period_type: str | None = None, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_cycles ORDER BY year DESC, quarter DESC")
+        all_cycles = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    cycles = all_cycles
+    if cycle_id:
+        cycles = [c for c in all_cycles if c.get("id") == cycle_id]
+    if period_type:
+        cycles = [c for c in cycles if (c.get("type") or "") == period_type]
+    cycle_ids = [c["id"] for c in cycles]
+    if not cycle_ids:
+        return {"cycles": [], "kpis": [], "appraisals": []}
+    ph = ",".join("?" * len(cycle_ids))
+    with cursor() as c:
+        c.execute(f"SELECT k.*, u.full_name as user_name, u.department FROM kpis k JOIN users u ON k.user_id = u.id WHERE k.cycle_id IN ({ph}) AND k.status = 'acknowledged'", cycle_ids)
+        kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    with cursor() as c:
+        c.execute(f"SELECT a.*, u.full_name as user_name, u.department FROM appraisals a JOIN users u ON a.user_id = u.id WHERE a.cycle_id IN ({ph}) AND a.status = 'acknowledged'", cycle_ids)
+        appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    if department:
+        kpis = [k for k in kpis if (k.get("department") or "") == department]
+        appraisals = [a for a in appraisals if (a.get("department") or "") == department]
+    return {"cycles": cycles, "kpis": kpis, "appraisals": appraisals}
+
+
+# ---------- Appraisal: Annual KPIs + rating (single appraisal module) ----------
+def _appraisal_rating_from_score(score: float | None) -> str:
+    """Automatic rating from total score. No manual override."""
+    if score is None:
+        return ""
+    if score >= 101:
+        return "Excellent"
+    if score >= 80:
+        return "Very Good"
+    if score >= 70:
+        return "Good"
+    if score >= 60:
+        return "Average"
+    return "Poor"
+
+
+def _appraisal_annual_total_weight(annual_kpi_id: str) -> float:
+    with cursor() as c:
+        c.execute(
+            "SELECT COALESCE(SUM(i.weight), 0) FROM appraisal_kpi_items i "
+            "JOIN appraisal_kpi_titles t ON i.kpi_title_id = t.id WHERE t.annual_kpi_id = ?",
+            (annual_kpi_id,),
+        )
+        r = c.fetchone()
+    return float(r[0] or 0)
+
+
+def _appraisal_recalc_total(appraisal_id: str):
+    """Recalc weighted_score per appraisal_scores row, then appraisals.total_score and rating."""
+    with cursor() as c:
+        c.execute(
+            "SELECT s.id, s.agreed_score, i.weight FROM appraisal_scores s "
+            "JOIN appraisal_kpi_items i ON s.kpi_item_id = i.id WHERE s.appraisal_id = ?",
+            (appraisal_id,),
+        )
+        rows = c.fetchall()
+    total = 0.0
+    now = datetime.utcnow().isoformat()
+    for row in rows:
+        agreed = row[1] if row[1] is not None else 0
+        weight = float(row[2] or 0)
+        weighted = weight * (agreed / 100.0) if agreed else 0
+        total += weighted
+        with cursor() as c:
+            c.execute("UPDATE appraisal_scores SET weighted_score = ?, updated_at = ? WHERE id = ?", (weighted, now, row[0]))
+    rating = _appraisal_rating_from_score(total)
+    with cursor() as c:
+        c.execute("UPDATE appraisals SET total_score = ?, rating = ?, updated_at = ? WHERE id = ?", (total, rating, now, appraisal_id))
+
+
+# Annual KPIs: one set per user per year; workflow Supervisor -> HOD -> HR lock
+def _annual_kpi_editable(status: str) -> bool:
+    return (status or "") in ("draft", "returned_supervisor", "returned_hod")
+
+
+def _is_year_closed(year: int) -> bool:
+    """True if any appraisal cycle with this year has status 'closed' (no one can add KPIs for that year)."""
+    with cursor() as c:
+        c.execute("SELECT 1 FROM appraisal_cycles WHERE year = ? AND status = 'closed' LIMIT 1", (year,))
+        return c.fetchone() is not None
+
+
+class AnnualKPICreate(BaseModel):
+    year: int
+
+
+class AnnualKPITitleCreate(BaseModel):
+    name: str
+
+
+class AnnualKPIItemCreate(BaseModel):
+    description: str  # subtitle label
+    weight: float  # percentage 0-100
+    target: float  # target percentage 0-100
+
+
+class AnnualKPIItemUpdate(BaseModel):
+    description: str | None = None
+    weight: float | None = None
+    target: float | None = None
+
+
+class ReturnCommentBody(BaseModel):
+    comment: str
+
+
+@app.get("/appraisal/annual-kpis")
+def appraisal_list_annual_kpis(year: int | None = None, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    role = _appraisal_user_role(user_id)
+    with cursor() as c:
+        if role in ("admin", "hr"):
+            if year:
+                c.execute("SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a LEFT JOIN users u ON a.user_id = u.id WHERE a.year = ? ORDER BY a.year DESC, u.full_name", (year,))
+            else:
+                c.execute("SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a LEFT JOIN users u ON a.user_id = u.id ORDER BY a.year DESC, u.full_name")
+        elif year:
+            c.execute("SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = ? AND a.year = ?", (user_id, year))
+        else:
+            c.execute("SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a LEFT JOIN users u ON a.user_id = u.id WHERE a.user_id = ? ORDER BY a.year DESC", (user_id,))
+        rows = c.fetchall()
+    out = []
+    for row in rows:
+        d = row_to_dict(row)
+        if d:
+            d["user_name"] = d.pop("user_name", None)
+            d["total_weight"] = _appraisal_annual_total_weight(d["id"])
+            out.append(d)
+    return out
+
+
+@app.post("/appraisal/annual-kpis")
+def appraisal_create_annual_kpi(req: AnnualKPICreate, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "employee", "manager", "hod"])
+    if _is_year_closed(req.year):
+        raise HTTPException(status_code=400, detail="This year is closed for appraisal. No new KPIs can be added.")
+    with cursor() as c:
+        c.execute("SELECT id FROM appraisal_annual_kpis WHERE user_id = ? AND year = ?", (user_id, req.year))
+        if c.fetchone():
+            raise HTTPException(status_code=400, detail="Annual KPIs already exist for this year")
+    aid = new_id()
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO appraisal_annual_kpis (id, user_id, year, status, created_at, updated_at) VALUES (?, ?, ?, 'draft', ?, ?)",
+            (aid, user_id, req.year, now, now),
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (aid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/annual-kpis/pending-approval")
+def appraisal_list_annual_kpis_pending_approval(user_id: str = Depends(get_current_user_id)):
+    """Annual KPIs where the current user is the pending approver (chain-based approval)."""
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    uid = (user_id or "").strip()
+    with cursor() as c:
+        c.execute(
+            "SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a JOIN users u ON a.user_id = u.id WHERE LOWER(TRIM(COALESCE(a.pending_approver_id, ''))) = LOWER(?) AND a.status = 'submitted' ORDER BY a.updated_at",
+            (uid,),
+        )
+        rows = c.fetchall()
+    out = []
+    for row in rows:
+        d = row_to_dict(row)
+        if d:
+            d["user_name"] = d.pop("user_name", None)
+            out.append(d)
+    return out
+
+
+@app.get("/appraisal/annual-kpis/{annual_kpi_id}")
+def appraisal_get_annual_kpi(annual_kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT a.*, u.full_name as user_name FROM appraisal_annual_kpis a LEFT JOIN users u ON a.user_id = u.id WHERE a.id = ?", (annual_kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Annual KPI not found")
+    d = row_to_dict(row)
+    if d and str(d.get("user_id")) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager"])
+    if d:
+        d["user_name"] = d.pop("user_name", None)
+        d["total_weight"] = _appraisal_annual_total_weight(annual_kpi_id)
+    return d
+
+
+@app.get("/appraisal/annual-kpis/{annual_kpi_id}/titles")
+def appraisal_list_kpi_titles(annual_kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Annual KPI not found")
+        c.execute("SELECT * FROM appraisal_kpi_titles WHERE annual_kpi_id = ? ORDER BY sort_order, created_at", (annual_kpi_id,))
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows if row_to_dict(r)]
+
+
+@app.post("/appraisal/annual-kpis/{annual_kpi_id}/titles")
+def appraisal_create_kpi_title(annual_kpi_id: str, req: AnnualKPITitleCreate, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Annual KPI not found")
+    r = dict(row)
+    if _is_year_closed(int(r.get("year") or 0)):
+        raise HTTPException(status_code=400, detail="This year is closed for appraisal. No new KPIs can be added.")
+    if str(r.get("user_id")) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr"])
+    if not _annual_kpi_editable(r.get("status")):
+        raise HTTPException(status_code=400, detail="Cannot edit KPIs in current status")
+    tid = new_id()
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO appraisal_kpi_titles (id, annual_kpi_id, name, sort_order, created_at) VALUES (?, ?, ?, 0, ?)",
+            (tid, annual_kpi_id, req.name.strip(), datetime.utcnow().isoformat()),
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_kpi_titles WHERE id = ?", (tid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/kpi-titles/{title_id}/items")
+def appraisal_list_kpi_items(title_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager", "employee"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_kpi_items WHERE kpi_title_id = ? ORDER BY sort_order, created_at", (title_id,))
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows if row_to_dict(r)]
+
+
+@app.post("/appraisal/kpi-titles/{title_id}/items")
+def appraisal_create_kpi_item(title_id: str, req: AnnualKPIItemCreate, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT t.*, a.user_id, a.status, a.year FROM appraisal_kpi_titles t JOIN appraisal_annual_kpis a ON t.annual_kpi_id = a.id WHERE t.id = ?", (title_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI title not found")
+    r = dict(row)
+    if _is_year_closed(int(r.get("year") or 0)):
+        raise HTTPException(status_code=400, detail="This year is closed for appraisal. No new KPIs can be added.")
+    if str(r.get("user_id")) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr"])
+    if not _annual_kpi_editable(r.get("status")):
+        raise HTTPException(status_code=400, detail="Cannot edit KPIs in current status")
+    iid = new_id()
+    target_val = req.target if req.target is not None else 0
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO appraisal_kpi_items (id, kpi_title_id, description, weight, target, sort_order, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (iid, title_id, req.description.strip(), req.weight, str(target_val), datetime.utcnow().isoformat()),
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_kpi_items WHERE id = ?", (iid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.patch("/appraisal/kpi-items/{item_id}")
+def appraisal_update_kpi_item(item_id: str, req: AnnualKPIItemUpdate, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT i.*, a.user_id, a.status FROM appraisal_kpi_items i JOIN appraisal_kpi_titles t ON i.kpi_title_id = t.id JOIN appraisal_annual_kpis a ON t.annual_kpi_id = a.id WHERE i.id = ?", (item_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI item not found")
+    r = dict(row)
+    if str(r.get("user_id")) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr"])
+    if not _annual_kpi_editable(r.get("status")):
+        raise HTTPException(status_code=400, detail="Cannot edit KPIs in current status")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        with cursor() as c:
+            c.execute("SELECT * FROM appraisal_kpi_items WHERE id = ?", (item_id,))
+            return row_to_dict(c.fetchone())
+    if "description" in updates:
+        updates["description"] = updates["description"].strip()
+    if "target" in updates and updates["target"] is not None:
+        updates["target"] = str(updates["target"])
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with cursor() as c:
+        c.execute(f"UPDATE appraisal_kpi_items SET {set_clause} WHERE id = ?", (*updates.values(), item_id))
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_kpi_items WHERE id = ?", (item_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.delete("/appraisal/kpi-items/{item_id}")
+def appraisal_delete_kpi_item(item_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT i.*, a.user_id, a.status FROM appraisal_kpi_items i JOIN appraisal_kpi_titles t ON i.kpi_title_id = t.id JOIN appraisal_annual_kpis a ON t.annual_kpi_id = a.id WHERE i.id = ?", (item_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="KPI item not found")
+    r = dict(row)
+    if str(r.get("user_id")) != str(user_id):
+        _appraisal_require_roles(user_id, ["admin", "hr"])
+    if not _annual_kpi_editable(r.get("status")):
+        raise HTTPException(status_code=400, detail="Cannot edit KPIs in current status")
+    with cursor() as c:
+        c.execute("DELETE FROM appraisal_kpi_items WHERE id = ?", (item_id,))
+    return {"ok": True}
+
+
+@app.post("/appraisal/annual-kpis/{annual_kpi_id}/submit")
+def appraisal_submit_annual_kpi(annual_kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Annual KPI not found")
+    if _is_year_closed(int(row.get("year") or 0)):
+        raise HTTPException(status_code=400, detail="This year is closed for appraisal. No new KPIs can be added.")
+    if str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (row["status"] or "") not in ("draft", "returned_supervisor", "returned_hod"):
+        raise HTTPException(status_code=400, detail="Cannot submit in current status")
+    total = _appraisal_annual_total_weight(annual_kpi_id)
+    if abs(total - 100.0) > 0.01:
+        raise HTTPException(status_code=400, detail=f"Total KPI weight must equal 100%. Current: {total}%")
+    owner_id = str((row["user_id"] or "")).strip()
+    first_approver = _get_staff_manager_id(owner_id)
+    if not first_approver:
+        raise HTTPException(status_code=400, detail="No supervisor assigned. Ask HR to assign your supervisor before submitting.")
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute(
+            "UPDATE appraisal_annual_kpis SET status = 'submitted', pending_approver_id = ?, updated_at = ? WHERE id = ?",
+            (first_approver, now, annual_kpi_id),
+        )
+    _appraisal_log("annual_kpi", annual_kpi_id, "submitted", user_id, _appraisal_user_role(user_id), "supervisor")
+    try:
+        _notify_manager_appraisal_submitted(first_approver, owner_id, "Annual KPI plan")
+    except Exception as ex:
+        logger.warning("Annual KPI submit supervisor notify failed: %s", ex)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/annual-kpis/{annual_kpi_id}/return")
+def appraisal_return_annual_kpi(annual_kpi_id: str, req: ReturnCommentBody, user_id: str = Depends(get_current_user_id)):
+    if not (req.comment or req.comment.strip()):
+        raise HTTPException(status_code=400, detail="Comment required when returning")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Annual KPI not found")
+    r = dict(row)
+    status = r.get("status") or ""
+    if status != "submitted":
+        raise HTTPException(status_code=400, detail="Only submitted KPIs can be returned")
+    pending = (r.get("pending_approver_id") or "").strip()
+    if pending.lower() != (user_id or "").strip().lower():
+        raise HTTPException(status_code=403, detail="Only the current approver can return this KPI")
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute("UPDATE appraisal_annual_kpis SET status = 'returned_supervisor', pending_approver_id = NULL, updated_at = ? WHERE id = ?", (now, annual_kpi_id))
+    wid = new_id()
+    role = _appraisal_user_role(user_id)
+    with cursor() as c:
+        c.execute("INSERT INTO workflow_comments (id, reference_type, reference_id, from_user_id, from_role, comment, created_at) VALUES (?, 'annual_kpi', ?, ?, ?, ?, ?)", (wid, annual_kpi_id, user_id, role, req.comment.strip(), now))
+    _appraisal_log("annual_kpi", annual_kpi_id, "returned", user_id, role, "staff")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/annual-kpis/{annual_kpi_id}/approve")
+def appraisal_approve_annual_kpi(annual_kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    """Single approve: only the current pending_approver can approve. Chain moves to approver's manager; if none, status becomes approved_hod (HR can lock)."""
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Annual KPI not found")
+    if (row["status"] or "") != "submitted":
+        raise HTTPException(status_code=400, detail="Only submitted KPIs can be approved")
+    r = dict(row)
+    pending = (r.get("pending_approver_id") or "").strip()
+    if pending.lower() != (user_id or "").strip().lower():
+        raise HTTPException(status_code=403, detail="Only the current approver can approve this KPI")
+    next_approver = _get_staff_manager_id(user_id)
+    now = datetime.utcnow().isoformat()
+    if next_approver:
+        with cursor() as c:
+            c.execute("UPDATE appraisal_annual_kpis SET pending_approver_id = ?, updated_at = ? WHERE id = ?", (next_approver, now, annual_kpi_id))
+        _appraisal_log("annual_kpi", annual_kpi_id, "approved_supervisor", user_id, _appraisal_user_role(user_id), "next_approver")
+    else:
+        with cursor() as c:
+            c.execute("UPDATE appraisal_annual_kpis SET status = 'approved_hod', pending_approver_id = NULL, updated_at = ? WHERE id = ?", (now, annual_kpi_id))
+        _appraisal_log("annual_kpi", annual_kpi_id, "approved_hod", user_id, _appraisal_user_role(user_id), "hr")
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/appraisal/annual-kpis/{annual_kpi_id}/lock")
+def appraisal_lock_annual_kpi(annual_kpi_id: str, user_id: str = Depends(get_current_user_id)):
+    _appraisal_require_roles(user_id, ["admin", "hr"])
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Annual KPI not found")
+    if (row["status"] or "") != "approved_hod":
+        raise HTTPException(status_code=400, detail="Only HOD-approved KPIs can be locked by HR")
+    with cursor() as c:
+        c.execute("UPDATE appraisal_annual_kpis SET status = 'locked', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), annual_kpi_id))
+    _appraisal_log("annual_kpi", annual_kpi_id, "locked", user_id, _appraisal_user_role(user_id), None)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_annual_kpis WHERE id = ?", (annual_kpi_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/rating-scale")
+def appraisal_rating_scale(_: str = Depends(get_current_user_id)):
+    """Rating bands for appraisal total score (read-only)."""
+    return [
+        {"min": 101, "label": "Excellent"},
+        {"min": 80, "label": "Very Good"},
+        {"min": 70, "label": "Good"},
+        {"min": 60, "label": "Average"},
+        {"min": 0, "label": "Poor"},
+    ]
+
+
 # ---------- HR Documents ----------
 @app.get("/hr-documents")
 def list_hr_documents(_: str = Depends(get_current_user_id)):
@@ -2027,3 +4189,1977 @@ def get_hr_document_file(document_id: str, user_id: str = Depends(get_current_us
         filename=file_path.split("_", 1)[-1] if "_" in file_path else file_path,
         media_type="application/octet-stream",
     )
+
+
+# ---------- In-app notifications (bell) ----------
+@app.get("/notifications")
+def list_notifications(limit: int = 40, user_id: str = Depends(get_current_user_id)):
+    lim = max(1, min(limit, 100))
+    with cursor() as c:
+        c.execute(
+            f"SELECT * FROM notifications WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT {lim}",
+            (user_id,),
+        )
+        rows = c.fetchall()
+    return [row_to_dict(r) for r in rows if row_to_dict(r)]
+
+
+@app.get("/notifications/unread-count")
+def notifications_unread_count(user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL",
+            (user_id,),
+        )
+        (n,) = c.fetchone()
+    return {"count": int(n or 0)}
+
+
+@app.patch("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: str, user_id: str = Depends(get_current_user_id)):
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute(
+            "UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ?",
+            (now, notification_id, user_id),
+        )
+        if c.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Notification not found")
+    return {"ok": True}
+
+
+@app.post("/notifications/mark-all-read")
+def mark_all_notifications_read(user_id: str = Depends(get_current_user_id)):
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL", (now, user_id))
+    return {"ok": True}
+
+
+# ---------- Staff documents (per employee: HR confidential or employee certificates) ----------
+@app.get("/staff-documents")
+def list_staff_documents(
+    subject_user_id: str | None = Query(None, description="Employee whose folder to list (required for HR/Admin)"),
+    user_id: str = Depends(get_current_user_id),
+):
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    role = (row[0] or "").strip().lower()
+    sub = (subject_user_id or "").strip() or user_id
+    if role not in ("admin", "hr"):
+        if sub != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        kind_sql = "kind = 'employee_certificate'"
+        params = (sub,)
+    else:
+        if not (subject_user_id or "").strip():
+            raise HTTPException(status_code=400, detail="Query parameter subject_user_id (user folder) is required")
+        kind_sql = "1=1"
+        params = (sub,)
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT s.*, u.full_name as uploader_name
+            FROM staff_documents s
+            LEFT JOIN users u ON s.uploaded_by = u.id
+            WHERE s.user_id = ? AND {kind_sql}
+            ORDER BY datetime(s.created_at) DESC
+            """,
+            params,
+        )
+        rows = c.fetchall()
+    out = []
+    for r in rows:
+        d = row_to_dict(r)
+        if d:
+            d["uploader_name"] = d.pop("uploader_name", None)
+            out.append(d)
+    return out
+
+
+@app.post("/staff-documents/upload")
+async def upload_staff_document(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    kind: str = Form(...),
+    subject_user_id: str = Form(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """kind = hr_confidential (HR/Admin only, about subject) or employee_certificate (subject uploads their own)."""
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    role = (row[0] or "").strip().lower()
+    sub = (subject_user_id or "").strip()
+    if not sub:
+        raise HTTPException(status_code=400, detail="subject_user_id required")
+    k = (kind or "").strip().lower()
+    if k not in ("hr_confidential", "employee_certificate"):
+        raise HTTPException(status_code=400, detail="Invalid kind")
+    if k == "hr_confidential":
+        if role not in ("admin", "hr"):
+            raise HTTPException(status_code=403, detail="Only HR or Admin can upload confidential staff documents")
+    else:
+        if sub != user_id:
+            raise HTTPException(status_code=403, detail="You can only upload certificates to your own profile")
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE id = ?", (sub,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+    if not file.filename or not file.filename.strip():
+        raise HTTPException(status_code=400, detail="No file selected")
+    safe_name = re.sub(r"[^\w\-.]", "_", file.filename.strip())[:200]
+    if not safe_name:
+        safe_name = "document"
+    hid = new_id()
+    file_path = f"scd_{hid}_{safe_name}"
+    full_path = os.path.join(UPLOAD_DIR, file_path)
+    try:
+        contents = await file.read()
+        with open(full_path, "wb") as f:
+            f.write(contents)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO staff_documents (id, user_id, kind, title, file_path, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (hid, sub, k, (title or "").strip() or file.filename, file_path, user_id),
+        )
+    if k == "employee_certificate":
+        try:
+            _notify_hr_admins_staff_certificate(sub, (title or "").strip() or file.filename)
+        except Exception as e:
+            logger.warning("Certificate notification failed: %s", e)
+    with cursor() as c:
+        c.execute(
+            "SELECT s.*, u.full_name as uploader_name FROM staff_documents s LEFT JOIN users u ON s.uploaded_by = u.id WHERE s.id = ?",
+            (hid,),
+        )
+        r = c.fetchone()
+    d = row_to_dict(r)
+    if d:
+        d["uploader_name"] = d.pop("uploader_name", None)
+    return d
+
+
+@app.get("/staff-documents/{document_id}/file")
+def get_staff_document_file(document_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        rrole = c.fetchone()
+        c.execute("SELECT * FROM staff_documents WHERE id = ?", (document_id,))
+        row = c.fetchone()
+    if not row or not rrole:
+        raise HTTPException(status_code=404, detail="Document not found")
+    role = (rrole[0] or "").strip().lower()
+    doc = row_to_dict(row)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    sub_uid = (doc.get("user_id") or "").strip()
+    dk = (doc.get("kind") or "").strip().lower()
+    if role in ("admin", "hr"):
+        pass
+    elif dk == "employee_certificate" and sub_uid == user_id:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    file_path = doc.get("file_path") or ""
+    if "/" in file_path or "\\" in file_path or str(file_path).startswith(".."):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    full_path = os.path.join(UPLOAD_DIR, file_path)
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        full_path,
+        filename=file_path.split("_", 1)[-1] if "_" in file_path else file_path,
+        media_type="application/octet-stream",
+    )
+
+
+@app.delete("/staff-documents/{document_id}")
+def delete_staff_document(document_id: str, user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        rrole = c.fetchone()
+        c.execute("SELECT * FROM staff_documents WHERE id = ?", (document_id,))
+        row = c.fetchone()
+    if not row or not rrole:
+        raise HTTPException(status_code=404, detail="Document not found")
+    role = (rrole[0] or "").strip().lower()
+    doc = row_to_dict(row)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    dk = (doc.get("kind") or "").strip().lower()
+    sub_uid = (doc.get("user_id") or "").strip()
+    up = (doc.get("uploaded_by") or "").strip()
+    if role in ("admin", "hr"):
+        pass
+    elif dk == "employee_certificate" and sub_uid == user_id and up == user_id:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    fp = doc.get("file_path") or ""
+    if fp and "/" not in fp and "\\" not in fp and not str(fp).startswith(".."):
+        full_path = os.path.join(UPLOAD_DIR, fp)
+        try:
+            if os.path.isfile(full_path):
+                os.remove(full_path)
+        except OSError:
+            pass
+    with cursor() as c:
+        c.execute("DELETE FROM staff_documents WHERE id = ?", (document_id,))
+    return {"ok": True}
+
+
+# ---------- Leave module ----------
+def _now_iso():
+    return datetime.utcnow().isoformat()
+
+
+def _get_user_profile_min(user_id: str):
+    with cursor() as c:
+        c.execute(
+            "SELECT id, full_name, email, role, manager_id, department, is_active FROM users WHERE id = ?",
+            (user_id,),
+        )
+        row = c.fetchone()
+    return row_to_dict(row)
+
+
+def _user_is_active_row(user: dict | None) -> bool:
+    if not user:
+        return False
+    try:
+        return int(user.get("is_active") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _first_leave_approver(requester_id: str) -> str | None:
+    """OrangeHRM-style: first approver is the employee's direct supervisor (`manager_id`), any role."""
+    user = _get_user_profile_min(requester_id)
+    if not user or not _user_is_active_row(user):
+        return None
+    manager_id = (user.get("manager_id") or "").strip()
+    if not manager_id:
+        return None
+    mgr = _get_user_profile_min(manager_id)
+    if not mgr or not _user_is_active_row(mgr):
+        return None
+    return manager_id
+
+
+def _next_leave_approver_after_step(approver_user_id: str, requester_user_id: str) -> str | None:
+    """After a step approves, the next approver is this approver's supervisor (i.e. requester's supervisor-of-supervisor on the second hop)."""
+    approver = _get_user_profile_min(approver_user_id)
+    if not approver or not _user_is_active_row(approver):
+        return None
+    next_id = (approver.get("manager_id") or "").strip()
+    if not next_id or next_id == requester_user_id:
+        return None
+    nxt = _get_user_profile_min(next_id)
+    if not nxt or not _user_is_active_row(nxt):
+        return None
+    return next_id
+
+
+def _require_roles(user_id: str, allowed_roles: tuple[str, ...]):
+    profile = _get_user_profile_min(user_id)
+    if not profile:
+        raise HTTPException(status_code=401, detail="User not found")
+    if profile.get("role") not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return profile
+
+
+def _parse_yyyy_mm_dd(value: str):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Dates must be in YYYY-MM-DD format")
+
+
+def _parse_hire_date(raw: str | None) -> date | None:
+    s = (raw or "").strip()[:10]
+    if len(s) < 10:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _completed_service_years(uid: str, as_of: date | None = None) -> int:
+    """Full calendar years of service from work_anniversary (hire date) to as_of."""
+    as_of = as_of or datetime.utcnow().date()
+    with cursor() as c:
+        c.execute("SELECT work_anniversary FROM users WHERE id = ?", (uid,))
+        row = c.fetchone()
+    hire = _parse_hire_date(row[0] if row else None)
+    if not hire or hire > as_of:
+        return 0
+    y = as_of.year - hire.year
+    if (as_of.month, as_of.day) < (hire.month, hire.day):
+        y -= 1
+    return max(0, y)
+
+
+def _annual_entitlement_days(uid: str) -> float:
+    """
+    Annual leave: 18 days, +1 day per 3 completed years of service, max 21 (Rwanda-style ladder).
+    Uses users.work_anniversary. If unset, entitlement is 18 days (0 years of service recorded).
+    Overridden when HR_SUITE_ANNUAL_LEAVE_DAYS is set.
+    """
+    raw = (os.getenv("HR_SUITE_ANNUAL_LEAVE_DAYS") or "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    years = _completed_service_years(uid)
+    return float(min(21, 18 + (years // 3)))
+
+
+def _refresh_annual_balance_allocation(uid: str, year: int) -> None:
+    if not (uid or "").strip():
+        return
+    ent = _annual_entitlement_days(uid)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lb.id, COALESCE(lb.used_days, 0) AS used_days
+            FROM leave_balances lb
+            JOIN leave_types lt ON lt.id = lb.leave_type_id AND UPPER(TRIM(lt.code)) = 'ANNUAL'
+            WHERE lb.user_id = ? AND lb.year = ?
+            LIMIT 1
+            """,
+            (uid, year),
+        )
+        row = c.fetchone()
+    if not row:
+        return
+    bid, used = row[0], float(row[1] or 0)
+    rem = max(ent - used, 0.0)
+    now = _now_iso()
+    with cursor() as c:
+        c.execute(
+            "UPDATE leave_balances SET allocated_days = ?, remaining_days = ?, updated_at = ? WHERE id = ?",
+            (ent, rem, now, bid),
+        )
+
+
+def _refresh_all_annual_leave_balances_for_year(year: int) -> None:
+    """Recompute ANNUAL allocated/remaining for all users for this year (HR list view)."""
+    raw = (os.getenv("HR_SUITE_ANNUAL_LEAVE_DAYS") or "").strip()
+    now = _now_iso()
+    if raw:
+        try:
+            d = float(raw)
+        except ValueError:
+            return
+        with cursor() as c:
+            c.execute(
+                """
+                UPDATE leave_balances
+                SET allocated_days = ?,
+                    remaining_days = MAX(0, ? - COALESCE(used_days, 0)),
+                    updated_at = ?
+                WHERE year = ? AND leave_type_id = (SELECT id FROM leave_types WHERE UPPER(TRIM(code)) = 'ANNUAL' LIMIT 1)
+                """,
+                (d, d, now, year),
+            )
+        return
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lb.id, lb.user_id, COALESCE(lb.used_days, 0) AS used_days
+            FROM leave_balances lb
+            JOIN leave_types lt ON lt.id = lb.leave_type_id AND UPPER(TRIM(lt.code)) = 'ANNUAL'
+            WHERE lb.year = ?
+            """,
+            (year,),
+        )
+        rows = c.fetchall()
+    for bid, uid, used in rows:
+        ent = _annual_entitlement_days(uid)
+        rem = max(ent - float(used or 0), 0.0)
+        with cursor() as c:
+            c.execute(
+                "UPDATE leave_balances SET allocated_days = ?, remaining_days = ?, updated_at = ? WHERE id = ?",
+                (ent, rem, now, bid),
+            )
+
+
+def _calculate_leave_days(start_date: str, end_date: str) -> float:
+    sd = _parse_yyyy_mm_dd(start_date)
+    ed = _parse_yyyy_mm_dd(end_date)
+    if ed < sd:
+        raise HTTPException(status_code=400, detail="End date cannot be before start date")
+    return float((ed - sd).days + 1)
+
+
+def _leave_log(leave_request_id: str, action: str, from_user_id: str | None, from_role: str | None, to_user_id: str | None, to_role: str | None, comment: str | None = None):
+    with cursor() as c:
+        c.execute(
+            """
+            INSERT INTO leave_workflow_logs (id, leave_request_id, action, from_user_id, from_role, to_user_id, to_role, comment, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (new_id(), leave_request_id, action, from_user_id, from_role, to_user_id, to_role, (comment or "").strip() or None, _now_iso()),
+        )
+
+
+def _sync_leave_balance_for_approved(req_row: dict):
+    year = int((req_row.get("start_date") or "")[:4] or datetime.utcnow().year)
+    _refresh_annual_balance_allocation(req_row["user_id"], year)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, default_days, code FROM leave_types WHERE id = ?
+            """,
+            (req_row["leave_type_id"],),
+        )
+        lt = c.fetchone()
+    default_days = float(lt[1]) if lt else 0.0
+    if lt and (lt[2] or "").strip().upper() == "ANNUAL":
+        default_days = _annual_entitlement_days(req_row["user_id"])
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, allocated_days, used_days FROM leave_balances
+            WHERE user_id = ? AND leave_type_id = ? AND year = ?
+            """,
+            (req_row["user_id"], req_row["leave_type_id"], year),
+        )
+        bal = c.fetchone()
+    if not bal:
+        bid = new_id()
+        used = float(req_row.get("days_requested") or 0)
+        with cursor() as c:
+            c.execute(
+                """
+                INSERT INTO leave_balances (id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (bid, req_row["user_id"], req_row["leave_type_id"], year, default_days, used, max(default_days - used, 0), _now_iso(), _now_iso()),
+            )
+        return
+    used_days = float(bal[2] or 0) + float(req_row.get("days_requested") or 0)
+    allocated = float(bal[1] or 0)
+    with cursor() as c:
+        c.execute(
+            "UPDATE leave_balances SET used_days = ?, remaining_days = ?, updated_at = ? WHERE id = ?",
+            (used_days, max(allocated - used_days, 0), _now_iso(), bal[0]),
+        )
+
+
+def _setting_str(key: str) -> str:
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = c.fetchone()
+    if not row or row[0] is None:
+        return ""
+    v = row[0]
+    if isinstance(v, str) and len(v) >= 2 and v[0] == '"':
+        try:
+            s = json.loads(v)
+            return str(s) if s is not None else ""
+        except Exception:
+            return v.strip('"')
+    return str(v)
+
+
+def _setting_bool(key: str) -> bool:
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = c.fetchone()
+    if not row:
+        return False
+    v = str(row[0]).strip().lower().strip('"')
+    return v in ("1", "true", "yes", "on")
+
+
+def _leave_emails_enabled() -> bool:
+    env = (os.environ.get("LEAVE_EMAIL_ENABLED") or "").strip().lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    return _setting_bool("leave_email_enabled")
+
+
+def _get_smtp_config() -> dict:
+    host = (os.environ.get("SMTP_HOST") or _setting_str("smtp_host")).strip()
+    try:
+        port = int(os.environ.get("SMTP_PORT") or _setting_str("smtp_port") or "587")
+    except ValueError:
+        port = 587
+    user = (os.environ.get("SMTP_USER") or _setting_str("smtp_user")).strip()
+    password = os.environ.get("SMTP_PASSWORD") or _setting_str("smtp_password")
+    from_addr = (os.environ.get("SMTP_FROM") or _setting_str("smtp_from")).strip()
+    use_tls = _setting_bool("smtp_use_tls")
+    if (os.environ.get("SMTP_USE_TLS") or "").lower() in ("0", "false", "no"):
+        use_tls = False
+    return {"host": host, "port": port, "user": user, "password": password, "from": from_addr, "use_tls": use_tls}
+
+
+def _user_email(uid: str) -> str | None:
+    with cursor() as c:
+        c.execute("SELECT email FROM users WHERE id = ?", (uid,))
+        row = c.fetchone()
+    e = (row[0] or "").strip() if row else ""
+    return e if e and "@" in e else None
+
+
+def _hr_notification_emails() -> list[str]:
+    out = []
+    with cursor() as c:
+        c.execute(
+            "SELECT email FROM users WHERE is_active = 1 AND role IN ('hr','admin') AND email IS NOT NULL AND TRIM(email) != ''"
+        )
+        for row in c.fetchall():
+            e = (row[0] or "").strip()
+            if "@" in e:
+                out.append(e)
+    return list(dict.fromkeys(out))
+
+
+def _send_leave_email(to_addrs: list[str], subject: str, body: str) -> None:
+    if not _leave_emails_enabled():
+        return
+    cfg = _get_smtp_config()
+    if not cfg.get("host") or not cfg.get("from"):
+        logger.warning("Leave email skipped: configure smtp_host and smtp_from (or SMTP_* env vars)")
+        return
+    recipients = [a.strip() for a in to_addrs if a and "@" in a]
+    if not recipients:
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = cfg["from"]
+        msg["To"] = ", ".join(recipients)
+        msg.set_content(body)
+        if cfg["port"] == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=45) as smtp:
+                if cfg["user"] and cfg["password"]:
+                    smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=45) as smtp:
+                if cfg["use_tls"]:
+                    smtp.starttls(context=ssl.create_default_context())
+                if cfg["user"] and cfg["password"]:
+                    smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(msg)
+        logger.info("Leave email sent: %s -> %s", subject, recipients)
+    except Exception as e:
+        logger.warning("Leave email failed (%s): %s", subject, e)
+
+
+def _leave_email_body(d: dict) -> list[str]:
+    emp = d.get("employee_name") or "Employee"
+    return [
+        f"Employee: {emp}",
+        f"Leave type: {d.get('leave_type_name') or '-'}",
+        f"Dates: {d.get('start_date')} → {d.get('end_date')}",
+        f"Days: {d.get('days_requested')}",
+        f"Reason: {d.get('reason') or '-'}",
+        "",
+        "Open the HR Suite in your browser to view details and take action.",
+    ]
+
+
+def _leave_request_email_detail(req_id: str) -> dict | None:
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lr.*, u.full_name as employee_name, u.email as employee_email, lt.name as leave_type_name
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE lr.id = ?
+            """,
+            (req_id,),
+        )
+        row = c.fetchone()
+    return row_to_dict(row) if row else None
+
+
+def _notify_leave_approver(req_id: str, approver_id: str | None, intro: str):
+    d = _leave_request_email_detail(req_id)
+    if not d or not approver_id:
+        return
+    to = _user_email(approver_id)
+    if not to:
+        return
+    lines = [intro, ""] + _leave_email_body(d)
+    _send_leave_email([to], f"[Leave] Action required - {d.get('employee_name')}", "\n".join(lines))
+
+
+def _notify_leave_employee(req_id: str, title: str, extra: str = ""):
+    d = _leave_request_email_detail(req_id)
+    if not d:
+        return
+    to = d.get("employee_email") or _user_email(d.get("user_id") or "")
+    if not to:
+        return
+    lines = [f"Dear {d.get('employee_name') or 'colleague'},", "", title, ""] + _leave_email_body(d)
+    if extra:
+        lines.extend(["", extra])
+    _send_leave_email([to], f"[Leave] {title}", "\n".join(lines))
+
+
+def _notify_leave_hr_info(subject: str, req_id: str, note: str):
+    d = _leave_request_email_detail(req_id)
+    if not d:
+        return
+    body = "\n".join([note, ""] + _leave_email_body(d))
+    for em in _hr_notification_emails():
+        _send_leave_email([em], subject, body)
+
+
+def _send_app_email(to_addrs: list[str], subject: str, body: str) -> None:
+    """Transactional email (certificates, appraisal) when SMTP is configured. Independent of leave_email_enabled."""
+    cfg = _get_smtp_config()
+    if not cfg.get("host") or not cfg.get("from"):
+        return
+    recipients = [a.strip() for a in to_addrs if a and "@" in a]
+    if not recipients:
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = cfg["from"]
+        msg["To"] = ", ".join(recipients)
+        msg.set_content(body)
+        if cfg["port"] == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=45) as smtp:
+                if cfg["user"] and cfg["password"]:
+                    smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=45) as smtp:
+                if cfg["use_tls"]:
+                    smtp.starttls(context=ssl.create_default_context())
+                if cfg["user"] and cfg["password"]:
+                    smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(msg)
+        logger.info("App email sent: %s -> %s", subject, recipients)
+    except Exception as e:
+        logger.warning("App email failed (%s): %s", subject, e)
+
+
+def _insert_notification(recipient_id: str, kind: str, title: str, body: str | None, link: str | None):
+    rid = (recipient_id or "").strip()
+    if not rid:
+        return
+    nid = new_id()
+    lk = (link or "").strip()[:500] or None
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO notifications (id, user_id, kind, title, body, link, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (nid, rid, (kind or "notice")[:80], (title or "Notice")[:500], body, lk, _now_iso()),
+        )
+
+
+def _employee_display_name(uid: str) -> str:
+    u = _get_user_profile_min(uid) or {}
+    return ((u.get("full_name") or u.get("email") or "Employee") or "").strip() or "Employee"
+
+
+def _notify_leave_approver_inbox(req_id: str, approver_id: str | None):
+    if not approver_id:
+        return
+    d = _leave_request_email_detail(req_id)
+    emp = (d or {}).get("employee_name") or _employee_display_name((d or {}).get("user_id") or "")
+    sub = f"{(d or {}).get('leave_type_name') or 'Leave'} · {(d or {}).get('start_date')} → {(d or {}).get('end_date')}"
+    _insert_notification(approver_id, "leave_pending", f"Leave to approve: {emp}", sub, "/hr/leave")
+
+
+def _notify_hr_admins_staff_certificate(staff_user_id: str, doc_title: str):
+    staff_name = _employee_display_name(staff_user_id)
+    title = f"New certificate: {staff_name}"
+    body = f"{staff_name} uploaded a certificate: {doc_title or 'Document'}"
+    link = "/hr/employees"
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE is_active = 1 AND role IN ('hr','admin')")
+        for (hid,) in c.fetchall():
+            _insert_notification(hid, "staff_certificate", title, body, link)
+    for em in _hr_notification_emails():
+        _send_app_email([em], "[HR Suite] " + title, body + "\n\nReview under Employee records in the HR Suite.")
+
+
+def _notify_manager_appraisal_submitted(manager_id: str | None, staff_id: str, work_label: str):
+    if not manager_id:
+        return
+    staff_name = _employee_display_name(staff_id)
+    title = f"{work_label} submitted: {staff_name}"
+    body = f"{staff_name} submitted work for your review in Performance / Appraisal."
+    _insert_notification(manager_id, "appraisal_pending", title, body, "/manager/appraisal")
+    to = _user_email(manager_id)
+    if to:
+        _send_app_email([to], "[HR Suite] " + title, body + "\n\nOpen Appraisal (manager) in the HR Suite to continue.")
+
+
+def _ensure_leave_balance_rows_for_user(uid: str, year: int) -> None:
+    """
+    Create leave_balances rows from leave_types defaults when missing for this user/year.
+    Without rows, the UI falls back to lt.default_days for everyone (same numbers for all staff).
+    """
+    if not (uid or "").strip():
+        return
+    annual_override = None
+    raw = (os.getenv("HR_SUITE_ANNUAL_LEAVE_DAYS") or "").strip()
+    if raw:
+        try:
+            annual_override = float(raw)
+        except ValueError:
+            pass
+    with cursor() as c:
+        c.execute("SELECT id, code, default_days FROM leave_types WHERE is_active = 1")
+        types = [(r[0], (r[1] or "").strip().upper(), float(r[2] or 0)) for r in c.fetchall()]
+    for lt_id, code, alloc in types:
+        if code == "ANNUAL" and annual_override is not None:
+            alloc = annual_override
+        elif code == "ANNUAL":
+            alloc = _annual_entitlement_days(uid)
+        with cursor() as c:
+            c.execute(
+                "SELECT 1 FROM leave_balances WHERE user_id = ? AND leave_type_id = ? AND year = ? LIMIT 1",
+                (uid, lt_id, year),
+            )
+            if c.fetchone():
+                continue
+        bid = new_id()
+        with cursor() as c:
+            c.execute(
+                """
+                INSERT INTO leave_balances (id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                """,
+                (bid, uid, lt_id, year, alloc, alloc, _now_iso(), _now_iso()),
+            )
+    _refresh_annual_balance_allocation(uid, year)
+
+
+def _leave_balances_for_user(uid: str, year: int) -> list[dict]:
+    _refresh_annual_balance_allocation(uid, year)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lt.id as leave_type_id, lt.name as leave_name, lt.code as leave_code,
+                COALESCE(lb.allocated_days, lt.default_days) as allocated_days,
+                COALESCE(lb.used_days, 0) as used_days,
+                COALESCE(lb.remaining_days, COALESCE(lb.allocated_days, lt.default_days) - COALESCE(lb.used_days, 0)) as remaining_days
+            FROM leave_types lt
+            LEFT JOIN leave_balances lb ON lb.leave_type_id = lt.id AND lb.user_id = ? AND lb.year = ?
+            WHERE lt.is_active = 1
+            ORDER BY lt.name
+            """,
+            (uid, year),
+        )
+        return [row_to_dict(r) for r in c.fetchall()]
+
+
+class LeaveRequestCreate(BaseModel):
+    leave_type_id: str
+    start_date: str
+    end_date: str
+    reason: str | None = None
+
+
+class LeaveAssignBody(BaseModel):
+    """Supervisor/HR books leave for a staff member (appears in their My Leave as approved)."""
+
+    staff_user_id: str
+    leave_type_id: str
+    start_date: str
+    end_date: str
+    reason: str | None = None
+
+
+def _assert_can_assign_leave_for_staff(actor: dict, staff_id: str):
+    role = (actor or {}).get("role") or ""
+    aid = (actor or {}).get("id") or ""
+    if role in ("admin", "hr"):
+        return
+    if role not in ("manager", "hod"):
+        raise HTTPException(status_code=403, detail="Only a supervisor or HR can assign leave")
+    with cursor() as c:
+        c.execute(
+            "SELECT id, manager_id, department, is_active FROM users WHERE id = ?",
+            (staff_id,),
+        )
+        row = c.fetchone()
+    if not row or not row[3]:
+        raise HTTPException(status_code=404, detail="Staff member not found or inactive")
+    if role == "manager":
+        if (row[1] or "").strip() != aid:
+            raise HTTPException(status_code=403, detail="You can only assign leave to your direct reports")
+        return
+    # hod: same department as the HOD (trimmed, case-insensitive)
+    dept_staff = (row[2] or "").strip().lower()
+    dept_hod = ((actor or {}).get("department") or "").strip().lower()
+    if not dept_hod or dept_staff != dept_hod:
+        raise HTTPException(status_code=403, detail="You can only assign leave to staff in your department")
+
+
+class LeaveActionBody(BaseModel):
+    comment: str | None = None
+
+
+@app.get("/leave/types")
+def list_leave_types(_: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_types WHERE is_active = 1 ORDER BY name")
+        return [row_to_dict(r) for r in c.fetchall()]
+
+
+class LeaveTypeCreate(BaseModel):
+    """Admin-only: add a new leave type (code must be unique, letters/numbers/underscore)."""
+
+    code: str
+    name: str
+    default_days: float = 0.0
+
+
+@app.post("/leave/types")
+def create_leave_type(body: LeaveTypeCreate, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin",))
+    raw_code = (body.code or "").strip().upper().replace(" ", "_").replace("-", "_")
+    raw_code = "".join(ch for ch in raw_code if ch.isalnum() or ch == "_")
+    if not raw_code or len(raw_code) > 40:
+        raise HTTPException(status_code=400, detail="Invalid code: use letters, numbers, underscores (max 40).")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    try:
+        dd = float(body.default_days or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="default_days must be a number")
+    if dd < 0 or dd > 3660:
+        raise HTTPException(status_code=400, detail="default_days out of range")
+    lid = new_id()
+    now = _now_iso()
+    with cursor() as c:
+        c.execute("SELECT id FROM leave_types WHERE UPPER(TRIM(code)) = UPPER(TRIM(?))", (raw_code,))
+        if c.fetchone():
+            raise HTTPException(status_code=400, detail="A leave type with this code already exists")
+        c.execute(
+            """
+            INSERT INTO leave_types (id, code, name, default_days, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            """,
+            (lid, raw_code, name, dd, now, now),
+        )
+        c.execute("SELECT * FROM leave_types WHERE id = ?", (lid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/leave/my-requests")
+def list_my_leave_requests(user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lr.*, lt.name as leave_type_name, creator.full_name as assigned_by_name
+            FROM leave_requests lr
+            JOIN leave_types lt ON lr.leave_type_id = lt.id
+            LEFT JOIN users creator ON creator.id = lr.created_by_user_id
+            WHERE lr.user_id = ?
+            ORDER BY lr.created_at DESC
+            """,
+            (user_id,),
+        )
+        return [row_to_dict(r) for r in c.fetchall()]
+
+
+@app.post("/leave/requests")
+def create_leave_request(req: LeaveRequestCreate, user_id: str = Depends(get_current_user_id)):
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    days_requested = _calculate_leave_days(req.start_date, req.end_date)
+    with cursor() as c:
+        c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (req.leave_type_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=400, detail="Invalid leave type")
+    rid = new_id()
+    with cursor() as c:
+        c.execute(
+            """
+            INSERT INTO leave_requests (id, user_id, leave_type_id, start_date, end_date, days_requested, reason, status, created_at, updated_at, created_by_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, NULL)
+            """,
+            (rid, user_id, req.leave_type_id, req.start_date, req.end_date, days_requested, (req.reason or "").strip() or None, _now_iso(), _now_iso()),
+        )
+    _leave_log(rid, "created", user_id, current.get("role"), None, None, req.reason)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (rid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/leave/assign")
+def assign_leave_to_staff(body: LeaveAssignBody, user_id: str = Depends(get_current_user_id)):
+    """Record approved leave for a team member (manager/HOD/HR/Admin). Shows on the employee's My Leave list."""
+    actor = _get_user_profile_min(user_id)
+    if not actor or not _user_is_active_row(actor):
+        raise HTTPException(status_code=401, detail="User not found")
+    staff_id = (body.staff_user_id or "").strip()
+    if not staff_id:
+        raise HTTPException(status_code=400, detail="staff_user_id is required")
+    if staff_id == user_id:
+        raise HTTPException(status_code=400, detail="Use the normal Apply flow for your own leave")
+    _assert_can_assign_leave_for_staff(actor, staff_id)
+    days_requested = _calculate_leave_days(body.start_date, body.end_date)
+    with cursor() as c:
+        c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (body.leave_type_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=400, detail="Invalid leave type")
+    rid = new_id()
+    now = _now_iso()
+    reason = (body.reason or "").strip() or None
+    with cursor() as c:
+        c.execute(
+            """
+            INSERT INTO leave_requests (
+                id, user_id, leave_type_id, start_date, end_date, days_requested, reason, status,
+                current_approver_id, final_decision_by, final_decision_at, created_at, updated_at, created_by_user_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', NULL, ?, ?, ?, ?, ?)
+            """,
+            (
+                rid,
+                staff_id,
+                body.leave_type_id,
+                body.start_date,
+                body.end_date,
+                days_requested,
+                reason,
+                user_id,
+                now,
+                now,
+                now,
+                user_id,
+            ),
+        )
+    _leave_log(rid, "assigned", user_id, actor.get("role"), staff_id, "employee", reason)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (rid,))
+        approved_row = row_to_dict(c.fetchone())
+    _sync_leave_balance_for_approved(approved_row)
+    extra = f"{body.start_date} → {body.end_date}"
+    if reason:
+        extra = f"{extra}. Note: {reason}"
+    _notify_leave_employee(rid, "Leave was assigned to you by a supervisor.", extra)
+    staff_prof = _get_user_profile_min(staff_id) or {}
+    staff_nm = (staff_prof.get("full_name") or "Staff").strip() or "Staff"
+    _notify_leave_hr_info(
+        "[Leave] Assigned by supervisor",
+        rid,
+        f"{(actor.get('full_name') or actor.get('email') or 'Supervisor').strip()} assigned approved leave to {staff_nm} ({body.start_date} to {body.end_date}).",
+    )
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lr.*, lt.name as leave_type_name, creator.full_name as assigned_by_name
+            FROM leave_requests lr
+            JOIN leave_types lt ON lr.leave_type_id = lt.id
+            LEFT JOIN users creator ON creator.id = lr.created_by_user_id
+            WHERE lr.id = ?
+            """,
+            (rid,),
+        )
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/leave/requests/{leave_request_id}/submit")
+def submit_leave_request(leave_request_id: str, user_id: str = Depends(get_current_user_id)):
+    current = _get_user_profile_min(user_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if req["user_id"] != user_id and current.get("role") not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if req["status"] not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="Only draft or returned requests can be submitted")
+    approver_id = _first_leave_approver(req["user_id"])
+    if not approver_id:
+        with cursor() as c:
+            c.execute(
+                "UPDATE leave_requests SET status = 'approved', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ? WHERE id = ?",
+                (user_id, _now_iso(), _now_iso(), leave_request_id),
+            )
+        _leave_log(leave_request_id, "auto_approved_no_approver", user_id, current.get("role"), None, None, None)
+        with cursor() as c:
+            c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+            approved = row_to_dict(c.fetchone())
+        _sync_leave_balance_for_approved(approved)
+        _notify_leave_employee(leave_request_id, "Your leave request was approved (no supervisor assigned in your profile).", "")
+        _notify_leave_hr_info(
+            "[Leave] Approved (auto)",
+            leave_request_id,
+            "A leave request was auto-approved (no active supervisor on file - set Manager / report-to in People).",
+        )
+        return approved
+    approver_profile = _get_user_profile_min(approver_id)
+    approver_role = (approver_profile or {}).get("role") or "supervisor"
+    next_status = "pending_manager"
+    with cursor() as c:
+        c.execute(
+            "UPDATE leave_requests SET status = ?, current_approver_id = ?, updated_at = ? WHERE id = ?",
+            (next_status, approver_id, _now_iso(), leave_request_id),
+        )
+    _leave_log(leave_request_id, "submitted", user_id, current.get("role"), approver_id, approver_role, None)
+    _notify_leave_approver(
+        leave_request_id,
+        approver_id,
+        "You are the current approver: a team member submitted a leave request. Sign in to the HR Suite dashboard or Leave approvals to review it.",
+    )
+    _notify_leave_approver_inbox(leave_request_id, approver_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/leave/requests/{leave_request_id}/cancel")
+def cancel_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: str = Depends(get_current_user_id)):
+    current = _get_user_profile_min(user_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if req["user_id"] != user_id and current.get("role") not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if req["status"] in ("approved", "rejected", "cancelled"):
+        raise HTTPException(status_code=400, detail="Request cannot be cancelled in current status")
+    with cursor() as c:
+        c.execute(
+            "UPDATE leave_requests SET status = 'cancelled', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+            (_now_iso(), leave_request_id),
+        )
+    _leave_log(leave_request_id, "cancelled", user_id, current.get("role"), None, None, body.comment)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/leave/pending")
+def get_pending_leave_requests(user_id: str = Depends(get_current_user_id)):
+    """Supervisor chain (OrangeHRM-style): inbox is only requests where you are the current approver."""
+    y = datetime.utcnow().year
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lr.*, u.full_name as staff_name, u.email as staff_email, lt.name as leave_type_name
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE lr.current_approver_id = ?
+            ORDER BY lr.created_at DESC
+            """,
+            (user_id,),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    for d in rows:
+        suid = d.get("user_id")
+        if suid:
+            _ensure_leave_balance_rows_for_user(suid, y)
+            d["requester_balances"] = _leave_balances_for_user(suid, y)
+        else:
+            d["requester_balances"] = []
+    return rows
+
+
+def _act_on_leave(leave_request_id: str, user_id: str, action: str, body: LeaveActionBody):
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if req.get("current_approver_id") != user_id and current.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="You are not the current approver")
+    if req.get("status") not in ("pending_manager", "pending_hod", "pending_hr"):
+        raise HTTPException(status_code=400, detail="Leave request is not pending approval")
+    comment = (body.comment or "").strip()
+    if action in ("reject", "return") and not comment:
+        raise HTTPException(status_code=400, detail="Comment is required for this action")
+    if action == "approve":
+        next_user_id = _next_leave_approver_after_step(user_id, req["user_id"])
+        if not next_user_id:
+            with cursor() as c:
+                c.execute(
+                    """
+                    UPDATE leave_requests
+                    SET status = 'approved', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (user_id, _now_iso(), _now_iso(), leave_request_id),
+                )
+            _leave_log(leave_request_id, "approved", user_id, current.get("role"), None, None, comment or None)
+            with cursor() as c:
+                c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+                approved = row_to_dict(c.fetchone())
+            _sync_leave_balance_for_approved(approved)
+            extra = f"Approver note: {comment}" if comment else ""
+            _notify_leave_employee(leave_request_id, "Your leave request was fully approved.", extra)
+            _notify_leave_hr_info("[Leave] Final approval", leave_request_id, "A leave request was fully approved in the supervisor chain.")
+            return approved
+        nxt_profile = _get_user_profile_min(next_user_id)
+        next_role = (nxt_profile or {}).get("role") or "supervisor"
+        with cursor() as c:
+            c.execute(
+                "UPDATE leave_requests SET status = 'pending_manager', current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (next_user_id, _now_iso(), leave_request_id),
+            )
+        _leave_log(leave_request_id, "approved_step", user_id, current.get("role"), next_user_id, next_role, comment or None)
+        _notify_leave_approver(
+            leave_request_id,
+            next_user_id,
+            "You are the next approver in the supervisor chain: a leave request was forwarded to you after the previous approval.",
+        )
+        _notify_leave_approver_inbox(leave_request_id, next_user_id)
+        actor_nm = (current.get("full_name") or current.get("email") or "Approver").strip()
+        _notify_leave_hr_info(
+            "[Leave] Approval step (forwarded)",
+            leave_request_id,
+            f"{actor_nm} approved one step; the request was forwarded to the next approver in the reporting chain.",
+        )
+    elif action == "reject":
+        with cursor() as c:
+            c.execute(
+                """
+                UPDATE leave_requests
+                SET status = 'rejected', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (user_id, _now_iso(), _now_iso(), leave_request_id),
+            )
+        _leave_log(leave_request_id, "rejected", user_id, current.get("role"), req.get("user_id"), "employee", comment)
+        _notify_leave_employee(leave_request_id, "Your leave request was rejected.", f"Comment: {comment}")
+        _notify_leave_hr_info("[Leave] Rejected", leave_request_id, f"Rejected by workflow. Comment: {comment}")
+    elif action == "return":
+        with cursor() as c:
+            c.execute(
+                "UPDATE leave_requests SET status = 'returned', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                (_now_iso(), leave_request_id),
+            )
+        _leave_log(leave_request_id, "returned", user_id, current.get("role"), req.get("user_id"), "employee", comment)
+        _notify_leave_employee(leave_request_id, "Your leave request was returned for changes.", f"Comment: {comment}")
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.post("/leave/requests/{leave_request_id}/approve")
+def approve_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: str = Depends(get_current_user_id)):
+    return _act_on_leave(leave_request_id, user_id, "approve", body)
+
+
+@app.post("/leave/requests/{leave_request_id}/reject")
+def reject_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: str = Depends(get_current_user_id)):
+    return _act_on_leave(leave_request_id, user_id, "reject", body)
+
+
+@app.post("/leave/requests/{leave_request_id}/return")
+def return_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: str = Depends(get_current_user_id)):
+    return _act_on_leave(leave_request_id, user_id, "return", body)
+
+
+@app.get("/leave/requests/{leave_request_id}/workflow")
+def get_leave_workflow(leave_request_id: str, user_id: str = Depends(get_current_user_id)):
+    current = _get_user_profile_min(user_id)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if req.get("user_id") != user_id and current.get("role") not in ("admin", "hr", "manager", "hod"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT l.*, u.full_name as from_name, t.full_name as to_name
+            FROM leave_workflow_logs l
+            LEFT JOIN users u ON u.id = l.from_user_id
+            LEFT JOIN users t ON t.id = l.to_user_id
+            WHERE leave_request_id = ?
+            ORDER BY created_at ASC
+            """,
+            (leave_request_id,),
+        )
+        logs = [row_to_dict(r) for r in c.fetchall()]
+    return {"request": req, "logs": logs}
+
+
+@app.get("/leave/reports/summary")
+def leave_reports_summary(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    as_of: str | None = None,
+    department: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    """HR leave analytics: period uses calendar overlap (any leave touching the range). Department from user profile; blank → 'Unassigned'."""
+    _require_roles(user_id, ("hr", "admin"))
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    fd = from_date or (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
+    td = to_date or today
+    _parse_yyyy_mm_dd(fd)
+    _parse_yyyy_mm_dd(td)
+    if fd > td:
+        raise HTTPException(status_code=400, detail="from_date must be on or before to_date")
+    as_of_d = as_of or today
+    _parse_yyyy_mm_dd(as_of_d)
+
+    dept_filter_lr = ""
+    dept_params: list = []
+    if department and str(department).strip():
+        dept_filter_lr = " AND TRIM(COALESCE(u.department, '')) = TRIM(?) "
+        dept_params = [department.strip()]
+
+    dept_filter_u = ""
+    if department and str(department).strip():
+        dept_filter_u = " AND TRIM(COALESCE(u.department, '')) = TRIM(?) "
+
+    overlap = "(lr.start_date <= ? AND lr.end_date >= ?)"
+    overlap_params = [td, fd]
+
+    dept_expr_u = "COALESCE(NULLIF(TRIM(u.department), ''), 'Unassigned')"
+    dept_expr_plain = "COALESCE(NULLIF(TRIM(department), ''), 'Unassigned')"
+    active_u = "u.is_active = 1 AND COALESCE(TRIM(u.role), '') != 'admin'"
+    active_plain = "is_active = 1 AND COALESCE(TRIM(role), '') != 'admin'"
+
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT lr.status, COUNT(*) AS count FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE {overlap}
+            {dept_filter_lr}
+            """,
+            tuple(overlap_params + dept_params),
+        )
+        by_status = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT u.full_name, u.email, COUNT(*) AS total_requests, SUM(lr.days_requested) AS total_days
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE {overlap}
+            {dept_filter_lr}
+            GROUP BY lr.user_id
+            ORDER BY total_requests DESC
+            LIMIT 30
+            """,
+            tuple(overlap_params + dept_params),
+        )
+        top_requesters = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT u.full_name, u.email, {dept_expr_u} AS department,
+                   SUM(CASE WHEN lr.status = 'approved' THEN lr.days_requested ELSE 0 END) AS approved_days,
+                   SUM(CASE WHEN lr.status = 'approved' THEN 1 ELSE 0 END) AS approved_requests,
+                   SUM(CASE WHEN lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
+                        THEN lr.days_requested ELSE 0 END) AS pending_days,
+                   SUM(CASE WHEN lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
+                        THEN 1 ELSE 0 END) AS pending_requests,
+                   COUNT(*) AS total_requests,
+                   SUM(lr.days_requested) AS total_days
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE {overlap}
+              AND {active_u}
+            {dept_filter_lr}
+            GROUP BY lr.user_id
+            ORDER BY approved_days DESC, pending_days DESC, u.full_name COLLATE NOCASE
+            LIMIT 400
+            """,
+            tuple(overlap_params + dept_params),
+        )
+        staff_leave_activity = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT {dept_expr_u} AS department,
+                   COUNT(*) AS total_requests,
+                   SUM(lr.days_requested) AS total_days,
+                   SUM(CASE WHEN lr.status = 'approved' THEN lr.days_requested ELSE 0 END) AS approved_days,
+                   SUM(CASE WHEN lr.status = 'approved' THEN 1 ELSE 0 END) AS approved_requests,
+                   SUM(CASE WHEN lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
+                        THEN lr.days_requested ELSE 0 END) AS pending_days,
+                   SUM(CASE WHEN lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
+                        THEN 1 ELSE 0 END) AS pending_requests
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE {overlap}
+            {dept_filter_lr}
+            GROUP BY department
+            """,
+            tuple(overlap_params + dept_params),
+        )
+        req_by_dept = {row_to_dict(r)["department"]: row_to_dict(r) for r in c.fetchall()}
+
+        c.execute(
+            f"""
+            SELECT {dept_expr_plain} AS department, COUNT(*) AS active_staff
+            FROM users
+            WHERE {active_plain}
+            {dept_filter_u}
+            GROUP BY department
+            """,
+            tuple(dept_params),
+        )
+        active_by_dept = {row_to_dict(r)["department"]: row_to_dict(r) for r in c.fetchall()}
+
+        c.execute(
+            f"""
+            SELECT {dept_expr_u} AS department, COUNT(DISTINCT lr.user_id) AS on_leave
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE lr.status = 'approved'
+              AND lr.start_date <= ? AND lr.end_date >= ?
+              AND {active_u}
+            {dept_filter_lr}
+            GROUP BY department
+            """,
+            tuple([as_of_d, as_of_d] + dept_params),
+        )
+        on_leave_by_dept = {row_to_dict(r)["department"]: row_to_dict(r) for r in c.fetchall()}
+
+        c.execute(
+            f"""
+            SELECT COUNT(DISTINCT lr.user_id) AS n
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE lr.status = 'approved'
+              AND lr.start_date <= ? AND lr.end_date >= ?
+              AND {active_u}
+            {dept_filter_lr}
+            """,
+            tuple([as_of_d, as_of_d] + dept_params),
+        )
+        on_leave_total = int((c.fetchone() or [0])[0] or 0)
+
+        c.execute(
+            f"""
+            SELECT lr.id, u.full_name, u.email, {dept_expr_u} AS department,
+                   lr.start_date, lr.end_date, lr.days_requested, lt.name AS leave_type_name
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE lr.status = 'approved'
+              AND lr.start_date <= ? AND lr.end_date >= ?
+              AND {active_u}
+            {dept_filter_lr}
+            ORDER BY {dept_expr_u} COLLATE NOCASE, u.full_name COLLATE NOCASE
+            LIMIT 200
+            """,
+            tuple([as_of_d, as_of_d] + dept_params),
+        )
+        on_leave_rows = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM users u
+            WHERE {active_u}
+            {dept_filter_u}
+            AND NOT EXISTS (
+                SELECT 1 FROM leave_requests lr
+                WHERE lr.user_id = u.id AND lr.status = 'approved'
+                  AND lr.start_date <= ? AND lr.end_date >= ?
+            )
+            """,
+            tuple(dept_params + [td, fd]),
+        )
+        no_leave_total = int((c.fetchone() or [0])[0] or 0)
+
+        c.execute(
+            f"""
+            SELECT u.full_name, u.email, {dept_expr_u} AS department, u.role
+            FROM users u
+            WHERE {active_u}
+            {dept_filter_u}
+            AND NOT EXISTS (
+                SELECT 1 FROM leave_requests lr
+                WHERE lr.user_id = u.id AND lr.status = 'approved'
+                  AND lr.start_date <= ? AND lr.end_date >= ?
+            )
+            ORDER BY {dept_expr_u} COLLATE NOCASE, u.full_name COLLATE NOCASE
+            LIMIT 400
+            """,
+            tuple(dept_params + [td, fd]),
+        )
+        no_leave_rows = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT {dept_expr_u} AS department, COUNT(*) AS n
+            FROM users u
+            WHERE {active_u}
+            {dept_filter_u}
+            AND NOT EXISTS (
+                SELECT 1 FROM leave_requests lr
+                WHERE lr.user_id = u.id AND lr.status = 'approved'
+                  AND lr.start_date <= ? AND lr.end_date >= ?
+            )
+            GROUP BY department
+            """,
+            tuple(dept_params + [td, fd]),
+        )
+        no_leave_by_dept = {}
+        for r in c.fetchall():
+            d = row_to_dict(r)
+            no_leave_by_dept[d["department"]] = int(d.get("n") or 0)
+
+        c.execute(
+            f"""
+            SELECT COUNT(*) AS n FROM users u
+            WHERE {active_u}
+            {dept_filter_u}
+            """,
+            tuple(dept_params),
+        )
+        staff_in_scope = int((c.fetchone() or [0])[0] or 0)
+
+    all_depts = set(active_by_dept) | set(req_by_dept) | set(on_leave_by_dept) | set(no_leave_by_dept.keys())
+
+    def dept_sort_key(d):
+        return (0 if d == "Unassigned" else 1, (d or "").lower())
+
+    department_breakdown = []
+    for dept in sorted(all_depts, key=dept_sort_key):
+        rb = req_by_dept.get(dept, {})
+        ab = active_by_dept.get(dept, {})
+        ob = on_leave_by_dept.get(dept, {})
+        department_breakdown.append(
+            {
+                "department": dept,
+                "active_staff": int(ab.get("active_staff") or 0),
+                "on_leave_as_of": int(ob.get("on_leave") or 0),
+                "requests_in_period": int(rb.get("total_requests") or 0),
+                "total_days_in_period": round(float(rb.get("total_days") or 0), 2),
+                "approved_days_in_period": round(float(rb.get("approved_days") or 0), 2),
+                "approved_requests_in_period": int(rb.get("approved_requests") or 0),
+                "pending_days_in_period": round(float(rb.get("pending_days") or 0), 2),
+                "pending_requests_in_period": int(rb.get("pending_requests") or 0),
+                "no_approved_leave_in_period": int(no_leave_by_dept.get(dept, 0)),
+            }
+        )
+
+    total_requests = sum(int(r.get("count") or 0) for r in by_status)
+    approved = next((int(r.get("count") or 0) for r in by_status if r.get("status") == "approved"), 0)
+    rejected = next((int(r.get("count") or 0) for r in by_status if r.get("status") == "rejected"), 0)
+
+    by_department_simple = [
+        {
+            "department": row["department"],
+            "total_requests": row["requests_in_period"],
+            "total_days": row["total_days_in_period"],
+            "approved_days": row["approved_days_in_period"],
+            "pending_days": row["pending_days_in_period"],
+        }
+        for row in department_breakdown
+    ]
+
+    approved_days_period_total = round(
+        sum(float(r.get("approved_days_in_period") or 0) for r in department_breakdown), 2
+    )
+    pending_days_period_total = round(
+        sum(float(r.get("pending_days_in_period") or 0) for r in department_breakdown), 2
+    )
+    pending_requests_period_total = sum(int(r.get("pending_requests_in_period") or 0) for r in department_breakdown)
+
+    return {
+        "period": {"from_date": fd, "to_date": td, "as_of": as_of_d},
+        "note": "Counts use leave periods overlapping from_date–to_date. Staff scope: active users except admin. Empty department shows as Unassigned. Pending = submitted / in workflow / returned (not draft). Taken = approved leave days in the period.",
+        "staff_in_scope": staff_in_scope,
+        "on_leave_as_of_count": on_leave_total,
+        "on_leave_as_of": on_leave_rows,
+        "no_approved_leave_in_period_count": no_leave_total,
+        "no_approved_leave_in_period": no_leave_rows,
+        "total_requests": total_requests,
+        "approved_count": approved,
+        "rejected_count": rejected,
+        "approval_rate_pct": round((approved / total_requests) * 100, 1) if total_requests else 0,
+        "rejection_rate_pct": round((rejected / total_requests) * 100, 1) if total_requests else 0,
+        "by_status": by_status,
+        "by_department": by_department_simple,
+        "department_breakdown": department_breakdown,
+        "top_requesters": top_requesters,
+        "staff_leave_activity": staff_leave_activity,
+        "leave_totals_in_period": {
+            "approved_days": approved_days_period_total,
+            "pending_days": pending_days_period_total,
+            "pending_requests": pending_requests_period_total,
+        },
+    }
+
+
+@app.get("/leave/balances")
+def leave_balances(
+    year: int | None = None,
+    target_user_id: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    y = year or datetime.utcnow().year
+    if target_user_id and target_user_id != user_id and current.get("role") not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    # Single-user balance view
+    if target_user_id or current.get("role") not in ("hr", "admin"):
+        uid = target_user_id or user_id
+        _ensure_leave_balance_rows_for_user(uid, y)
+        with cursor() as c:
+            c.execute(
+                """
+                SELECT
+                    lt.id as leave_type_id,
+                    lt.code as leave_code,
+                    lt.name as leave_name,
+                    COALESCE(lb.allocated_days, lt.default_days) as allocated_days,
+                    COALESCE(lb.used_days, 0) as used_days,
+                    COALESCE(lb.remaining_days, COALESCE(lb.allocated_days, lt.default_days) - COALESCE(lb.used_days, 0)) as remaining_days
+                FROM leave_types lt
+                LEFT JOIN leave_balances lb
+                  ON lb.leave_type_id = lt.id AND lb.user_id = ? AND lb.year = ?
+                WHERE lt.is_active = 1
+                ORDER BY lt.name
+                """,
+                (uid, y),
+            )
+            rows = [row_to_dict(r) for r in c.fetchall()]
+        return {"year": y, "user_id": uid, "rows": rows}
+    # HR/Admin all users summary
+    _refresh_all_annual_leave_balances_for_year(y)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT
+                u.id as user_id,
+                u.full_name,
+                u.email,
+                u.department,
+                lt.name as leave_name,
+                COALESCE(lb.allocated_days, lt.default_days) as allocated_days,
+                COALESCE(lb.used_days, 0) as used_days,
+                COALESCE(lb.remaining_days, COALESCE(lb.allocated_days, lt.default_days) - COALESCE(lb.used_days, 0)) as remaining_days
+            FROM users u
+            JOIN leave_types lt ON lt.is_active = 1
+            LEFT JOIN leave_balances lb
+              ON lb.user_id = u.id AND lb.leave_type_id = lt.id AND lb.year = ?
+            WHERE u.is_active = 1
+            ORDER BY u.full_name, lt.name
+            """,
+            (y,),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    return {"year": y, "rows": rows}
+
+
+@app.get("/leave/my-dashboard")
+def leave_my_dashboard(user_id: str = Depends(get_current_user_id)):
+    """Employee-focused leave snapshot: balances, pending requests, approver workload."""
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    y = datetime.utcnow().year
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    _ensure_leave_balance_rows_for_user(user_id, y)
+    balances = _leave_balances_for_user(user_id, y)
+    total_remaining = sum(float(r.get("remaining_days") or 0) for r in balances)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT COUNT(*) FROM leave_requests
+            WHERE user_id = ? AND status IN ('draft','submitted','pending_manager','pending_hod','pending_hr','returned')
+            """,
+            (user_id,),
+        )
+        my_pending = c.fetchone()[0]
+        c.execute(
+            """
+            SELECT COUNT(*) FROM leave_requests
+            WHERE user_id = ? AND status = 'approved' AND start_date <= ? AND end_date >= ?
+            """,
+            (user_id, today, today),
+        )
+        on_leave_today = c.fetchone()[0]
+    approval_queue = 0
+    pending_approvals_preview: list[dict] = []
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT COUNT(*) FROM leave_requests lr
+            WHERE lr.current_approver_id = ?
+            """,
+            (user_id,),
+        )
+        approval_queue = c.fetchone()[0] or 0
+        if approval_queue:
+            c.execute(
+                """
+                SELECT lr.id, u.full_name as staff_name, u.email as staff_email,
+                       lr.start_date, lr.end_date, lr.days_requested, lt.name as leave_type_name
+                FROM leave_requests lr
+                JOIN users u ON u.id = lr.user_id
+                JOIN leave_types lt ON lt.id = lr.leave_type_id
+                WHERE lr.current_approver_id = ?
+                ORDER BY lr.created_at ASC
+                LIMIT 15
+                """,
+                (user_id,),
+            )
+            pending_approvals_preview = [row_to_dict(r) for r in c.fetchall()]
+    return {
+        "year": y,
+        "viewer": {"id": user_id, "full_name": current.get("full_name") or ""},
+        "balances": balances,
+        "total_remaining_days": round(total_remaining, 2),
+        "my_pending_requests": my_pending,
+        "on_leave_today": bool(on_leave_today),
+        "approval_queue_count": approval_queue,
+        "pending_approvals_preview": pending_approvals_preview,
+    }
+
+
+@app.get("/leave/colleagues-on-leave")
+def leave_colleagues_on_leave(on_date: str | None = None, user_id: str = Depends(get_current_user_id)):
+    """Approved leave for colleagues in the same department (excludes current user)."""
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    dept = (current.get("department") or "").strip()
+    d = on_date or datetime.utcnow().strftime("%Y-%m-%d")
+    _parse_yyyy_mm_dd(d)
+    if not dept:
+        return {"on_date": d, "count": 0, "rows": [], "department": None}
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lr.id, lr.user_id, u.full_name, u.email, u.department, lt.name as leave_type_name,
+                   lr.start_date, lr.end_date, lr.days_requested
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE lr.status = 'approved' AND u.is_active = 1
+              AND lr.start_date <= ? AND lr.end_date >= ?
+              AND TRIM(COALESCE(u.department,'')) = TRIM(?)
+              AND u.id != ?
+            ORDER BY u.full_name COLLATE NOCASE
+            LIMIT 100
+            """,
+            (d, d, dept, user_id),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    return {"on_date": d, "count": len(rows), "rows": rows, "department": dept}
+
+
+def _rolling_month_keys_ending_now(count: int = 12):
+    """Oldest-first ISO 'YYYY-MM' keys for charting (UTC calendar months)."""
+    d = datetime.utcnow().date()
+    y, m = d.year, d.month
+    keys = []
+    for _ in range(count):
+        keys.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m < 1:
+            m = 12
+            y -= 1
+    return list(reversed(keys))
+
+
+@app.get("/leave/overview")
+def leave_overview(user_id: str = Depends(get_current_user_id)):
+    """HR/Admin dashboard: pipeline counts, today on leave, month snapshot."""
+    _require_roles(user_id, ("hr", "admin"))
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    ym = datetime.utcnow().strftime("%Y-%m")
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT status, COUNT(*) as n FROM leave_requests
+            WHERE status IN ('pending_manager','pending_hod','pending_hr')
+            GROUP BY status
+            """
+        )
+        pipeline = {row[0]: row[1] for row in c.fetchall()}
+        c.execute(
+            "SELECT COUNT(*) FROM leave_requests WHERE status IN ('pending_manager','pending_hod','pending_hr')"
+        )
+        pending_total = c.fetchone()[0]
+        c.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) FROM leave_requests
+            WHERE status = 'approved' AND start_date <= ? AND end_date >= ?
+            """,
+            (today, today),
+        )
+        staff_on_leave_today = c.fetchone()[0]
+        c.execute(
+            """
+            SELECT COUNT(*) FROM leave_requests
+            WHERE status = 'approved' AND final_decision_at IS NOT NULL AND substr(final_decision_at,1,7) = ?
+            """,
+            (ym,),
+        )
+        approved_this_month = c.fetchone()[0]
+        c.execute(
+            """
+            SELECT COUNT(*) FROM leave_requests
+            WHERE status = 'rejected' AND final_decision_at IS NOT NULL AND substr(final_decision_at,1,7) = ?
+            """,
+            (ym,),
+        )
+        rejected_this_month = c.fetchone()[0]
+        c.execute(
+            """
+            SELECT lr.id, u.full_name, u.email, lt.name as leave_type_name, lr.start_date, lr.end_date, lr.days_requested, lr.status
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE lr.status IN ('pending_manager','pending_hod','pending_hr')
+            ORDER BY lr.created_at DESC
+            LIMIT 15
+            """
+        )
+        recent_pending = [row_to_dict(r) for r in c.fetchall()]
+        c.execute(
+            """
+            SELECT lr.id, lr.user_id, u.full_name, u.email, u.department, lt.name as leave_type_name,
+                   lr.start_date, lr.end_date, lr.days_requested
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE lr.status = 'approved' AND u.is_active = 1
+              AND lr.start_date <= ? AND lr.end_date >= ?
+            ORDER BY u.department COLLATE NOCASE, u.full_name COLLATE NOCASE
+            LIMIT 80
+            """,
+            (today, today),
+        )
+        on_leave_today_detail = [row_to_dict(r) for r in c.fetchall()]
+        c.execute(
+            """
+            SELECT substr(final_decision_at, 1, 7) AS ym,
+                   SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved_n,
+                   SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_n
+            FROM leave_requests
+            WHERE status IN ('approved', 'rejected')
+              AND final_decision_at IS NOT NULL
+              AND length(final_decision_at) >= 7
+            GROUP BY substr(final_decision_at, 1, 7)
+            """
+        )
+        agg = {
+            row[0]: {"approved": int(row[1] or 0), "rejected": int(row[2] or 0)}
+            for row in c.fetchall()
+            if row[0]
+        }
+    monthly_decisions = []
+    for mk in _rolling_month_keys_ending_now(12):
+        bucket = agg.get(mk, {})
+        short = datetime.strptime(mk + "-01", "%Y-%m-%d").strftime("%b %y")
+        monthly_decisions.append(
+            {
+                "month": mk,
+                "label": short,
+                "approved": bucket.get("approved", 0),
+                "rejected": bucket.get("rejected", 0),
+            }
+        )
+    return {
+        "pending_total": pending_total,
+        "pipeline": pipeline,
+        "staff_on_leave_today": staff_on_leave_today,
+        "approved_this_month": approved_this_month,
+        "rejected_this_month": rejected_this_month,
+        "recent_pending": recent_pending,
+        "on_leave_today_detail": on_leave_today_detail,
+        "monthly_decisions": monthly_decisions,
+    }
+
+
+@app.get("/leave/filters")
+def leave_hr_filters(user_id: str = Depends(get_current_user_id)):
+    """Distinct departments from active users (for HR/Admin leave filters)."""
+    _require_roles(user_id, ("hr", "admin"))
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT DISTINCT TRIM(department) as d FROM users
+            WHERE is_active = 1 AND department IS NOT NULL AND TRIM(department) != ''
+            ORDER BY d COLLATE NOCASE
+            """
+        )
+        departments = [r[0] for r in c.fetchall() if r[0]]
+    return {"departments": departments}
+
+
+@app.get("/leave/on-leave")
+def leave_on_leave(
+    on_date: str | None = None,
+    department: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Approved leave overlapping a calendar day; optional department filter."""
+    _require_roles(user_id, ("hr", "admin"))
+    d = on_date or datetime.utcnow().strftime("%Y-%m-%d")
+    _parse_yyyy_mm_dd(d)
+    where = ["lr.status = 'approved'", "u.is_active = 1", "lr.start_date <= ?", "lr.end_date >= ?"]
+    params: list = [d, d]
+    if department and department.strip():
+        where.append("TRIM(COALESCE(u.department,'')) = TRIM(?)")
+        params.append(department.strip())
+    where_sql = " AND ".join(where)
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT lr.id, lr.user_id, u.full_name, u.email, u.department, lt.name as leave_type_name,
+                   lr.start_date, lr.end_date, lr.days_requested
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE {where_sql}
+            ORDER BY u.department COLLATE NOCASE, u.full_name COLLATE NOCASE
+            LIMIT 500
+            """,
+            tuple(params),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    return {"on_date": d, "count": len(rows), "rows": rows}
+
+
+@app.get("/leave/org-requests")
+def leave_org_requests(
+    department: str | None = None,
+    status: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    limit: int = 400,
+    user_id: str = Depends(get_current_user_id),
+):
+    """All leave requests with optional department, status, and date-range overlap on leave period."""
+    _require_roles(user_id, ("hr", "admin"))
+    limit = min(max(int(limit or 400), 1), 800)
+    where = ["1=1"]
+    params: list = []
+    if department and department.strip():
+        where.append("TRIM(COALESCE(u.department,'')) = TRIM(?)")
+        params.append(department.strip())
+    if status and status.strip():
+        parts = [s.strip() for s in status.split(",") if s.strip()]
+        if parts:
+            qs = ",".join("?" * len(parts))
+            where.append(f"lr.status IN ({qs})")
+            params.extend(parts)
+    if from_date:
+        _parse_yyyy_mm_dd(from_date)
+        where.append("lr.end_date >= ?")
+        params.append(from_date)
+    if to_date:
+        _parse_yyyy_mm_dd(to_date)
+        where.append("lr.start_date <= ?")
+        params.append(to_date)
+    if not from_date and not to_date:
+        ago = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
+        where.append("substr(COALESCE(lr.created_at,''),1,10) >= ?")
+        params.append(ago)
+    where_sql = " AND ".join(where)
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT lr.id, lr.user_id, u.full_name, u.email, u.department, lt.name as leave_type_name,
+                   lr.start_date, lr.end_date, lr.days_requested, lr.status, lr.created_at
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            WHERE u.is_active = 1 AND {where_sql}
+            ORDER BY lr.created_at DESC
+            LIMIT ?
+            """,
+            tuple(params + [limit]),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    return {"limit": limit, "rows": rows}
+
+
+@app.get("/leave/team-balances")
+def leave_team_balances(year: int | None = None, user_id: str = Depends(get_current_user_id)):
+    """Managers: direct reports. HOD: same department. HR/Admin: employees (preview list)."""
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    role = current.get("role")
+    if role not in ("manager", "hod", "hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    y = year or datetime.utcnow().year
+    members = []
+    with cursor() as c:
+        if role == "manager":
+            c.execute(
+                """
+                SELECT id, full_name, email, department FROM users
+                WHERE is_active = 1 AND manager_id = ?
+                ORDER BY full_name
+                """,
+                (user_id,),
+            )
+            members = c.fetchall()
+        elif role == "hod":
+            dept = (current.get("department") or "").strip()
+            if dept:
+                c.execute(
+                    """
+                    SELECT id, full_name, email, department FROM users
+                    WHERE is_active = 1 AND department = ? AND id != ?
+                    ORDER BY full_name
+                    """,
+                    (dept, user_id),
+                )
+                members = c.fetchall()
+        else:
+            c.execute(
+                """
+                SELECT id, full_name, email, department FROM users
+                WHERE is_active = 1 AND role = 'employee'
+                ORDER BY full_name
+                LIMIT 250
+                """
+            )
+            members = c.fetchall()
+    out = []
+    for m in members:
+        mid = m[0]
+        _ensure_leave_balance_rows_for_user(mid, y)
+        out.append(
+            {
+                "user_id": mid,
+                "full_name": m[1],
+                "email": m[2],
+                "department": m[3],
+                "balances": _leave_balances_for_user(mid, y),
+            }
+        )
+    return {"year": y, "members": out}

@@ -66,7 +66,7 @@ export function EmployeeAttendance() {
                   <tr key={log.id} className="text-gray-700 dark:text-gray-300">
                     <td className="px-4 py-2">{formatDate(log.clock_in_at)}</td>
                     <td className="px-4 py-2">{formatTime(log.clock_in_at)}</td>
-                    <td className="px-4 py-2">{log.clock_out_at ? formatTime(log.clock_out_at) : '—'}</td>
+                    <td className="px-4 py-2">{log.clock_out_at ? formatTime(log.clock_out_at) : '-'}</td>
                     <td className="px-4 py-2">{formatDuration(log.total_minutes)}</td>
                     <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded text-xs ${log.status === 'late' ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300' : 'bg-gray-100 dark:bg-gray-700'}`}>{log.status || 'present'}</span></td>
                   </tr>

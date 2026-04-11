@@ -15,10 +15,18 @@ dist-ssr
 # Backend uploads (HR documents)
 backend/uploads
 
+# Local dev stamps (npm run dev)
+backend/.dev-pip-stamp
+
 # Python
 __pycache__/
 *.pyc
 *.pyo
+backend/venv/
+venv/
+
+# Legacy reference tree (not part of this app)
+old hrms/
 
 # Environment and local DB
 .env

@@ -37,10 +37,10 @@ export function AdminAudit() {
                 {logs.map((log) => (
                   <tr key={log.id} className="text-gray-700 dark:text-gray-300 text-sm">
                     <td className="px-4 py-2">{formatDateTime(log.created_at)}</td>
-                    <td className="px-4 py-2">{log.users?.full_name || log.users?.email || '—'}</td>
+                    <td className="px-4 py-2">{log.users?.full_name || log.users?.email || '-'}</td>
                     <td className="px-4 py-2">{log.action}</td>
-                    <td className="px-4 py-2">{log.resource || '—'}</td>
-                    <td className="px-4 py-2">{log.details ? JSON.stringify(log.details) : '—'}</td>
+                    <td className="px-4 py-2">{log.resource || '-'}</td>
+                    <td className="px-4 py-2">{log.details ? JSON.stringify(log.details) : '-'}</td>
                   </tr>
                 ))}
               </tbody>

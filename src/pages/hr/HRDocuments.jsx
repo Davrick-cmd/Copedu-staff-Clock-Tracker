@@ -114,7 +114,7 @@ export function HRDocuments() {
                 <tr key={d.id} className="text-gray-700 dark:text-gray-300">
                   <td className="px-4 py-2">{d.title}</td>
                   <td className="px-4 py-2">{formatDateTime(d.created_at)}</td>
-                  <td className="px-4 py-2">{d.users?.full_name || '—'}</td>
+                  <td className="px-4 py-2">{d.users?.full_name || '-'}</td>
                   <td className="px-4 py-2">
                     <button type="button" onClick={() => handleDownload(d)} className="text-primary-600 dark:text-primary-400 hover:underline text-sm">Download</button>
                   </td>

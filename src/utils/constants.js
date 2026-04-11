@@ -1,17 +1,24 @@
 // App name and role constants
 export const APP_NAME = 'copedustaffclocktracker';
-export const APP_DISPLAY_NAME = 'CopeDu Staff Clock Tracker';
+/** Short product name (headers, login). */
+export const APP_DISPLAY_NAME = 'Copedu HR Suite';
+/** Full formal product name (marketing, login). */
+export const APP_FORMAL_NAME = 'Copedu Human Resource Suite';
 
 export const ROLES = {
   ADMIN: 'admin',
   HR: 'hr',
+  HOD: 'hod',
+  MANAGER: 'manager',
   EMPLOYEE: 'employee',
 };
 
-/** Display labels for roles (Admin, HR, Employee) */
+/** Display labels for roles */
 export const ROLE_LABELS = {
   [ROLES.ADMIN]: 'Admin',
   [ROLES.HR]: 'HR',
+  [ROLES.HOD]: 'Head of Department',
+  [ROLES.MANAGER]: 'Manager',
   [ROLES.EMPLOYEE]: 'Employee',
 };
 
@@ -37,14 +44,25 @@ export const ROUTES = {
     ATTENDANCE: '/employee/attendance',
     ANNOUNCEMENTS: '/employee/announcements',
     DOCUMENTS: '/employee/documents',
+    APPRAISAL: '/employee/appraisal',
+    LEAVE: '/employee/leave',
+    TEAM_LEAVE: '/employee/team-leave',
   },
   HR: {
     DASHBOARD: '/hr',
+    DASHBOARD_ATTENDANCE: '/hr/dashboard-attendance',
+    DASHBOARD_LEAVE: '/hr/dashboard-leave',
+    ORGANIZATION: '/hr/organization',
     EMPLOYEES: '/hr/employees',
     REPORTS: '/hr/reports',
+    LEAVE_BALANCES: '/hr/leave-balances',
     FLAGGED: '/hr/flagged',
     ANNOUNCEMENTS: '/hr/announcements',
     DOCUMENTS: '/hr/documents',
+    APPRAISAL: '/hr/appraisal',
+    LEAVE: '/hr/leave',
+    LEAVE_OVERVIEW: '/hr/leave-overview',
+    LEAVE_ORGANIZATION: '/hr/leave-organization',
   },
   ADMIN: {
     DASHBOARD: '/admin',
@@ -52,6 +70,15 @@ export const ROUTES = {
     BRANCHES: '/admin/branches',
     AUDIT: '/admin/audit',
     SETTINGS: '/admin/settings',
+    APPRAISAL: '/admin/appraisal',
+    LEAVE_TYPES: '/admin/leave-types',
+  },
+  APPRAISAL: {
+    CYCLES: '/appraisal/cycles',
+    STAFF: '/employee/appraisal',
+    MANAGER: '/manager/appraisal',
+    HOD: '/hod/appraisal',
+    HR: '/hr/appraisal',
   },
 };
 

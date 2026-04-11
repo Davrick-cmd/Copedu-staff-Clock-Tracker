@@ -21,7 +21,11 @@ def verify_password(plain: str, hashed: str) -> bool:
     if not hashed:
         return False
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        # OrangeHRM / PHP often stores $2y$; Python's bcrypt expects $2b$ (same format otherwise).
+        h = hashed
+        if h.startswith("$2y$") or h.startswith("$2a$"):
+            h = "$2b$" + h[4:]
+        return bcrypt.checkpw(plain.encode("utf-8"), h.encode("utf-8"))
     except Exception:
         return False
 

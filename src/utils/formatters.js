@@ -2,7 +2,7 @@
  * Format date for display (e.g. "12 Feb 2025")
  */
 export function formatDate(d) {
-  if (!d) return '—';
+  if (!d) return '-';
   const date = typeof d === 'string' ? new Date(d) : d;
   return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 }
@@ -11,7 +11,7 @@ export function formatDate(d) {
  * Format time (e.g. "09:15")
  */
 export function formatTime(d) {
-  if (!d) return '—';
+  if (!d) return '-';
   const date = typeof d === 'string' ? new Date(d) : d;
   return date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
@@ -20,7 +20,7 @@ export function formatTime(d) {
  * Format datetime
  */
 export function formatDateTime(d) {
-  if (!d) return '—';
+  if (!d) return '-';
   return `${formatDate(d)} ${formatTime(d)}`;
 }
 
@@ -28,7 +28,7 @@ export function formatDateTime(d) {
  * Format duration in minutes to "Xh Ym"
  */
 export function formatDuration(minutes) {
-  if (minutes == null || minutes < 0) return '—';
+  if (minutes == null || minutes < 0) return '-';
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
   if (h === 0) return `${m}m`;

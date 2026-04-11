@@ -66,7 +66,11 @@ export function RecognitionFeed() {
   const [mentionForRid, setMentionForRid] = useState(null);
   const [mentionQuery, setMentionQuery] = useState('');
   const [mentionStart, setMentionStart] = useState(0);
+  const [messageMentionQuery, setMessageMentionQuery] = useState('');
+  const [messageMentionStart, setMessageMentionStart] = useState(0);
+  const [showMessageMention, setShowMessageMention] = useState(false);
   const commentInputRefs = useRef({});
+  const messageInputRef = useRef(null);
 
   const loadRecognitions = () => api.getRecognitions().then(setRecognitions).catch(() => setRecognitions([]));
   const colleagues = users.filter((u) => u.id !== user?.id && (u.is_active === 1 || u.is_active === true));
@@ -80,8 +84,49 @@ export function RecognitionFeed() {
   }, []);
 
   useEffect(() => {
-    api.getUsers().then(setUsers).catch(() => setUsers([]));
+    api.getUsersForMention().then(setUsers).catch(() => setUsers([]));
   }, []);
+
+  const handleMessageChange = (value) => {
+    setMessage(value);
+    const el = messageInputRef.current;
+    if (!el) return;
+    const pos = el.selectionStart ?? 0;
+    const textBefore = value.slice(0, pos);
+    const atIdx = textBefore.lastIndexOf('@');
+    if (atIdx === -1) {
+      setShowMessageMention(false);
+      return;
+    }
+    const afterAt = textBefore.slice(atIdx + 1);
+    if (/\s/.test(afterAt)) {
+      setShowMessageMention(false);
+      return;
+    }
+    setShowMessageMention(true);
+    setMessageMentionQuery(afterAt);
+    setMessageMentionStart(atIdx);
+  };
+
+  const insertMentionInMessage = (fullName) => {
+    const before = message.slice(0, messageMentionStart);
+    const after = message.slice(messageMentionStart);
+    const rest = after.replace(/^@[^\s]*/, '');
+    setMessage(before + '@' + fullName + (rest.startsWith(' ') ? rest : ' ' + rest));
+    setShowMessageMention(false);
+    setTimeout(() => {
+      if (messageInputRef.current) {
+        const pos = messageMentionStart + fullName.length + 2;
+        messageInputRef.current.focus();
+        messageInputRef.current.setSelectionRange(pos, pos);
+      }
+    }, 0);
+  };
+
+  const messageMentionUsers = colleagues.filter((u) => {
+    const name = (u.full_name || u.email || '').toLowerCase();
+    return name.includes((messageMentionQuery || '').toLowerCase());
+  }).slice(0, 8);
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -180,9 +225,9 @@ export function RecognitionFeed() {
   };
 
   return (
-    <div className="bg-white dark:bg-gray-800 rounded-xl shadow-md border border-gray-100 dark:border-gray-700 p-6">
-      <h2 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">Recognition</h2>
-      <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">Share recognition by type. In comments, type @ and a name to tag someone.</p>
+    <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 backdrop-blur-sm shadow-soft p-6 md:p-8">
+      <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-2">Recognition</h2>
+      <p className="text-sm text-slate-500 dark:text-slate-400 mb-6 leading-relaxed">Share recognition by type. In the message or comments, type @ to mention colleagues by name.</p>
 
       <form onSubmit={handleSubmit} className="mb-6 space-y-3">
         <div>
@@ -198,18 +243,35 @@ export function RecognitionFeed() {
             ))}
           </select>
         </div>
-        <textarea
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="Share what happened (e.g. Great collaboration on the project!)"
-          rows={2}
-          maxLength={2000}
-          className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white resize-none"
-        />
+        <div className="relative">
+          <textarea
+            ref={messageInputRef}
+            value={message}
+            onChange={(e) => handleMessageChange(e.target.value)}
+            placeholder="Share what happened. Type @ to mention a colleague by name."
+            rows={2}
+            maxLength={2000}
+            className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white resize-none"
+          />
+          {showMessageMention && messageMentionUsers.length > 0 && (
+            <div className="absolute left-0 right-0 top-full mt-1 py-1 bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg z-10 max-h-40 overflow-y-auto">
+              {messageMentionUsers.map((u) => (
+                <button
+                  key={u.id}
+                  type="button"
+                  className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-gray-600 text-sm text-gray-800 dark:text-gray-200"
+                  onClick={() => insertMentionInMessage(u.full_name || u.email || '')}
+                >
+                  @{u.full_name || u.email}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <button
           type="submit"
           disabled={submitting || !message.trim()}
-          className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-5 py-2.5 bg-primary-600 text-white rounded-xl font-semibold shadow-soft hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           {submitting ? 'Posting…' : 'Post recognition'}
         </button>
@@ -226,7 +288,7 @@ export function RecognitionFeed() {
               key={r.id}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              className="border border-gray-200 dark:border-gray-600 rounded-lg p-4"
+              className="border border-slate-200/90 dark:border-slate-700 rounded-xl p-4 bg-slate-50/50 dark:bg-slate-800/30"
             >
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div className="flex-1 min-w-0">

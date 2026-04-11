@@ -149,6 +149,12 @@ export async function getUsers() {
   return data || [];
 }
 
+/** User list for @mentions (recognition/comments). Any authenticated user. */
+export async function getUsersForMention() {
+  const { data } = await api.get('/users/mention-list');
+  return data || [];
+}
+
 /** Look up user in AD by username; returns { full_name, email } for create-user form. Admin only. */
 export async function lookupADUser(username) {
   const { data } = await api.get('/users/lookup-ad', { params: { username: (username || '').trim() } });
@@ -167,6 +173,36 @@ export async function setUserRole(userId, role) {
 
 export async function setUserActive(userId, isActive) {
   const { data } = await api.patch(`/users/${userId}/active`, { is_active: isActive });
+  return data;
+}
+
+export async function updateUserSupervisor(userId, managerId) {
+  const { data } = await api.patch(`/users/${userId}/supervisor`, { manager_id: managerId ?? null });
+  return data;
+}
+
+export async function updateUserDepartment(userId, department) {
+  const { data } = await api.patch(`/users/${userId}/department`, {
+    department: department === '' || department == null ? null : department,
+  });
+  return data;
+}
+
+/** Admin only: set local password (bcrypt) for email + password login. */
+export async function setUserPassword(userId, newPassword) {
+  const { data } = await api.patch(`/users/${userId}/password`, { new_password: newPassword });
+  return data;
+}
+
+/** HR/Admin: update employee demographic and org fields (PATCH). */
+export async function updateEmployeeRecord(userId, payload) {
+  const { data } = await api.patch(`/users/${userId}/record`, payload);
+  return data;
+}
+
+/** HR/Admin: workforce snapshot - departments, branches, gender mix, upcoming work anniversaries. */
+export async function getOrganizationOverview() {
+  const { data } = await api.get('/hr/organization-overview');
   return data;
 }
 
@@ -288,6 +324,61 @@ export async function getHrDocumentFileBlob(documentId) {
   return res.blob();
 }
 
+// ---------- Staff documents (per employee: HR confidential + certificates) ----------
+export async function getStaffDocuments(subjectUserId) {
+  const params = {};
+  if (subjectUserId) params.subject_user_id = subjectUserId;
+  const { data } = await api.get('/staff-documents', { params });
+  return data || [];
+}
+
+export async function uploadStaffDocument(file, title, kind, subjectUserId) {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('title', title || file.name || 'Document');
+  formData.append('kind', kind);
+  formData.append('subject_user_id', subjectUserId);
+  const { data } = await api.post('/staff-documents/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+}
+
+export async function deleteStaffDocument(documentId) {
+  const { data } = await api.delete(`/staff-documents/${documentId}`);
+  return data;
+}
+
+export async function getStaffDocumentFileBlob(documentId) {
+  const token = localStorage.getItem('copedu_token');
+  const res = await fetch(`${API_BASE}/staff-documents/${documentId}/file`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) throw new Error(res.statusText || 'Failed to load file');
+  return res.blob();
+}
+
+// ---------- In-app notifications ----------
+export async function getNotifications(limit = 40) {
+  const { data } = await api.get('/notifications', { params: { limit } });
+  return data || [];
+}
+
+export async function getUnreadNotificationCount() {
+  const { data } = await api.get('/notifications/unread-count');
+  return data?.count ?? 0;
+}
+
+export async function markNotificationRead(notificationId) {
+  const { data } = await api.patch(`/notifications/${notificationId}/read`);
+  return data;
+}
+
+export async function markAllNotificationsRead() {
+  const { data } = await api.post('/notifications/mark-all-read');
+  return data;
+}
+
 // ---------- Recognitions ----------
 export async function getRecognitionTypes() {
   const { data } = await api.get('/recognitions/types');
@@ -322,4 +413,354 @@ export async function addRecognitionComment(recognitionId, body) {
 // No realtime with local DB; polling can be added in components if needed
 export function subscribeAttendanceFeed(callback) {
   return { unsubscribe: () => {} };
+}
+
+// ---------- Appraisal ----------
+export async function getAppraisalCycles() {
+  const { data } = await api.get('/appraisal/cycles');
+  return data || [];
+}
+
+export async function getAppraisalCycle(cycleId) {
+  const { data } = await api.get(`/appraisal/cycles/${cycleId}`);
+  return data;
+}
+
+export async function createAppraisalCycle(payload) {
+  const { data } = await api.post('/appraisal/cycles', payload);
+  return data;
+}
+
+export async function updateAppraisalCycle(cycleId, payload) {
+  const { data } = await api.patch(`/appraisal/cycles/${cycleId}`, payload);
+  return data;
+}
+
+export async function getAppraisalCycleKpis(cycleId) {
+  const { data } = await api.get(`/appraisal/cycles/${cycleId}/kpis`);
+  return data || [];
+}
+
+export async function getAppraisalCycleAppraisals(cycleId) {
+  const { data } = await api.get(`/appraisal/cycles/${cycleId}/appraisals`);
+  return data || [];
+}
+
+export async function createKpi(payload) {
+  const { data } = await api.post('/appraisal/kpis', payload);
+  return data;
+}
+
+export async function getKpi(kpiId) {
+  const { data } = await api.get(`/appraisal/kpis/${kpiId}`);
+  return data;
+}
+
+export async function updateKpi(kpiId, payload) {
+  const { data } = await api.patch(`/appraisal/kpis/${kpiId}`, payload);
+  return data;
+}
+
+export async function submitKpi(kpiId) {
+  const { data } = await api.post(`/appraisal/kpis/${kpiId}/submit`);
+  return data;
+}
+
+export async function returnKpi(kpiId, comment) {
+  const { data } = await api.post(`/appraisal/kpis/${kpiId}/return`, { comment });
+  return data;
+}
+
+export async function verifyKpi(kpiId, comment) {
+  const { data } = await api.post(`/appraisal/kpis/${kpiId}/verify`, { comment: (comment || '').trim() });
+  return data;
+}
+
+export async function approveKpi(kpiId) {
+  const { data } = await api.post(`/appraisal/kpis/${kpiId}/approve`);
+  return data;
+}
+
+export async function receiveKpi(kpiId) {
+  const { data } = await api.post(`/appraisal/kpis/${kpiId}/receive`);
+  return data;
+}
+
+export async function acknowledgeKpi(kpiId) {
+  const { data } = await api.post(`/appraisal/kpis/${kpiId}/acknowledge`);
+  return data;
+}
+
+export async function getKpiWorkflow(kpiId) {
+  const { data } = await api.get(`/appraisal/kpis/${kpiId}/workflow`);
+  return data;
+}
+
+export async function createAppraisal(payload) {
+  const { data } = await api.post('/appraisal/appraisals', payload);
+  return data;
+}
+
+export async function getAppraisal(appraisalId) {
+  const { data } = await api.get(`/appraisal/appraisals/${appraisalId}`);
+  return data;
+}
+
+export async function updateAppraisal(appraisalId, payload) {
+  const { data } = await api.patch(`/appraisal/appraisals/${appraisalId}`, payload);
+  return data;
+}
+
+export async function putAppraisalAssessments(appraisalId, assessments) {
+  const { data } = await api.put(`/appraisal/appraisals/${appraisalId}/assessments`, assessments);
+  return data;
+}
+
+export async function submitAppraisal(appraisalId) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/submit`);
+  return data;
+}
+
+export async function returnAppraisal(appraisalId, comment) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/return`, { comment });
+  return data;
+}
+
+export async function verifyAppraisal(appraisalId, comment) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/verify`, { comment: (comment || '').trim() });
+  return data;
+}
+
+export async function approveAppraisal(appraisalId) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/approve`);
+  return data;
+}
+
+export async function receiveAppraisal(appraisalId) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/receive`);
+  return data;
+}
+
+export async function acknowledgeAppraisal(appraisalId) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/acknowledge`);
+  return data;
+}
+
+export async function getAppraisalWorkflow(appraisalId) {
+  const { data } = await api.get(`/appraisal/appraisals/${appraisalId}/workflow`);
+  return data;
+}
+
+export async function getAppraisalDashboardStaff() {
+  const { data } = await api.get('/appraisal/dashboard/staff');
+  return data;
+}
+
+export async function getAppraisalDashboardManager() {
+  const { data } = await api.get('/appraisal/dashboard/manager');
+  return data;
+}
+
+export async function getAppraisalDashboardHod() {
+  const { data } = await api.get('/appraisal/dashboard/hod');
+  return data;
+}
+
+export async function getAppraisalDashboardHr() {
+  const { data } = await api.get('/appraisal/dashboard/hr');
+  return data;
+}
+
+export async function getAppraisalExport(params = {}) {
+  const { data } = await api.get('/appraisal/export', { params });
+  return data;
+}
+
+// ---------- Appraisal: Annual KPIs (once per year, then locked for quarterly appraisals) ----------
+export async function getAnnualKpis(year = null) {
+  const params = year != null ? { year } : {};
+  const { data } = await api.get('/appraisal/annual-kpis', { params });
+  return data || [];
+}
+
+export async function createAnnualKpi(year) {
+  const { data } = await api.post('/appraisal/annual-kpis', { year });
+  return data;
+}
+
+export async function getAnnualKpi(annualKpiId) {
+  const { data } = await api.get(`/appraisal/annual-kpis/${annualKpiId}`);
+  return data;
+}
+
+export async function getAnnualKpiTitles(annualKpiId) {
+  const { data } = await api.get(`/appraisal/annual-kpis/${annualKpiId}/titles`);
+  return data || [];
+}
+
+export async function createAnnualKpiTitle(annualKpiId, payload) {
+  const { data } = await api.post(`/appraisal/annual-kpis/${annualKpiId}/titles`, payload);
+  return data;
+}
+
+export async function getKpiTitleItems(titleId) {
+  const { data } = await api.get(`/appraisal/kpi-titles/${titleId}/items`);
+  return data || [];
+}
+
+export async function createKpiItem(titleId, payload) {
+  const { data } = await api.post(`/appraisal/kpi-titles/${titleId}/items`, payload);
+  return data;
+}
+
+export async function updateKpiItem(itemId, payload) {
+  const { data } = await api.patch(`/appraisal/kpi-items/${itemId}`, payload);
+  return data;
+}
+
+export async function deleteKpiItem(itemId) {
+  await api.delete(`/appraisal/kpi-items/${itemId}`);
+}
+
+export async function getAnnualKpisPendingApproval() {
+  const { data } = await api.get('/appraisal/annual-kpis/pending-approval');
+  return data || [];
+}
+
+export async function submitAnnualKpi(annualKpiId) {
+  const { data } = await api.post(`/appraisal/annual-kpis/${annualKpiId}/submit`);
+  return data;
+}
+
+export async function returnAnnualKpi(annualKpiId, comment) {
+  const { data } = await api.post(`/appraisal/annual-kpis/${annualKpiId}/return`, { comment });
+  return data;
+}
+
+export async function approveAnnualKpi(annualKpiId) {
+  const { data } = await api.post(`/appraisal/annual-kpis/${annualKpiId}/approve`);
+  return data;
+}
+
+export async function lockAnnualKpi(annualKpiId) {
+  const { data } = await api.post(`/appraisal/annual-kpis/${annualKpiId}/lock`);
+  return data;
+}
+
+export async function getAppraisalRatingScale() {
+  const { data } = await api.get('/appraisal/rating-scale');
+  return data || [];
+}
+
+export async function updateAppraisalScore(appraisalId, kpiItemId, payload) {
+  const { data } = await api.patch(`/appraisal/appraisals/${appraisalId}/scores/${kpiItemId}`, payload);
+  return data;
+}
+
+// ---------- Leave ----------
+export async function getLeaveTypes() {
+  const { data } = await api.get('/leave/types');
+  return data || [];
+}
+
+/** Admin only: create a new leave type (unique code). */
+export async function createLeaveType(payload) {
+  const { data } = await api.post('/leave/types', payload);
+  return data;
+}
+
+export async function getMyLeaveRequests() {
+  const { data } = await api.get('/leave/my-requests');
+  return data || [];
+}
+
+export async function createLeaveRequest(payload) {
+  const { data } = await api.post('/leave/requests', payload);
+  return data;
+}
+
+/** Manager/HOD/HR/Admin: book approved leave for a staff member (shows on their My Leave). */
+export async function assignLeaveToStaff(payload) {
+  const { data } = await api.post('/leave/assign', payload);
+  return data;
+}
+
+export async function submitLeaveRequest(leaveRequestId) {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/submit`);
+  return data;
+}
+
+export async function cancelLeaveRequest(leaveRequestId, comment = '') {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/cancel`, { comment });
+  return data;
+}
+
+export async function getPendingLeaveRequests() {
+  const { data } = await api.get('/leave/pending');
+  return data || [];
+}
+
+export async function approveLeaveRequest(leaveRequestId, comment = '') {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/approve`, { comment });
+  return data;
+}
+
+export async function rejectLeaveRequest(leaveRequestId, comment) {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/reject`, { comment });
+  return data;
+}
+
+export async function returnLeaveRequest(leaveRequestId, comment) {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/return`, { comment });
+  return data;
+}
+
+export async function getLeaveWorkflow(leaveRequestId) {
+  const { data } = await api.get(`/leave/requests/${leaveRequestId}/workflow`);
+  return data;
+}
+
+export async function getLeaveReportSummary(params = {}) {
+  const { data } = await api.get('/leave/reports/summary', { params });
+  return data;
+}
+
+export async function getLeaveBalances(params = {}) {
+  const { data } = await api.get('/leave/balances', { params });
+  return data;
+}
+
+export async function getLeaveMyDashboard() {
+  const { data } = await api.get('/leave/my-dashboard');
+  return data;
+}
+
+export async function getLeaveOverview() {
+  const { data } = await api.get('/leave/overview');
+  return data;
+}
+
+export async function getLeaveTeamBalances(params = {}) {
+  const { data } = await api.get('/leave/team-balances', { params });
+  return data;
+}
+
+export async function getLeaveHrFilters() {
+  const { data } = await api.get('/leave/filters');
+  return data || { departments: [] };
+}
+
+export async function getLeaveOnLeave(params = {}) {
+  const { data } = await api.get('/leave/on-leave', { params });
+  return data || { rows: [], count: 0, on_date: '' };
+}
+
+export async function getLeaveColleaguesOnLeave(params = {}) {
+  const { data } = await api.get('/leave/colleagues-on-leave', { params });
+  return data || { rows: [], count: 0, on_date: '', department: null };
+}
+
+export async function getLeaveOrgRequests(params = {}) {
+  const { data } = await api.get('/leave/org-requests', { params });
+  return data || { rows: [], limit: 0 };
 }

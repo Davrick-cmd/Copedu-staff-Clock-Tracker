@@ -33,18 +33,22 @@ backend/
 
 ## Setup Instructions
 
-### 1. Backend (Python + SQLite)
+### 1. Run the app (recommended)
+
+From the **project root** (where `package.json` is):
 
 ```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate   # Windows
-# source venv/bin/activate   # macOS/Linux
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+npm run dev
 ```
 
-The first run creates `copedu.db` (SQLite file) in the backend directory and creates all tables.
+On the **first** run this will, if needed: run `npm install`, create `backend/venv`, `pip install -r backend/requirements.txt`, and copy `.env.example` → `.env` and `backend/.env.example` → `backend/.env` when those files are missing. You need **Node.js** and **Python 3** on your PATH (`python` / `python3`, or on Windows the `py -3` launcher).
+
+- Frontend: [http://localhost:5173](http://localhost:5173)  
+- API: [http://127.0.0.1:8000](http://127.0.0.1:8000)  
+
+The first API run creates `copedu.db` (SQLite) under `backend/` and all tables.
+
+Use `npm run dev:web` or `npm run dev:api` if you only want one process (after at least one full `npm run dev` or `node scripts/prepare-dev.mjs`).
 
 ### 2. Create first user (Admin)
 
@@ -62,27 +66,15 @@ Or use any HTTP client (Postman, etc.) to `POST /auth/register` with body:
 
 Then log in on the frontend with that email and password.
 
-### 3. Frontend
+### 3. Manual backend only (optional)
 
 ```bash
-cd "CLock In and Out"   # project root
-npm install
-cp .env.example .env
+cd backend
+python -m venv venv
+venv\Scripts\activate   # Windows — or: source venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
 ```
-
-Edit `.env`:
-
-```
-VITE_API_BASE_URL=http://localhost:8000
-```
-
-Then:
-
-```bash
-npm run start
-```
-
-Open [http://localhost:5173](http://localhost:5173) and sign in.
 
 ## Environment Variables
 
@@ -97,6 +89,7 @@ Backend (optional, in `backend/.env`):
 | `CORS_ORIGIN` | Allowed frontend origin (default: `http://localhost:5173`) |
 | `SECRET_KEY` | JWT signing secret (change in production) |
 | `DATABASE_URL` | SQLite path, e.g. `sqlite:///./copedu.db` |
+| `HR_SUITE_ANNUAL_LEAVE_DAYS` | If set (e.g. `28.5`), overrides annual leave for everyone. If unset, annual leave uses 18 days + 1 day per 3 full years of service (max 21) from each employee’s hire date (`work_anniversary`). |
 | `PORT` | Port for uvicorn (default: 8000) |
 
 ## User Roles

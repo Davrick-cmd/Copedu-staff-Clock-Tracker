@@ -7,7 +7,10 @@ import { createAuditLog } from '../../services/api';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
-import { ROLE_LABELS, ROLES, DEPARTMENTS } from '../../utils/constants';
+import { ROLE_LABELS, ROLES, DEPARTMENTS, ROUTES } from '../../utils/constants';
+import { isImportedStaffRecord, ImportedUserBadge } from '../../components/MigratedUserBadge';
+import { Link } from 'react-router-dom';
+import { EmployeeRecordEditModal } from '../../components/EmployeeRecordEditModal';
 
 export function AdminUsers() {
   const toast = useToast();
@@ -22,6 +25,10 @@ export function AdminUsers() {
   const [bulkUploading, setBulkUploading] = useState(false);
   const [bulkResult, setBulkResult] = useState(null);
   const [adLookupLoading, setAdLookupLoading] = useState(false);
+  const [editUser, setEditUser] = useState(null);
+  const [passwordModalUser, setPasswordModalUser] = useState(null);
+  const [passwordModalValue, setPasswordModalValue] = useState('');
+  const [passwordModalSaving, setPasswordModalSaving] = useState(false);
   const { register, handleSubmit, reset, setValue, watch } = useForm();
 
   const loadUsers = () => api.getUsers().then(setUsers).catch(() => setUsers([]));
@@ -75,8 +82,26 @@ export function AdminUsers() {
     };
     const branchId = (data.branch_id || '').trim() || undefined;
     const department = (data.department || '').trim() || undefined;
+    const managerId = (data.manager_id || '').trim() || undefined;
     if (branchId) payload.branch_id = branchId;
     if (department) payload.department = department;
+    if (managerId) payload.manager_id = managerId;
+    const g = (data.gender || '').trim();
+    if (g) payload.gender = g;
+    const phone = (data.phone || '').trim();
+    if (phone) payload.phone = phone;
+    const eid = (data.employee_id || '').trim();
+    if (eid) payload.employee_id = eid;
+    const ec = (data.employee_code || '').trim();
+    if (ec) payload.employee_code = ec;
+    const div = (data.division || '').trim();
+    if (div) payload.division = div;
+    const jt = (data.job_title || '').trim();
+    if (jt) payload.job_title = jt;
+    const wa = (data.work_anniversary || '').trim();
+    if (wa) payload.work_anniversary = wa;
+    const hn = (data.hr_notes || '').trim();
+    if (hn) payload.hr_notes = hn;
     if (useAD) {
       payload.ad_username = data.ad_username.trim();
       const email = (data.email || '').trim();
@@ -120,6 +145,24 @@ export function AdminUsers() {
       .catch((e) => toast(e.response?.data?.detail || e.message || 'Update failed', 'error'));
   };
 
+  const submitPasswordReset = () => {
+    const pwd = passwordModalValue.trim();
+    if (pwd.length < 6) {
+      toast('Password must be at least 6 characters', 'error');
+      return;
+    }
+    if (!passwordModalUser?.id) return;
+    setPasswordModalSaving(true);
+    api.setUserPassword(passwordModalUser.id, pwd)
+      .then(() => {
+        toast('Local password updated. They can sign in with email and this password (AD still works if linked).', 'success');
+        setPasswordModalUser(null);
+        setPasswordModalValue('');
+      })
+      .catch((e) => toast(getApiError(e), 'error'))
+      .finally(() => setPasswordModalSaving(false));
+  };
+
   const onBulkImport = () => {
     if (!bulkFile) {
       toast('Choose a CSV file first', 'error');
@@ -144,7 +187,20 @@ export function AdminUsers() {
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Manage Users</h1>
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Employee records</h1>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1 max-w-3xl">
+          All staff appear in this list. Records created from a prior bulk import show an{' '}
+          <span className="font-medium text-amber-800 dark:text-amber-300">Imported</span> badge; accounts merged by email do
+          not. Use <strong className="text-gray-700 dark:text-gray-300">Edit record</strong> on any row to update job title,
+          department, branch, supervisor, hire date, and other details when someone moves role or location. Imported leave stays
+          on that account - browse under{' '}
+          <Link to={ROUTES.HR.LEAVE_ORGANIZATION} className="text-primary-600 dark:text-primary-400 hover:underline">
+            Leave → Organization
+          </Link>
+          .
+        </p>
+      </div>
 
       <div className="flex flex-wrap gap-4 items-center">
         <input
@@ -201,7 +257,7 @@ export function AdminUsers() {
               {bulkResult.failed?.length > 0 && (
                 <ul className="mt-2 text-red-600 dark:text-red-400 list-disc list-inside">
                   {bulkResult.failed.slice(0, 5).map((f, i) => (
-                    <li key={i}>{f.row?.username || 'Row'} — {f.error}</li>
+                    <li key={i}>{f.row?.username || 'Row'} - {f.error}</li>
                   ))}
                   {bulkResult.failed.length > 5 && <li>… and {bulkResult.failed.length - 5} more</li>}
                 </ul>
@@ -254,9 +310,20 @@ export function AdminUsers() {
             className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
           >
             <option value="employee">{ROLE_LABELS[ROLES.EMPLOYEE]}</option>
+            <option value="manager">{ROLE_LABELS[ROLES.MANAGER]}</option>
+            <option value="hod">{ROLE_LABELS[ROLES.HOD]}</option>
             <option value="hr">{ROLE_LABELS[ROLES.HR]}</option>
             <option value="admin">{ROLE_LABELS[ROLES.ADMIN]}</option>
           </select>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Manager (optional)</label>
+            <select {...register('manager_id')} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+              <option value="">None</option>
+              {users.filter((u) => ['manager', 'hod', 'admin', 'hr'].includes(u.role || '')).map((u) => (
+                <option key={u.id} value={u.id}>{u.full_name} ({u.role})</option>
+              ))}
+            </select>
+          </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Branch</label>
             <select
@@ -281,12 +348,51 @@ export function AdminUsers() {
               ))}
             </select>
           </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Gender</label>
+              <select
+                {...register('gender')}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="">Select role</option>
+                <option value="female">Female</option>
+                <option value="male">Male</option>
+                <option value="other">Other</option>
+                <option value="prefer_not_say">Prefer not to say</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Phone</label>
+              <input {...register('phone')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Optional" />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Employee ID</label>
+              <input {...register('employee_id')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Staff code</label>
+              <input {...register('employee_code')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+            </div>
+          </div>
+          <input {...register('job_title')} type="text" placeholder="Job title (optional)" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+          <input {...register('division')} type="text" placeholder="Division / unit (optional)" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Work anniversary (hire date)</label>
+            <input {...register('work_anniversary')} type="date" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">HR notes (internal)</label>
+            <textarea {...register('hr_notes')} rows={2} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm" placeholder="Optional" />
+          </div>
           <button type="submit" className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">Create user</button>
         </form>
       )}
 
       {!filtered.length ? (
-        <EmptyState title="No users" />
+        <EmptyState title="No employee records" />
       ) : (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
           <div className="overflow-x-auto">
@@ -305,10 +411,13 @@ export function AdminUsers() {
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {filtered.map((u) => (
                   <tr key={u.id} className="text-gray-700 dark:text-gray-300">
-                    <td className="px-4 py-2">{u.full_name}</td>
+                    <td className="px-4 py-2">
+                      <span className="font-medium">{u.full_name}</span>
+                      {isImportedStaffRecord(u.id) && <ImportedUserBadge />}
+                    </td>
                     <td className="px-4 py-2">{u.email}</td>
-                    <td className="px-4 py-2">{u.branches?.name || '—'}</td>
-                    <td className="px-4 py-2">{u.department || '—'}</td>
+                    <td className="px-4 py-2">{u.branches?.name || '-'}</td>
+                    <td className="px-4 py-2">{u.department || '-'}</td>
                     <td className="px-4 py-2">
                       <select
                         value={u.role || 'employee'}
@@ -317,26 +426,94 @@ export function AdminUsers() {
                         className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-sm text-gray-900 dark:text-white"
                       >
                         <option value="employee">{ROLE_LABELS[ROLES.EMPLOYEE]}</option>
+                        <option value="manager">{ROLE_LABELS[ROLES.MANAGER]}</option>
+                        <option value="hod">{ROLE_LABELS[ROLES.HOD]}</option>
                         <option value="hr">{ROLE_LABELS[ROLES.HR]}</option>
                         <option value="admin">{ROLE_LABELS[ROLES.ADMIN]}</option>
                       </select>
                     </td>
                     <td className="px-4 py-2">{u.is_active === 1 || u.is_active === true ? 'Active' : 'Inactive'}</td>
                     <td className="px-4 py-2">
-                      {u.id !== currentUser?.id && (
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
                         <button
                           type="button"
-                          onClick={() => setActive(u.id, !(u.is_active === 1 || u.is_active === true))}
-                          className="text-sm text-primary-600 dark:text-primary-400 hover:underline"
+                          onClick={() => setEditUser(u)}
+                          className="text-sm font-medium text-primary-600 dark:text-primary-400 hover:underline text-left"
                         >
-                          {u.is_active === 1 || u.is_active === true ? 'Deactivate' : 'Activate'}
+                          Edit record
                         </button>
-                      )}
+                        {u.id !== currentUser?.id && (
+                          <button
+                            type="button"
+                            onClick={() => setActive(u.id, !(u.is_active === 1 || u.is_active === true))}
+                            className="text-sm text-gray-600 dark:text-gray-400 hover:underline text-left"
+                          >
+                            {u.is_active === 1 || u.is_active === true ? 'Deactivate' : 'Activate'}
+                          </button>
+                        )}
+                        {currentUser?.role === 'admin' && (
+                          <button
+                            type="button"
+                            onClick={() => { setPasswordModalUser(u); setPasswordModalValue(''); }}
+                            className="text-sm text-amber-700 dark:text-amber-400 hover:underline text-left"
+                          >
+                            Set local password
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {editUser && (
+        <EmployeeRecordEditModal
+          key={editUser.id}
+          user={editUser}
+          users={users}
+          branches={branches}
+          onClose={() => setEditUser(null)}
+          onSaved={loadUsers}
+        />
+      )}
+
+      {passwordModalUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-md w-full p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Set local password</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+              {passwordModalUser.full_name} ({passwordModalUser.email || 'no email'}) — min. 6 characters. Does not change Active Directory.
+            </p>
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={passwordModalValue}
+              onChange={(e) => setPasswordModalValue(e.target.value)}
+              placeholder="New password"
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+            <div className="flex gap-2 mt-4">
+              <button
+                type="button"
+                onClick={submitPasswordReset}
+                disabled={passwordModalSaving || passwordModalValue.trim().length < 6}
+                className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
+              >
+                {passwordModalSaving ? 'Saving…' : 'Save'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setPasswordModalUser(null); setPasswordModalValue(''); }}
+                disabled={passwordModalSaving}
+                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}

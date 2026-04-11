@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import * as api from '../../services/api';
@@ -6,8 +7,10 @@ import { formatDate, formatTime, formatDuration } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
+import { DashboardPageHeader } from '../../components/dashboard/DashboardWidgets';
+import { ROUTES } from '../../utils/constants';
 
-const REPORT_MODE = { DAILY: 'daily', MONTHLY: 'monthly', RAW: 'raw', RECOGNITION: 'recognition' };
+const REPORT_MODE = { DAILY: 'daily', MONTHLY: 'monthly', RAW: 'raw', RECOGNITION: 'recognition', LEAVE: 'leave' };
 
 function escapeCsvCell(v) {
   const s = String(v ?? '');
@@ -48,7 +51,7 @@ function UserListModal({ title, users, onClose }) {
               <ul className="space-y-2">
                 {list.map((u, i) => (
                   <li key={u.user_id || i} className="text-sm text-gray-700 dark:text-gray-300 py-1 border-b border-gray-100 dark:border-gray-700 last:border-0">
-                    <span className="font-medium">{u.full_name || '—'}</span>
+                    <span className="font-medium">{u.full_name || '-'}</span>
                     {u.email && <span className="text-gray-500 dark:text-gray-400 ml-2">{u.email}</span>}
                     {u.clock_in_at && <span className="block text-xs text-gray-500 dark:text-gray-400">Clocked in: {formatTime(u.clock_in_at)}</span>}
                   </li>
@@ -64,6 +67,7 @@ function UserListModal({ title, users, onClose }) {
 
 export function HRReports() {
   const toast = useToast();
+  const [searchParams] = useSearchParams();
   const [reportMode, setReportMode] = useState(REPORT_MODE.DAILY);
   const [dailyDate, setDailyDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [monthYear, setMonthYear] = useState(() => {
@@ -81,16 +85,47 @@ export function HRReports() {
   const [reportType, setReportType] = useState('all');
   const [modal, setModal] = useState(null);
   const [recognitionReport, setRecognitionReport] = useState(null);
+  const [leaveReport, setLeaveReport] = useState(null);
+  const [leaveAsOf, setLeaveAsOf] = useState(() => new Date().toISOString().slice(0, 10));
+  const [leaveDeptFilter, setLeaveDeptFilter] = useState('');
+  const [leaveDepartments, setLeaveDepartments] = useState([]);
 
   useEffect(() => {
     api.getBranches().then(setBranches).catch(() => setBranches([]));
   }, []);
 
   useEffect(() => {
+    if (searchParams.get('mode') === 'leave') {
+      setReportMode(REPORT_MODE.LEAVE);
+    }
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (reportMode !== REPORT_MODE.LEAVE) return;
+    api.getLeaveHrFilters().then((d) => setLeaveDepartments(d.departments || [])).catch(() => setLeaveDepartments([]));
+  }, [reportMode]);
+
+  useEffect(() => {
     if (reportMode !== REPORT_MODE.RECOGNITION) return;
     setLoading(true);
     api.getRecognitionReport().then(setRecognitionReport).catch(() => setRecognitionReport(null)).finally(() => setLoading(false));
   }, [reportMode]);
+
+  useEffect(() => {
+    if (reportMode !== REPORT_MODE.LEAVE) return;
+    setLoading(true);
+    const params = {
+      from_date: fromDate,
+      to_date: toDate,
+      as_of: leaveAsOf,
+      ...(leaveDeptFilter.trim() ? { department: leaveDeptFilter.trim() } : {}),
+    };
+    api
+      .getLeaveReportSummary(params)
+      .then(setLeaveReport)
+      .catch(() => setLeaveReport(null))
+      .finally(() => setLoading(false));
+  }, [reportMode, fromDate, toDate, leaveAsOf, leaveDeptFilter]);
 
   useEffect(() => {
     if (reportMode !== REPORT_MODE.DAILY) return;
@@ -206,6 +241,94 @@ export function HRReports() {
     toast('Report exported to Excel', 'success');
   };
 
+  const exportLeaveReport = () => {
+    if (!leaveReport) return;
+    const p = leaveReport.period || {};
+    const lines = [
+      `Leave report (HR), period ${p.from_date ?? fromDate} to ${p.to_date ?? toDate}, on-leave snapshot as of ${p.as_of ?? leaveAsOf}`,
+      leaveReport.note || '',
+      '',
+      'Headline metrics',
+      'Staff in scope (active non-admin),On leave as of snapshot (distinct staff),No approved leave in period (distinct staff),Total requests (overlap period),Approved requests,Rejected requests,Approved days in period (taken),Pending days in period,Pending requests in period',
+      [
+        leaveReport.staff_in_scope ?? '',
+        leaveReport.on_leave_as_of_count ?? '',
+        leaveReport.no_approved_leave_in_period_count ?? '',
+        leaveReport.total_requests ?? 0,
+        leaveReport.approved_count ?? 0,
+        leaveReport.rejected_count ?? 0,
+        leaveReport.leave_totals_in_period?.approved_days ?? '',
+        leaveReport.leave_totals_in_period?.pending_days ?? '',
+        leaveReport.leave_totals_in_period?.pending_requests ?? '',
+      ].map(escapeCsvCell).join(','),
+      '',
+      'Approval rate %,Rejection rate %',
+      `${leaveReport.approval_rate_pct ?? 0},${leaveReport.rejection_rate_pct ?? 0}`,
+      '',
+      'By status (requests overlapping period)',
+      'Status,Count',
+      ...(leaveReport.by_status || []).map((r) => [r.status ?? '', r.count ?? 0].map(escapeCsvCell).join(',')),
+      '',
+      'Department breakdown',
+      'Department,Active staff,On leave as of,Requests in period,Total days (all statuses),Taken (approved days),Approved requests,Pending days,Pending requests,No approved leave in period',
+      ...(leaveReport.department_breakdown || []).map((r) =>
+        [
+          r.department ?? '',
+          r.active_staff ?? 0,
+          r.on_leave_as_of ?? 0,
+          r.requests_in_period ?? 0,
+          r.total_days_in_period ?? 0,
+          r.approved_days_in_period ?? 0,
+          r.approved_requests_in_period ?? 0,
+          r.pending_days_in_period ?? 0,
+          r.pending_requests_in_period ?? 0,
+          r.no_approved_leave_in_period ?? 0,
+        ].map(escapeCsvCell).join(','),
+      ),
+      '',
+      'On leave as of snapshot (detail)',
+      'Employee,Email,Department,Leave type,Start,End,Days',
+      ...(leaveReport.on_leave_as_of || []).map((r) =>
+        [
+          r.full_name ?? '',
+          r.email ?? '',
+          r.department ?? '',
+          r.leave_type_name ?? '',
+          r.start_date ?? '',
+          r.end_date ?? '',
+          r.days_requested ?? '',
+        ].map(escapeCsvCell).join(','),
+      ),
+      '',
+      'No approved leave overlapping period (sample up to 400)',
+      'Employee,Email,Department,Role',
+      ...(leaveReport.no_approved_leave_in_period || []).map((r) =>
+        [r.full_name ?? '', r.email ?? '', r.department ?? '', r.role ?? ''].map(escapeCsvCell).join(','),
+      ),
+      '',
+      'By person: taken vs pending (overlap period)',
+      'Employee,Email,Department,Taken days,Taken requests,Pending days,Pending requests,Total days',
+      ...(leaveReport.staff_leave_activity || []).map((r) =>
+        [
+          r.full_name ?? '',
+          r.email ?? '',
+          r.department ?? '',
+          r.approved_days ?? 0,
+          r.approved_requests ?? 0,
+          r.pending_days ?? 0,
+          r.pending_requests ?? 0,
+          r.total_days ?? 0,
+        ].map(escapeCsvCell).join(','),
+      ),
+      '',
+      'Top requesters by request count (overlap period)',
+      'Employee,Email,Requests,Days',
+      ...(leaveReport.top_requesters || []).map((r) => [r.full_name ?? '', r.email ?? '', r.total_requests ?? 0, r.total_days ?? 0].map(escapeCsvCell).join(',')),
+    ];
+    downloadCsv(`leave-report-${fromDate}-to-${toDate}.csv`, lines.join('\n'));
+    toast('Leave report CSV exported', 'success');
+  };
+
   const byDate = logs.reduce((acc, l) => {
     const d = (l.clock_in_at || '').slice(0, 10);
     if (!d) return acc;
@@ -218,20 +341,93 @@ export function HRReports() {
     if (list?.length) setModal({ title, list });
   };
 
-  return (
-    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Reports</h1>
+  const reportTabs = [
+    { id: REPORT_MODE.DAILY, label: 'Daily', hint: 'Snapshot for one day' },
+    { id: REPORT_MODE.MONTHLY, label: 'Monthly', hint: 'Trends & departments' },
+    { id: REPORT_MODE.RAW, label: 'Raw attendance', hint: 'Date range & CSV' },
+    { id: REPORT_MODE.RECOGNITION, label: 'Recognition', hint: 'Peer recognition stats' },
+    { id: REPORT_MODE.LEAVE, label: 'Leave', hint: 'Dept analytics, on leave, CSV' },
+  ];
 
-      <div className="flex flex-wrap gap-4 items-center">
-        <select value={reportMode} onChange={(e) => setReportMode(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white font-medium">
-          <option value={REPORT_MODE.DAILY}>Daily report</option>
-          <option value={REPORT_MODE.MONTHLY}>Monthly report</option>
-          <option value={REPORT_MODE.RAW}>Raw attendance (date range)</option>
-          <option value={REPORT_MODE.RECOGNITION}>Recognition report</option>
-        </select>
-        <select value={branchId} onChange={(e) => setBranchId(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white">
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-6 pb-8">
+      <DashboardPageHeader
+        badge="Reports hub"
+        title="HR reports"
+        subtitle="Pick a report type below. Attendance reports support branch filters; raw and leave modes include CSV export. For headcount, gender, age, and active vs former staff, use the organization workspace - then return here for day-to-day attendance and leave."
+      />
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <Link
+          to={ROUTES.HR.ORGANIZATION}
+          className="group rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-gradient-to-br from-violet-50/95 to-white dark:from-violet-950/35 dark:to-slate-900/80 p-5 shadow-soft hover:border-violet-300/80 dark:hover:border-violet-600/50 transition-all"
+        >
+          <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-violet-700 dark:text-violet-300">Workforce</p>
+          <p className="text-lg font-bold text-slate-900 dark:text-white mt-1 group-hover:text-violet-900 dark:group-hover:text-violet-100">
+            Organization dashboard
+          </p>
+          <p className="text-sm text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
+            Women and men, age bands, active vs no-longer-active, departments and branches, plus a demographics CSV export.
+          </p>
+          <span className="inline-block mt-3 text-sm font-semibold text-primary-600 dark:text-primary-400">Open overview →</span>
+        </Link>
+        <Link
+          to={ROUTES.HR.EMPLOYEES}
+          className="group rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft hover:border-primary-300/80 dark:hover:border-primary-600/50 transition-all"
+        >
+          <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-slate-500 dark:text-slate-400">Data quality</p>
+          <p className="text-lg font-bold text-slate-900 dark:text-white mt-1">Employee records</p>
+          <p className="text-sm text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
+            Keep gender, date of birth, hire dates, and departments current so every report reflects reality.
+          </p>
+          <span className="inline-block mt-3 text-sm font-semibold text-primary-600 dark:text-primary-400">Edit records →</span>
+        </Link>
+      </div>
+
+      <div
+        className="flex flex-wrap gap-2 p-1.5 rounded-2xl bg-slate-100/90 dark:bg-slate-800/90 border border-slate-200/90 dark:border-slate-700/90 shadow-inner"
+        role="tablist"
+        aria-label="Report type"
+      >
+        {reportTabs.map((tab) => {
+          const active = reportMode === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              title={tab.hint}
+              onClick={() => setReportMode(tab.id)}
+              className={`px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+                active
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-soft ring-1 ring-slate-200/90 dark:ring-slate-600'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="sticky top-0 z-20 -mx-1 px-1 py-3 md:py-4 bg-slate-50/95 dark:bg-slate-950/90 backdrop-blur-md border-b border-slate-200/80 dark:border-slate-800/80 mb-2 rounded-b-xl">
+        <div className="flex flex-wrap gap-3 items-center">
+        <label className="sr-only" htmlFor="reports-branch">
+          Branch
+        </label>
+        <select
+          id="reports-branch"
+          value={branchId}
+          onChange={(e) => setBranchId(e.target.value)}
+          className="rounded-xl border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 text-sm text-slate-900 dark:text-white shadow-sm"
+        >
           <option value="">All branches</option>
-          {branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+          {branches.map((b) => (
+            <option key={b.id} value={b.id}>
+              {b.name}
+            </option>
+          ))}
         </select>
 
         {reportMode === REPORT_MODE.DAILY && (
@@ -264,6 +460,28 @@ export function HRReports() {
             <button type="button" onClick={exportCSV} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700">Export CSV</button>
           </>
         )}
+        {reportMode === REPORT_MODE.LEAVE && (
+          <>
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Period</span>
+            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Period start" />
+            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Period end" />
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">On leave</span>
+            <input type="date" value={leaveAsOf} onChange={(e) => setLeaveAsOf(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Snapshot date: who is on approved leave this day" />
+            <select
+              value={leaveDeptFilter}
+              onChange={(e) => setLeaveDeptFilter(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[12rem]"
+              title="Filter by user department"
+            >
+              <option value="">All departments</option>
+              {leaveDepartments.map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+            <button type="button" onClick={exportLeaveReport} disabled={!leaveReport} className="px-4 py-2 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium shadow-sm">Export CSV</button>
+          </>
+        )}
+        </div>
       </div>
 
       {modal && <UserListModal title={modal.title} users={modal.list} onClose={() => setModal(null)} />}
@@ -317,10 +535,10 @@ export function HRReports() {
                   <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                     {(dailySummary.daily_table || []).map((row, i) => (
                       <tr key={i} className="text-gray-700 dark:text-gray-300 text-sm">
-                        <td className="px-4 py-2 font-medium">{row.employee_name || '—'}</td>
-                        <td className="px-4 py-2">{row.department || '—'}</td>
-                        <td className="px-4 py-2">{row.check_in ?? '—'}</td>
-                        <td className="px-4 py-2">{row.check_out ?? '—'}</td>
+                        <td className="px-4 py-2 font-medium">{row.employee_name || '-'}</td>
+                        <td className="px-4 py-2">{row.department || '-'}</td>
+                        <td className="px-4 py-2">{row.check_in ?? '-'}</td>
+                        <td className="px-4 py-2">{row.check_out ?? '-'}</td>
                         <td className="px-4 py-2">
                           <span className={`px-2 py-0.5 rounded text-xs ${
                             row.status === 'Absent' ? 'bg-red-100 dark:bg-red-900/30' :
@@ -373,8 +591,8 @@ export function HRReports() {
                   <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                     {(monthlySummary.staff_monthly || []).map((row, i) => (
                       <tr key={row.user_id || i} className="text-gray-700 dark:text-gray-300 text-sm">
-                        <td className="px-4 py-2 font-medium">{row.employee_name || row.full_name || '—'}</td>
-                        <td className="px-4 py-2">{row.department || '—'}</td>
+                        <td className="px-4 py-2 font-medium">{row.employee_name || row.full_name || '-'}</td>
+                        <td className="px-4 py-2">{row.department || '-'}</td>
                         <td className="px-4 py-2 text-right">{row.work_days ?? 0}</td>
                         <td className="px-4 py-2 text-right">{row.present_days ?? 0}</td>
                         <td className="px-4 py-2 text-right">{row.days_absent ?? 0}</td>
@@ -401,7 +619,7 @@ export function HRReports() {
                   <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                     {(monthlySummary.department_summary || []).map((row, i) => (
                       <tr key={i} className="text-gray-700 dark:text-gray-300 text-sm">
-                        <td className="px-4 py-2 font-medium">{row.department || '—'}</td>
+                        <td className="px-4 py-2 font-medium">{row.department || '-'}</td>
                         <td className="px-4 py-2 text-right">{row.employee_count ?? 0}</td>
                         <td className="px-4 py-2 text-right text-green-600 dark:text-green-400">{row.avg_attendance_pct ?? 0}%</td>
                         <td className="px-4 py-2 text-right text-red-600 dark:text-red-400">{row.absence_pct ?? 0}%</td>
@@ -490,12 +708,12 @@ export function HRReports() {
                     {logs.map((log) => (
                       <tr key={log.id} className="text-gray-700 dark:text-gray-300">
                         <td className="px-4 py-2">{formatDate(log.clock_in_at)}</td>
-                        <td className="px-4 py-2">{log.users?.full_name || '—'}</td>
+                        <td className="px-4 py-2">{log.users?.full_name || '-'}</td>
                         <td className="px-4 py-2">{formatTime(log.clock_in_at)}</td>
-                        <td className="px-4 py-2">{log.clock_out_at ? formatTime(log.clock_out_at) : '—'}</td>
+                        <td className="px-4 py-2">{log.clock_out_at ? formatTime(log.clock_out_at) : '-'}</td>
                         <td className="px-4 py-2">{formatDuration(log.total_minutes)}</td>
                         <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded text-xs ${log.status === 'late' ? 'bg-amber-100 dark:bg-amber-900/30' : 'bg-gray-100 dark:bg-gray-700'}`}>{log.status || 'present'}</span></td>
-                        <td className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">{log.client_ip || '—'}</td>
+                        <td className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">{log.client_ip || '-'}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -534,7 +752,7 @@ export function HRReports() {
                   <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                     {(recognitionReport.by_type || []).map((row, i) => (
                       <tr key={i} className="text-gray-700 dark:text-gray-300">
-                        <td className="px-4 py-2 font-medium">{row.recognition_type || '—'}</td>
+                        <td className="px-4 py-2 font-medium">{row.recognition_type || '-'}</td>
                         <td className="px-4 py-2 text-right">{row.count ?? 0}</td>
                       </tr>
                     ))}
@@ -558,15 +776,257 @@ export function HRReports() {
                     {(recognitionReport.recent || []).map((r) => (
                       <tr key={r.id} className="text-gray-700 dark:text-gray-300 text-sm">
                         <td className="px-4 py-2">{formatDateTime(r.created_at)}</td>
-                        <td className="px-4 py-2 font-medium">{r.from_name || '—'}</td>
-                        <td className="px-4 py-2">{r.recognition_type || '—'}</td>
-                        <td className="px-4 py-2 max-w-xs truncate">{r.message || '—'}</td>
+                        <td className="px-4 py-2 font-medium">{r.from_name || '-'}</td>
+                        <td className="px-4 py-2">{r.recognition_type || '-'}</td>
+                        <td className="px-4 py-2 max-w-xs truncate">{r.message || '-'}</td>
                         <td className="px-4 py-2 text-right">{r.like_count ?? 0}</td>
                         <td className="px-4 py-2 text-right">{r.comment_count ?? 0}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Leave report */}
+      {reportMode === REPORT_MODE.LEAVE && (
+        <>
+          {loading ? (
+            <div className="flex justify-center py-8"><LoadingSpinner /></div>
+          ) : !leaveReport ? (
+            <EmptyState title="No data" message="Could not load leave report." />
+          ) : (
+            <div className="space-y-8">
+              <p className="text-sm text-gray-600 dark:text-gray-400 max-w-4xl leading-relaxed">
+                {leaveReport.note}{' '}
+                <strong className="text-gray-800 dark:text-gray-200">Period</strong> counts any request whose dates overlap the range.{' '}
+                <strong className="text-gray-800 dark:text-gray-200">Taken</strong> is approved leave days in that range.{' '}
+                <strong className="text-gray-800 dark:text-gray-200">Pending</strong> is days in submitted / in-approval / returned requests (not draft).{' '}
+                <strong className="text-gray-800 dark:text-gray-200">No leave in period</strong> means no <em>approved</em> leave overlaps that range (per person).{' '}
+                Set <Link to={ROUTES.HR.EMPLOYEES} className="text-primary-600 dark:text-primary-400 font-medium hover:underline">People</Link> department on each user - until then, staff appear under <span className="font-medium">Unassigned</span>.
+              </p>
+
+              <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
+                <SummaryCard label="Staff in scope" sub="Active, non-admin" value={leaveReport.staff_in_scope ?? 0} />
+                <SummaryCard
+                  label="On leave (snapshot)"
+                  sub={`As of ${leaveReport.period?.as_of ?? leaveAsOf}`}
+                  value={leaveReport.on_leave_as_of_count ?? 0}
+                  color="text-sky-600 dark:text-sky-400"
+                />
+                <SummaryCard
+                  label="No approved leave in period"
+                  sub="May still have pending/draft"
+                  value={leaveReport.no_approved_leave_in_period_count ?? 0}
+                  color="text-amber-700 dark:text-amber-400"
+                />
+                <SummaryCard
+                  label="Leave taken (days)"
+                  sub="Approved, in period"
+                  value={Number(leaveReport.leave_totals_in_period?.approved_days ?? 0).toFixed(1)}
+                  color="text-green-600 dark:text-green-400"
+                />
+                <SummaryCard
+                  label="Pending (days)"
+                  sub="In workflow, in period"
+                  value={Number(leaveReport.leave_totals_in_period?.pending_days ?? 0).toFixed(1)}
+                  color="text-violet-600 dark:text-violet-400"
+                />
+                <SummaryCard
+                  label="Pending (requests)"
+                  sub="In workflow, in period"
+                  value={leaveReport.leave_totals_in_period?.pending_requests ?? 0}
+                  color="text-violet-700 dark:text-violet-300"
+                />
+                <SummaryCard label="Requests (overlap)" value={leaveReport.total_requests ?? 0} />
+                <SummaryCard label="Approval rate" value={`${leaveReport.approval_rate_pct ?? 0}%`} color="text-primary-600 dark:text-primary-400" />
+              </div>
+
+              <div>
+                <h2 className="font-semibold text-gray-800 dark:text-white mb-1">By department</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                  Headcount, snapshot on leave, approved vs pending days in the period (overlap), and staff with no approved leave touching the period.
+                </p>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80">
+                      <tr>
+                        <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Department</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Active staff</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">On leave</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Requests</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Days (all)</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Taken (approved days)</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Pending days</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">Pending reqs</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase tracking-wide">No approved in period</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {(leaveReport.department_breakdown || []).map((row) => (
+                        <tr key={row.department} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-3 font-medium">{row.department || '-'}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.active_staff ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-sky-700 dark:text-sky-300">{row.on_leave_as_of ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.requests_in_period ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">{row.total_days_in_period ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-green-700 dark:text-green-300">{row.approved_days_in_period ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-violet-700 dark:text-violet-300">{row.pending_days_in_period ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-violet-700 dark:text-violet-300">{row.pending_requests_in_period ?? 0}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-amber-800 dark:text-amber-200">{row.no_approved_leave_in_period ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!(leaveReport.department_breakdown || []).length && (
+                    <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No department rows yet - add departments on user profiles or import staff with a department column.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid gap-6 lg:grid-cols-2">
+                <div>
+                  <h2 className="font-semibold text-gray-800 dark:text-white mb-1">On approved leave (snapshot)</h2>
+                  <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">Up to 200 rows · date {leaveReport.period?.as_of ?? leaveAsOf}</p>
+                  <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[22rem] overflow-y-auto">
+                    <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                      <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Type</th>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dates</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                        {(leaveReport.on_leave_as_of || []).map((r) => (
+                          <tr key={r.id || `${r.email}-${r.start_date}-${r.end_date}`} className="text-gray-700 dark:text-gray-300">
+                            <td className="px-3 py-2">
+                              <div className="font-medium">{r.full_name}</div>
+                              <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                            </td>
+                            <td className="px-3 py-2">{r.department}</td>
+                            <td className="px-3 py-2">{r.leave_type_name}</td>
+                            <td className="px-3 py-2 whitespace-nowrap tabular-nums text-xs">
+                              {formatDate(r.start_date)} – {formatDate(r.end_date)}
+                              <span className="block text-gray-500">{r.days_requested} d</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {!(leaveReport.on_leave_as_of || []).length && (
+                      <p className="px-4 py-8 text-sm text-gray-500 dark:text-gray-400 text-center">No one on approved leave on this date.</p>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <h2 className="font-semibold text-gray-800 dark:text-white mb-1">No approved leave in period</h2>
+                  <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">Staff with no approved request overlapping the period (sample up to 400)</p>
+                  <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[22rem] overflow-y-auto">
+                    <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                      <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Role</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                        {(leaveReport.no_approved_leave_in_period || []).map((r, i) => (
+                          <tr key={`${r.email}-${i}`} className="text-gray-700 dark:text-gray-300">
+                            <td className="px-3 py-2">
+                              <div className="font-medium">{r.full_name}</div>
+                              <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                            </td>
+                            <td className="px-3 py-2">{r.department}</td>
+                            <td className="px-3 py-2">{r.role}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {(leaveReport.no_approved_leave_in_period_count ?? 0) > (leaveReport.no_approved_leave_in_period || []).length && (
+                      <p className="px-4 py-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border-t border-amber-100 dark:border-amber-900/40">
+                        Showing {(leaveReport.no_approved_leave_in_period || []).length} of {leaveReport.no_approved_leave_in_period_count} - export CSV for full lists.
+                      </p>
+                    )}
+                    {!(leaveReport.no_approved_leave_in_period || []).length && (leaveReport.no_approved_leave_in_period_count ?? 0) === 0 && (
+                      <p className="px-4 py-8 text-sm text-gray-500 dark:text-gray-400 text-center">Everyone in scope had at least one approved leave day in this period.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h2 className="font-semibold text-gray-800 dark:text-white mb-1">By person: leave taken vs pending</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                  Same period overlap. <strong className="text-gray-700 dark:text-gray-300">Taken</strong> = approved days; <strong className="text-gray-700 dark:text-gray-300">Pending</strong> = days in workflow. Up to 400 rows.
+                </p>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[28rem] overflow-y-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0 z-10">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Taken (days)</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Taken (reqs)</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Pending (days)</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Pending (reqs)</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">All days</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {(leaveReport.staff_leave_activity || []).map((r, i) => (
+                        <tr key={`${r.email}-${i}`} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                          </td>
+                          <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2 text-right tabular-nums text-green-700 dark:text-green-300">{Number(r.approved_days ?? 0).toFixed(1)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{r.approved_requests ?? 0}</td>
+                          <td className="px-4 py-2 text-right tabular-nums text-violet-700 dark:text-violet-300">{Number(r.pending_days ?? 0).toFixed(1)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums text-violet-700 dark:text-violet-300">{r.pending_requests ?? 0}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{Number(r.total_days ?? 0).toFixed(1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!(leaveReport.staff_leave_activity || []).length && (
+                    <p className="px-4 py-8 text-sm text-gray-500 dark:text-gray-400 text-center">No overlapping requests in this period for staff in scope.</p>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Top requesters by volume (period)</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">Most requests overlapping the range (any status), up to 30.</p>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Requests</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Days</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {(leaveReport.top_requesters || []).map((r, i) => (
+                        <tr key={i} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                          </td>
+                          <td className="px-4 py-2 text-right tabular-nums">{r.total_requests ?? 0}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{r.total_days ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           )}

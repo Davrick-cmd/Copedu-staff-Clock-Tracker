@@ -164,7 +164,7 @@ export function HRAnnouncements() {
             >
               <div className="flex-1 min-w-0">
                 <h3 className="font-semibold text-gray-900 dark:text-white">{a.title}</h3>
-                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{formatDateTime(a.published_at)} · {a.users?.full_name || '—'}</p>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{formatDateTime(a.published_at)} · {a.users?.full_name || '-'}</p>
                 <p className="mt-2 text-gray-700 dark:text-gray-300 whitespace-pre-wrap"><AnnouncementBody body={a.body} /></p>
                 <p className="mt-2 text-sm font-medium text-primary-600 dark:text-primary-400">
                   Seen by {a.acknowledged_count ?? 0}/{a.total_staff ?? 0} staff
@@ -198,7 +198,7 @@ export function HRAnnouncements() {
                 <ul className="space-y-2">
                   {receipts.map((r) => (
                     <li key={r.user_id} className="text-sm text-gray-700 dark:text-gray-300 flex justify-between">
-                      <span>{r.full_name || r.email || '—'}</span>
+                      <span>{r.full_name || r.email || '-'}</span>
                       <span className="text-gray-500">{formatDateTime(r.acknowledged_at)}</span>
                     </li>
                   ))}

@@ -49,7 +49,7 @@ export function AdminBranches() {
                 <tr key={b.id} className="text-gray-700 dark:text-gray-300">
                   <td className="px-4 py-2">{b.name}</td>
                   <td className="px-4 py-2">{b.code}</td>
-                  <td className="px-4 py-2">{b.address || '—'}</td>
+                  <td className="px-4 py-2">{b.address || '-'}</td>
                 </tr>
               ))}
             </tbody>
