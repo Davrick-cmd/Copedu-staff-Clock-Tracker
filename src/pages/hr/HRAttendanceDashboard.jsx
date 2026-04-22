@@ -4,7 +4,6 @@ import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import * as api from '../../services/api';
-import { formatTime } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { ROUTES, ROLES } from '../../utils/constants';
@@ -17,7 +16,6 @@ export function HRAttendanceDashboard() {
   const role = useSelector((s) => s.auth.profile?.role);
   const dashboardSwitcherMode = role === ROLES.ADMIN ? 'admin' : 'hr';
   const [summary, setSummary] = useState(null);
-  const [feed, setFeed] = useState([]);
   const [chartData, setChartData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState(null);
@@ -39,20 +37,17 @@ export function HRAttendanceDashboard() {
   }, []);
 
   useEffect(() => {
-    const today = new Date().toISOString().slice(0, 10);
-    api
-      .getAllAttendance({ fromDate: `${today}T00:00:00`, toDate: `${today}T23:59:59` })
-      .then((logs) => setFeed(logs.slice(0, 16).map((l) => ({ ...l, users: l.users || {} }))))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
     const days = 7;
     const promises = [];
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date();
+      d.setHours(12, 0, 0, 0);
       d.setDate(d.getDate() - i);
-      const day = d.toISOString().slice(0, 10);
+      if (d.getDay() === 0) continue; // Sunday — not a working day
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const dayNum = String(d.getDate()).padStart(2, '0');
+      const day = `${y}-${m}-${dayNum}`;
       promises.push(
         api.getAllAttendance({ fromDate: `${day}T00:00:00`, toDate: `${day}T23:59:59` }).then((logs) => ({ date: day.slice(5), count: logs.length }))
       );
@@ -64,10 +59,6 @@ export function HRAttendanceDashboard() {
     const interval = setInterval(() => {
       const today = new Date().toISOString().slice(0, 10);
       api.getDailyReportSummary(today).then(setSummary).catch(() => {});
-      api
-        .getAllAttendance({ fromDate: `${today}T00:00:00`, toDate: `${today}T23:59:59` })
-        .then((logs) => setFeed(logs.slice(0, 16).map((l) => ({ ...l, users: l.users || {} }))))
-        .catch(() => {});
     }, 15000);
     return () => clearInterval(interval);
   }, []);
@@ -153,28 +144,10 @@ export function HRAttendanceDashboard() {
 
       {modal && <UserListModal title={modal.title} users={modal.list} onClose={() => setModal(null)} />}
 
-      {absent > 0 && (
-        <div className="rounded-2xl border border-red-200 dark:border-red-900/40 bg-red-50/40 dark:bg-red-950/20 p-6">
-          <h2 className="font-semibold text-slate-900 dark:text-white mb-1">Absent today</h2>
-          <p className="text-sm text-slate-600 dark:text-slate-400 mb-4">No clock-in recorded for these staff.</p>
-          <ul className="flex flex-wrap gap-2">
-            {(users.absent || []).map((u, i) => (
-              <li
-                key={u.user_id || i}
-                className="inline-flex items-center px-3 py-2 rounded-xl bg-white dark:bg-slate-800 border border-red-100 dark:border-red-900/50 text-red-900 dark:text-red-200 text-sm shadow-sm"
-              >
-                <span className="font-medium">{u.full_name || '-'}</span>
-                {u.email && <span className="ml-2 text-red-700/80 dark:text-red-300/90 text-xs">{u.email}</span>}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      <div className="grid gap-6 xl:grid-cols-3">
+      <div className="grid gap-6 xl:grid-cols-2">
         <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-6 shadow-soft xl:col-span-1">
           <h2 className="font-semibold text-slate-900 dark:text-white mb-1">Attendance trend</h2>
-          <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">Clock-in records per day (last 7 days)</p>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">Clock-in records per day (last 7 calendar days; Sundays omitted)</p>
           {chartData.length ? (
             <ResponsiveContainer width="100%" height={240}>
               <BarChart data={chartData}>
@@ -189,29 +162,10 @@ export function HRAttendanceDashboard() {
           )}
         </div>
         <AttendanceTodayDonut summary={s} />
-        <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-6 shadow-soft">
-          <h2 className="font-semibold text-slate-900 dark:text-white mb-1">Recent clock-ins</h2>
-          <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">Latest arrivals today</p>
-          {feed.length ? (
-            <ul className="space-y-2 max-h-80 overflow-y-auto pr-1">
-              {feed.map((log) => (
-                <li
-                  key={log.id}
-                  className="flex justify-between items-center text-sm py-2.5 px-3 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-slate-100 dark:border-slate-700"
-                >
-                  <span className="font-medium text-slate-800 dark:text-slate-200">{log.users?.full_name || 'Employee'}</span>
-                  <span className="text-slate-500 dark:text-slate-400 tabular-nums">{formatTime(log.clock_in_at)}</span>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <EmptyState title="No clock-ins yet" message="Activity will show here during the day." />
-          )}
-        </div>
       </div>
 
       <div className="rounded-2xl border border-slate-200/80 dark:border-slate-700/80 bg-slate-50/80 dark:bg-slate-800/40 px-5 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <p className="text-sm text-slate-600 dark:text-slate-300">Leave pipeline, balances, and exports</p>
+        <p className="text-sm text-slate-600 dark:text-slate-300">Need deeper details? Open full tables and filters.</p>
         <div className="flex flex-wrap gap-3 text-sm font-semibold">
           <Link to={ROUTES.HR.DASHBOARD_LEAVE} className="text-primary-600 dark:text-primary-400 hover:underline">
             Leave dashboard
@@ -221,8 +175,12 @@ export function HRAttendanceDashboard() {
             Flagged attendance
           </Link>
           <span className="text-slate-300 dark:text-slate-600">·</span>
-          <Link to={ROUTES.HR.REPORTS} className="text-primary-600 dark:text-primary-400 hover:underline">
-            Reports hub
+          <Link to={ROUTES.HR.REPORTS_ATTENDANCE} className="text-primary-600 dark:text-primary-400 hover:underline">
+            Attendance reports
+          </Link>
+          <span className="text-slate-300 dark:text-slate-600">·</span>
+          <Link to={ROUTES.HR.LEAVE} className="text-primary-600 dark:text-primary-400 hover:underline">
+            Approvals inbox
           </Link>
         </div>
       </div>

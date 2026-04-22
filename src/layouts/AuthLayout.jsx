@@ -1,6 +1,10 @@
 import { Outlet, Navigate } from 'react-router-dom';
 import { useSelector } from 'react-redux';
 
+/**
+ * Shell for routes that require the user to be logged out (currently `/login`).
+ * When `auth.user` is set, we immediately redirect home so dashboard routes never flash behind login.
+ */
 export function AuthLayout() {
   const user = useSelector((s) => s.auth.user);
   if (user) return <Navigate to="/" replace />;

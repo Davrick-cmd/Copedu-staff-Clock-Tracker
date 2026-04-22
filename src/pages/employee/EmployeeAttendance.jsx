@@ -6,6 +6,12 @@ import { formatDate, formatTime, formatDuration } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 
+function clockInDateIsSunday(iso) {
+  if (!iso) return false;
+  const d = new Date(iso);
+  return d.getDay() === 0;
+}
+
 export function EmployeeAttendance() {
   const dispatch = useDispatch();
   const { user } = useSelector((s) => s.auth);
@@ -21,7 +27,8 @@ export function EmployeeAttendance() {
     if (user?.id) dispatch(fetchAttendanceHistory({ userId: user.id, fromDate: `${from}T00:00:00`, toDate: `${to}T23:59:59` }));
   }, [dispatch, user?.id, from, to]);
 
-  const totalMinutes = (history || []).reduce((acc, log) => acc + (log.total_minutes || 0), 0);
+  const visibleHistory = (history || []).filter((log) => !clockInDateIsSunday(log.clock_in_at));
+  const totalMinutes = visibleHistory.reduce((acc, log) => acc + (log.total_minutes || 0), 0);
   const totalHours = (totalMinutes / 60).toFixed(1);
 
   return (
@@ -40,7 +47,7 @@ export function EmployeeAttendance() {
       </div>
 
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 mb-4">
-        <p className="text-sm text-gray-500 dark:text-gray-400">Total hours in period</p>
+        <p className="text-sm text-gray-500 dark:text-gray-400">Total hours in period (Sundays excluded)</p>
         <p className="text-2xl font-bold text-primary-600 dark:text-primary-400">{totalHours}h</p>
       </div>
 
@@ -48,6 +55,8 @@ export function EmployeeAttendance() {
         <div className="flex justify-center py-8"><LoadingSpinner /></div>
       ) : !history?.length ? (
         <EmptyState title="No records" message="No attendance in this period." />
+      ) : !visibleHistory.length ? (
+        <EmptyState title="No working-day records" message="This range only had Sundays, or there is no clock-in on Mon–Sat yet." />
       ) : (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
           <div className="overflow-x-auto">
@@ -62,7 +71,7 @@ export function EmployeeAttendance() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {history.map((log) => (
+                {visibleHistory.map((log) => (
                   <tr key={log.id} className="text-gray-700 dark:text-gray-300">
                     <td className="px-4 py-2">{formatDate(log.clock_in_at)}</td>
                     <td className="px-4 py-2">{formatTime(log.clock_in_at)}</td>

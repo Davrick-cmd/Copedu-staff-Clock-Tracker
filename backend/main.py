@@ -3,6 +3,7 @@ CopeDu Staff Clock Tracker - Local API (SQLite).
 Auth: JWT. All data in SQLite.
 """
 import csv
+import html
 import io
 import ipaddress
 import json
@@ -25,11 +26,11 @@ except ImportError:
     ZoneInfo = None
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from database import cursor, init_db, row_to_dict, get_conn
+from database import cursor, init_db, row_to_dict, get_conn, DB_PATH
 from auth_jwt import (
     hash_password,
     verify_password,
@@ -260,6 +261,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # Ensure login/LDAP logs show in uvicorn output
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 app = FastAPI(title="CopeDu Staff Clock Tracker API")
+APP_STARTED_AT = datetime.utcnow()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("CORS_ORIGIN", "http://localhost:5173")],
@@ -383,9 +385,14 @@ def startup():
             _ensure_leave_balance_rows_for_user(uid, y)
         if uids:
             logger.info("Leave: backfilled balance rows for %s users (year %s)", len(uids), y)
-        _refresh_all_annual_leave_balances_for_year(y)
     except Exception as e:
         logger.warning("Leave balance startup backfill failed: %s", e)
+    try:
+        n = _purge_expired_recognitions()
+        if n:
+            logger.info("Recognitions: purged %s expired post(s) (5 working-day retention)", n)
+    except Exception as e:
+        logger.warning("Recognition retention purge on startup failed: %s", e)
 
 
 @app.get("/health")
@@ -454,6 +461,7 @@ def login(req: LoginRequest):
     email_lower = identifier.lower() if looks_like_email else ""
     logger.info("Login: identifier=%r normalized_ad=%r looks_like_email=%s", identifier, normalized_ad, looks_like_email)
     user = None
+    login_method = "unknown"
     # Path 1: Looks like email -> find app user, then AD password (if enabled) and/or local hash
     if looks_like_email:
         with cursor() as c:
@@ -491,46 +499,85 @@ def login(req: LoginRequest):
             local_ok = verify_password(password, user["password_hash"])
             if ldap_ok:
                 logger.info("Login: email identifier -> AD success")
+                login_method = "ad_email_or_upn"
             elif local_ok:
                 logger.info("Login: email identifier -> local password success")
+                login_method = "local_email"
             else:
                 if last_ldap_err:
                     raise HTTPException(status_code=503, detail=last_ldap_err)
                 raise HTTPException(status_code=401, detail="Invalid username or password")
-    # Path 2: Username / UPN / unknown email - try AD, then match linked account
+    # Path 2a: Local auth only — email not found in Path 1, or identifier is not an email (e.g. AD username / login name)
     if user is None:
         cfg = _get_ldap_config()
         if not cfg.get("ldap_enabled"):
-            raise HTTPException(status_code=401, detail="Invalid username or password")
-        last_err = None
-        ok = False
-        if looks_like_email:
-            ok, err = _ldap_authenticate_by_mail_or_upn(email_lower, password)
-            if err:
-                last_err = err
-        if not ok:
-            ok, err = _ldap_authenticate(normalized_ad, password)
-            if err:
-                last_err = err
-        if not ok:
-            if last_err:
-                raise HTTPException(status_code=503, detail=last_err)
-            raise HTTPException(status_code=401, detail="Invalid username or password")
-        with cursor() as c:
-            c.execute("SELECT * FROM users WHERE LOWER(ad_username) = LOWER(?) AND is_active = 1", (normalized_ad,))
-            row = c.fetchone()
-        if not row and looks_like_email:
+            ident_lower = (identifier or "").strip().lower()
             with cursor() as c:
-                c.execute("SELECT * FROM users WHERE LOWER(email) = ? AND is_active = 1", (email_lower,))
+                c.execute(
+                    "SELECT * FROM users WHERE is_active = 1 AND ("
+                    "LOWER(COALESCE(ad_username,'')) = LOWER(?) OR LOWER(email) = ?"
+                    ")",
+                    (normalized_ad, ident_lower),
+                )
                 row = c.fetchone()
-        if not row:
-            raise HTTPException(status_code=401, detail="No account linked to this username. Ask an admin to add you.")
-        user = row_to_dict(row)
-        logger.info("Login: AD user by username / mail lookup -> success")
+            if not row:
+                if looks_like_email:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="No account for this email. Create the first user with POST /auth/register (see README), or ask HR/Admin to add you.",
+                    )
+                raise HTTPException(
+                    status_code=401,
+                    detail="Unknown login. Use your full work email, or ask HR to set your profile login name (AD username). First admin: register with your email and role admin.",
+                )
+            loc = row_to_dict(row)
+            if not verify_password(password, loc.get("password_hash") or ""):
+                raise HTTPException(status_code=401, detail="Invalid username or password")
+            user = loc
+            logger.info("Login: local DB match (email or ad_username) -> success")
+            login_method = "local_identifier"
+        else:
+            # Path 2b: LDAP — username / UPN / unknown email in DB - try AD, then match linked account
+            last_err = None
+            ok = False
+            if looks_like_email:
+                ok, err = _ldap_authenticate_by_mail_or_upn(email_lower, password)
+                if err:
+                    last_err = err
+            if not ok:
+                ok, err = _ldap_authenticate(normalized_ad, password)
+                if err:
+                    last_err = err
+            if not ok:
+                if last_err:
+                    raise HTTPException(status_code=503, detail=last_err)
+                raise HTTPException(status_code=401, detail="Invalid username or password")
+            with cursor() as c:
+                c.execute("SELECT * FROM users WHERE LOWER(ad_username) = LOWER(?) AND is_active = 1", (normalized_ad,))
+                row = c.fetchone()
+            if not row and looks_like_email:
+                with cursor() as c:
+                    c.execute("SELECT * FROM users WHERE LOWER(email) = ? AND is_active = 1", (email_lower,))
+                    row = c.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="No account linked to this username. Ask an admin to add you.")
+            user = row_to_dict(row)
+            logger.info("Login: AD user by username / mail lookup -> success")
+            login_method = "ad_username_or_mail"
     token = create_access_token({"sub": user["id"]})
     profile = _session_profile_for_user_id(user["id"])
     if not profile:
         raise HTTPException(status_code=401, detail="User not found")
+    _audit_log(
+        "auth_login_success",
+        "auth",
+        user.get("id"),
+        user.get("id"),
+        {
+            "identifier": identifier,
+            "login_method": login_method,
+        },
+    )
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -816,6 +863,17 @@ def clock_in(req: ClockInRequest, request: Request, user_id: str = Depends(get_c
     allowed_ranges = _get_clock_in_allowed_ip_ranges()
     if allowed_ranges and not _ip_in_ranges(client_ip or "", allowed_ranges):
         logger.warning("Clock-in rejected: IP %s not in allowed ranges", client_ip)
+        _audit_log(
+            "attendance_clockin_blocked",
+            "attendance_logs",
+            user_id,
+            None,
+            {
+                "reason": "ip_not_allowed",
+                "client_ip": client_ip,
+                "allowed_ranges": allowed_ranges,
+            },
+        )
         raise HTTPException(
             status_code=403,
             detail="Clock-in is only allowed from the office network. Connect to office Wi-Fi or network.",
@@ -831,6 +889,17 @@ def clock_in(req: ClockInRequest, request: Request, user_id: str = Depends(get_c
             )
             if c.fetchone():
                 logger.warning("Clock-in rejected: IP %s recently used by another user", client_ip)
+                _audit_log(
+                    "attendance_clockin_blocked",
+                    "attendance_logs",
+                    user_id,
+                    None,
+                    {
+                        "reason": "same_ip_cooldown",
+                        "client_ip": client_ip,
+                        "cooldown_minutes": same_ip_min,
+                    },
+                )
                 raise HTTPException(
                     status_code=403,
                     detail="This network address was used by another user recently. Clock in from your own device or wait a few minutes.",
@@ -1230,7 +1299,8 @@ def report_monthly_summary(
         raise HTTPException(status_code=403, detail="Forbidden")
     import calendar
     last_day = calendar.monthrange(year, month)[1]
-    total_days = last_day
+    total_days = last_day  # calendar days in month (Sundays still count toward month length)
+    work_days = sum(1 for d in range(1, last_day + 1) if date(year, month, d).weekday() != 6)
     days = []
     all_absent = set()
     all_late = set()
@@ -1243,6 +1313,8 @@ def report_monthly_summary(
     sum_pct_absent = 0.0
     sum_pct_no_clock_out = 0.0
     for day in range(1, last_day + 1):
+        if date(year, month, day).weekday() == 6:
+            continue  # Sunday — not a working day; do not count absent/present or list in daily series
         date_str = f"{year}-{month:02d}-{day:02d}"
         total_staff = len(employees)
         logs = _get_attendance_logs_for_date(date_str, branch_id)
@@ -1300,7 +1372,6 @@ def report_monthly_summary(
         "avg_pct_absent": round(sum_pct_absent / num_days, 1) if num_days else 0,
         "avg_pct_no_clock_out": round(sum_pct_no_clock_out / num_days, 1) if num_days else 0,
     }
-    work_days = total_days
     staff_monthly = []
     for e in employees:
         uid = e["user_id"]
@@ -1359,6 +1430,8 @@ def report_monthly_summary(
         prev_last = calendar.monthrange(prev_year, prev_month)[1]
         prev_sum_abs, prev_sum_late, prev_n = 0.0, 0.0, 0
         for day in range(1, prev_last + 1):
+            if date(prev_year, prev_month, day).weekday() == 6:
+                continue
             date_str = f"{prev_year}-{prev_month:02d}-{day:02d}"
             logs_prev = _get_attendance_logs_for_date(date_str, branch_id)
             pres_prev = {lg["user_id"] for lg in logs_prev}
@@ -1788,11 +1861,20 @@ def set_user_supervisor(uid: str, req: SupervisorUpdate, current_user_id: str = 
             c.execute("SELECT id FROM users WHERE id = ?", (req.manager_id,))
             if not c.fetchone():
                 raise HTTPException(status_code=400, detail="Supervisor user not found")
+    old_mid = None
+    with cursor() as c:
+        c.execute("SELECT manager_id FROM users WHERE id = ?", (uid,))
+        row = c.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        old_mid = row[0]
     with cursor() as c:
         c.execute(
             "UPDATE users SET manager_id = ?, updated_at = ? WHERE id = ?",
             (req.manager_id, datetime.utcnow().isoformat(), uid),
         )
+    if not _norm_uid_compare(old_mid, req.manager_id):
+        _repoint_workflows_after_staff_manager_change(uid, old_mid, current_user_id)
     with cursor() as c:
         c.execute("SELECT * FROM users WHERE id = ?", (uid,))
         return row_to_dict(c.fetchone())
@@ -2162,6 +2244,12 @@ def patch_user_record(uid: str, req: EmployeeRecordUpdate, current_user_id: str 
         if not out:
             raise HTTPException(status_code=404, detail="User not found")
         return out
+    old_manager_for_repoint = None
+    if "manager_id" in updates:
+        with cursor() as c:
+            c.execute("SELECT manager_id FROM users WHERE id = ?", (uid,))
+            r0 = c.fetchone()
+            old_manager_for_repoint = r0[0] if r0 else None
     sets = []
     params: list = []
     for k, v in updates.items():
@@ -2173,6 +2261,8 @@ def patch_user_record(uid: str, req: EmployeeRecordUpdate, current_user_id: str 
         c.execute(f"UPDATE users SET {', '.join(sets)}, updated_at = ? WHERE id = ?", tuple(params))
         if c.rowcount == 0:
             raise HTTPException(status_code=404, detail="User not found")
+    if "manager_id" in updates and not _norm_uid_compare(old_manager_for_repoint, updates.get("manager_id")):
+        _repoint_workflows_after_staff_manager_change(uid, old_manager_for_repoint, current_user_id)
     out = _return_user_api_dict(uid)
     if not out:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2185,8 +2275,10 @@ def set_user_active(uid: str, req: ActiveUpdate, current_user_id: str = Depends(
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
         r = c.fetchone()
-    if not r or r[0] != "admin":
+    if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    if not is_active and _norm_uid_compare(uid, current_user_id):
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
     with cursor() as c:
         c.execute("UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?", (1 if is_active else 0, datetime.utcnow().isoformat(), uid))
     with cursor() as c:
@@ -2334,7 +2426,7 @@ def create_branch(req: BranchCreate, user_id: str = Depends(get_current_user_id)
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
         r = c.fetchone()
-    if not r or r[0] != "admin":
+    if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
     bid = new_id()
     now = datetime.utcnow().isoformat()
@@ -2356,7 +2448,7 @@ def update_branch(bid: str, req: BranchUpdate, user_id: str = Depends(get_curren
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
         r = c.fetchone()
-    if not r or r[0] != "admin":
+    if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
     with cursor() as c:
         if req.name is not None:
@@ -2375,7 +2467,7 @@ def delete_branch(bid: str, user_id: str = Depends(get_current_user_id)):
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
         r = c.fetchone()
-    if not r or r[0] != "admin":
+    if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
     with cursor() as c:
         c.execute("DELETE FROM branches WHERE id = ?", (bid,))
@@ -2383,7 +2475,125 @@ def delete_branch(bid: str, user_id: str = Depends(get_current_user_id)):
 
 
 # ---------- Recognitions ----------
+# Posts use created_at (UTC). Retention = five inclusive Mon–Fri days from that calendar date (weekend posts count from next Mon).
+RECOGNITION_RETENTION_WORKING_DAYS = 5
 RECOGNITION_TYPES = ["Teamwork", "Innovation", "Customer focus", "Going the extra mile", "Leadership", "Support", "Other"]
+
+
+def _parse_recognition_created_utc_date(created_at_iso: str) -> date:
+    """UTC calendar date for a recognition row's created_at ISO string."""
+    raw = (created_at_iso or "").strip()
+    if not raw:
+        return datetime.now(timezone.utc).date()
+    try:
+        if raw.endswith("Z"):
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).date()
+    except ValueError:
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            try:
+                return date.fromisoformat(raw[:10])
+            except ValueError:
+                pass
+        return datetime.now(timezone.utc).date()
+
+
+def _recognition_retention_end_date(post_utc_date: date) -> date:
+    """Last calendar day the post is kept: the Nth working day (Mon–Fri), inclusive, from post_utc_date."""
+    n = RECOGNITION_RETENTION_WORKING_DAYS
+    wd_count = 0
+    cur = post_utc_date
+    while True:
+        if cur.weekday() < 5:
+            wd_count += 1
+            if wd_count >= n:
+                return cur
+        cur += timedelta(days=1)
+
+
+def _recognition_retention_expired(created_at_iso: str, today_utc: date) -> bool:
+    last_kept = _recognition_retention_end_date(_parse_recognition_created_utc_date(created_at_iso))
+    return today_utc > last_kept
+
+
+def _purge_expired_recognitions() -> int:
+    """Delete recognitions past working-day retention; CASCADE removes likes/comments.
+    Also removes old recognition @mention bell rows (no FK to recognitions)."""
+    today_utc = datetime.now(timezone.utc).date()
+    try:
+        with cursor() as c:
+            c.execute("SELECT id, created_at FROM recognitions")
+            rows = c.fetchall()
+            to_delete = [row[0] for row in rows if _recognition_retention_expired(row[1], today_utc)]
+            for rid in to_delete:
+                c.execute("DELETE FROM recognitions WHERE id = ?", (rid,))
+            if to_delete:
+                c.execute(
+                    "DELETE FROM notifications WHERE kind = ? AND datetime(created_at) < datetime('now', '-14 days')",
+                    ("recognition_mention",),
+                )
+        return len(to_delete)
+    except Exception as e:
+        logger.warning("Recognition retention purge failed: %s", e)
+        return 0
+# Same @token shape as the recognition UI (full name after @, optional spaces inside the name).
+_RECOGNITION_MENTION_RE = re.compile(r"@([^\s@]+(?:\s+[^\s@]+)*)")
+
+
+def _active_users_for_mention_match():
+    with cursor() as c:
+        c.execute("SELECT id, full_name, email FROM users WHERE is_active = 1")
+        rows = c.fetchall()
+    return [{"id": r[0], "full_name": (r[1] or "").strip(), "email": (r[2] or "").strip()} for r in rows]
+
+
+def _user_id_for_recognition_mention(users: list[dict], mention_raw: str) -> str | None:
+    """Match @mention text to a user: exact full_name (case-insensitive), else email prefix (like the frontend)."""
+    m = (mention_raw or "").strip().lower()
+    if not m:
+        return None
+    for u in users:
+        fn = (u.get("full_name") or "").strip().lower()
+        if fn and fn == m:
+            return u["id"]
+    for u in users:
+        em = (u.get("email") or "").strip().lower()
+        if em and em.startswith(m):
+            return u["id"]
+    return None
+
+
+def _notify_recognition_mentions(actor_id: str, text: str, *, recognition_id: str, is_comment: bool):
+    """Create in-app notifications for employees @tagged in a recognition post or comment."""
+    if not (text or "").strip() or not (recognition_id or "").strip():
+        return
+    slugs = []
+    for match in _RECOGNITION_MENTION_RE.finditer(text):
+        s = (match.group(1) or "").strip()
+        if s:
+            slugs.append(s)
+    if not slugs:
+        return
+    users = _active_users_for_mention_match()
+    actor = (actor_id or "").strip()
+    seen: set[str] = set()
+    actor_name = _employee_display_name(actor) if actor else "Someone"
+    title = "You were mentioned in a recognition comment" if is_comment else "You were mentioned in recognition"
+    snippet = (text or "").replace("\n", " ").strip()
+    if len(snippet) > 180:
+        snippet = snippet[:177] + "..."
+    link = "/employee"
+    for slug in slugs:
+        uid = _user_id_for_recognition_mention(users, slug)
+        if not uid or uid == actor or uid in seen:
+            continue
+        seen.add(uid)
+        body = f"{actor_name} tagged you. {snippet}"
+        _insert_notification(uid, "recognition_mention", title, body, link)
 
 
 class RecognitionCreate(BaseModel):
@@ -2397,11 +2607,13 @@ class RecognitionCommentCreate(BaseModel):
 
 @app.get("/recognitions/types")
 def list_recognition_types(_: str = Depends(get_current_user_id)):
+    _purge_expired_recognitions()
     return RECOGNITION_TYPES
 
 
 @app.post("/recognitions")
 def create_recognition(req: RecognitionCreate, from_user_id: str = Depends(get_current_user_id)):
+    _purge_expired_recognitions()
     msg = (req.message or "").strip()
     if not msg or len(msg) > 2000:
         raise HTTPException(status_code=400, detail="Message required (max 2000 chars)")
@@ -2430,11 +2642,16 @@ def create_recognition(req: RecognitionCreate, from_user_id: str = Depends(get_c
         d["like_count"] = 0
         d["comment_count"] = 0
         d["liked_by_me"] = False
+    try:
+        _notify_recognition_mentions(from_user_id, msg, recognition_id=rid, is_comment=False)
+    except Exception as ex:
+        logger.warning("Recognition mention notify failed: %s", ex)
     return d
 
 
 @app.get("/recognitions")
 def list_recognitions(limit: int = 50, user_id: str = Depends(get_current_user_id)):
+    _purge_expired_recognitions()
     with cursor() as c:
         c.execute(
             """SELECT r.*, u1.full_name as from_name, u2.full_name as to_name
@@ -2463,6 +2680,7 @@ def list_recognitions(limit: int = 50, user_id: str = Depends(get_current_user_i
 
 @app.post("/recognitions/{rid}/like")
 def toggle_recognition_like(rid: str, user_id: str = Depends(get_current_user_id)):
+    _purge_expired_recognitions()
     with cursor() as c:
         c.execute("SELECT id FROM recognitions WHERE id = ?", (rid,))
         if not c.fetchone():
@@ -2482,6 +2700,7 @@ def toggle_recognition_like(rid: str, user_id: str = Depends(get_current_user_id
 
 @app.get("/recognitions/{rid}/comments")
 def list_recognition_comments(rid: str, _: str = Depends(get_current_user_id)):
+    _purge_expired_recognitions()
     with cursor() as c:
         c.execute("SELECT id FROM recognitions WHERE id = ?", (rid,))
         if not c.fetchone():
@@ -2500,6 +2719,7 @@ def list_recognition_comments(rid: str, _: str = Depends(get_current_user_id)):
 
 @app.post("/recognitions/{rid}/comments")
 def create_recognition_comment(rid: str, req: RecognitionCommentCreate, user_id: str = Depends(get_current_user_id)):
+    _purge_expired_recognitions()
     body = (req.body or "").strip()
     if not body or len(body) > 1000:
         raise HTTPException(status_code=400, detail="Comment required (max 1000 chars)")
@@ -2519,7 +2739,13 @@ def create_recognition_comment(rid: str, req: RecognitionCommentCreate, user_id:
             """SELECT c.*, u.full_name as user_name FROM recognition_comments c JOIN users u ON c.user_id = u.id WHERE c.id = ?""",
             (cid,),
         )
-        return row_to_dict(c.fetchone())
+        row_out = c.fetchone()
+    out = row_to_dict(row_out) if row_out else None
+    try:
+        _notify_recognition_mentions(user_id, body, recognition_id=rid, is_comment=True)
+    except Exception as ex:
+        logger.warning("Recognition comment mention notify failed: %s", ex)
+    return out
 
 
 @app.get("/reports/recognitions")
@@ -2535,6 +2761,7 @@ def report_recognitions(
         r = c.fetchone()
     if not r or r[0] not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    _purge_expired_recognitions()
     with cursor() as c:
         c.execute("SELECT COUNT(*) FROM recognitions")
         total_count = c.fetchone()[0]
@@ -2566,7 +2793,313 @@ def report_recognitions(
     return {"total_count": total_count, "by_type": by_type, "recent": recent}
 
 
+@app.get("/reports/appraisal-performance")
+def report_appraisal_performance(
+    cycle_id: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    """HR/Admin: KPI and appraisal pipeline for one appraisal cycle (defaults to active, else latest)."""
+    with cursor() as c:
+        c.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
+        r = c.fetchone()
+    if not r or r[0] not in ("admin", "hr"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    cy_id = (cycle_id or "").strip() or None
+    td = to_date or datetime.utcnow().strftime("%Y-%m-%d")
+    fd = from_date or (datetime.utcnow() - timedelta(days=180)).strftime("%Y-%m-%d")
+    _parse_yyyy_mm_dd(fd)
+    _parse_yyyy_mm_dd(td)
+    if td < fd:
+        raise HTTPException(status_code=400, detail="to_date cannot be before from_date")
+
+    with cursor() as c:
+        if cy_id:
+            c.execute("SELECT * FROM appraisal_cycles WHERE id = ?", (cy_id,))
+            crow = c.fetchone()
+            if not crow:
+                raise HTTPException(status_code=404, detail="Cycle not found")
+        else:
+            c.execute("SELECT * FROM appraisal_cycles WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
+            crow = c.fetchone()
+            if not crow:
+                c.execute("SELECT * FROM appraisal_cycles ORDER BY year DESC, created_at DESC LIMIT 1")
+                crow = c.fetchone()
+        if not crow:
+            return {
+                "cycle": None,
+                "cycles": [],
+                "kpi_by_status": [],
+                "kpi_by_staff": [],
+                "appraisal_by_status": [],
+                "appraisal_by_staff": [],
+                "staff_in_scope": 0,
+                "note": "No appraisal cycles yet. Create one under HR → Appraisal.",
+            }
+        cy_id = crow["id"]
+        c.execute(
+            """
+            SELECT id, type, year, quarter, status, start_date, end_date
+            FROM appraisal_cycles
+            ORDER BY year DESC, created_at DESC
+            LIMIT 36
+            """
+        )
+        cycles = [row_to_dict(x) for x in c.fetchall()]
+        cycle = row_to_dict(crow)
+
+        c.execute(
+            """
+            SELECT status, COUNT(*) AS n
+            FROM kpis
+            WHERE cycle_id = ?
+              AND substr(COALESCE(updated_at, created_at, ''), 1, 10) >= ?
+              AND substr(COALESCE(updated_at, created_at, ''), 1, 10) <= ?
+            GROUP BY status
+            """,
+            (cy_id, fd, td),
+        )
+        kpi_by_status = [{"status": row[0], "count": int(row[1] or 0)} for row in c.fetchall()]
+
+        c.execute(
+            """
+            SELECT u.id AS user_id, u.full_name, u.email,
+              COALESCE(NULLIF(TRIM(u.department), ''), 'Unassigned') AS department,
+              COALESCE(TRIM(u.role), '') AS role,
+              COUNT(k.id) AS kpi_count,
+              COALESCE(SUM(CASE WHEN k.status = 'draft' THEN 1 ELSE 0 END), 0) AS kpi_draft,
+              COALESCE(SUM(CASE WHEN k.status = 'pending_supervisor' THEN 1 ELSE 0 END), 0) AS kpi_pending_supervisor,
+              COALESCE(SUM(CASE WHEN k.status = 'returned' THEN 1 ELSE 0 END), 0) AS kpi_returned,
+              COALESCE(SUM(CASE WHEN k.status = 'verified' THEN 1 ELSE 0 END), 0) AS kpi_verified,
+              COALESCE(SUM(CASE WHEN k.status = 'approved' THEN 1 ELSE 0 END), 0) AS kpi_approved,
+              COALESCE(SUM(CASE WHEN k.status = 'received' THEN 1 ELSE 0 END), 0) AS kpi_received,
+              COALESCE(SUM(CASE WHEN k.status = 'acknowledged' THEN 1 ELSE 0 END), 0) AS kpi_acknowledged
+            FROM users u
+            LEFT JOIN kpis k
+              ON k.user_id = u.id
+             AND k.cycle_id = ?
+             AND substr(COALESCE(k.updated_at, k.created_at, ''), 1, 10) >= ?
+             AND substr(COALESCE(k.updated_at, k.created_at, ''), 1, 10) <= ?
+            WHERE u.is_active = 1 AND COALESCE(TRIM(u.role), '') != 'admin'
+            GROUP BY u.id
+            ORDER BY u.full_name COLLATE NOCASE
+            LIMIT 600
+            """,
+            (cy_id, fd, td),
+        )
+        kpi_by_staff = [row_to_dict(x) for x in c.fetchall()]
+
+        c.execute(
+            """
+            SELECT status, COUNT(*) AS n
+            FROM appraisals
+            WHERE cycle_id = ?
+              AND substr(COALESCE(updated_at, created_at, ''), 1, 10) >= ?
+              AND substr(COALESCE(updated_at, created_at, ''), 1, 10) <= ?
+            GROUP BY status
+            """,
+            (cy_id, fd, td),
+        )
+        appraisal_by_status = [{"status": row[0], "count": int(row[1] or 0)} for row in c.fetchall()]
+
+        c.execute(
+            """
+            SELECT u.id AS user_id, u.full_name, u.email,
+              COALESCE(NULLIF(TRIM(u.department), ''), 'Unassigned') AS department,
+              COALESCE(TRIM(u.role), '') AS role,
+              COUNT(a.id) AS appraisal_count,
+              COALESCE(SUM(CASE WHEN a.status = 'draft' THEN 1 ELSE 0 END), 0) AS ap_draft,
+              COALESCE(SUM(CASE WHEN a.status = 'pending_supervisor' THEN 1 ELSE 0 END), 0) AS ap_pending_supervisor,
+              COALESCE(SUM(CASE WHEN a.status = 'returned' THEN 1 ELSE 0 END), 0) AS ap_returned,
+              COALESCE(SUM(CASE WHEN a.status = 'verified' THEN 1 ELSE 0 END), 0) AS ap_verified,
+              COALESCE(SUM(CASE WHEN a.status = 'approved' THEN 1 ELSE 0 END), 0) AS ap_approved,
+              COALESCE(SUM(CASE WHEN a.status = 'received' THEN 1 ELSE 0 END), 0) AS ap_received,
+              COALESCE(SUM(CASE WHEN a.status = 'acknowledged' THEN 1 ELSE 0 END), 0) AS ap_acknowledged
+            FROM users u
+            LEFT JOIN appraisals a
+              ON a.user_id = u.id
+             AND a.cycle_id = ?
+             AND substr(COALESCE(a.updated_at, a.created_at, ''), 1, 10) >= ?
+             AND substr(COALESCE(a.updated_at, a.created_at, ''), 1, 10) <= ?
+            WHERE u.is_active = 1 AND COALESCE(TRIM(u.role), '') != 'admin'
+            GROUP BY u.id
+            ORDER BY u.full_name COLLATE NOCASE
+            LIMIT 600
+            """,
+            (cy_id, fd, td),
+        )
+        appraisal_by_staff = [row_to_dict(x) for x in c.fetchall()]
+
+        c.execute(
+            """
+            SELECT COUNT(*) FROM users u
+            WHERE u.is_active = 1 AND COALESCE(TRIM(u.role), '') != 'admin'
+            """
+        )
+        staff_in_scope = int((c.fetchone() or [0])[0] or 0)
+
+    return {
+        "cycle": cycle,
+        "cycles": cycles,
+        "kpi_by_status": kpi_by_status,
+        "kpi_by_staff": kpi_by_staff,
+        "appraisal_by_status": appraisal_by_status,
+        "appraisal_by_staff": appraisal_by_staff,
+        "staff_in_scope": staff_in_scope,
+        "period": {"from_date": fd, "to_date": td},
+        "note": "Per-employee rows include everyone in scope (active, non-admin); KPI/appraisal counts are for the selected cycle and selected date range (updated_at/created_at). draft = not submitted; pending_supervisor = in supervisor chain; verified = chain done pending HR approve on KPI; approved/received/acknowledged = HR pipeline and staff acknowledgement.",
+    }
+
+
 # ---------- Audit ----------
+@app.get("/admin/system-report")
+def admin_system_report(user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin",))
+    now = datetime.utcnow()
+    uptime_seconds = max(int((now - APP_STARTED_AT).total_seconds()), 0)
+    db_size_bytes = 0
+    try:
+        db_size_bytes = int(os.path.getsize(os.path.abspath(DB_PATH)))
+    except Exception:
+        db_size_bytes = 0
+
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+        users_active = int((c.fetchone() or [0])[0] or 0)
+        c.execute("SELECT COUNT(*) FROM users WHERE is_active = 0")
+        users_inactive = int((c.fetchone() or [0])[0] or 0)
+        c.execute("SELECT COUNT(*) FROM attendance_logs WHERE clock_out_at IS NULL")
+        open_attendance_sessions = int((c.fetchone() or [0])[0] or 0)
+
+        c.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'auth_login_success'
+              AND substr(created_at, 1, 10) = ?
+            """,
+            (now.strftime("%Y-%m-%d"),),
+        )
+        logins_today = int((c.fetchone() or [0])[0] or 0)
+        c.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'auth_login_success'
+              AND substr(created_at, 1, 10) >= ?
+            """,
+            ((now - timedelta(days=7)).strftime("%Y-%m-%d"),),
+        )
+        logins_last_7_days = int((c.fetchone() or [0])[0] or 0)
+        c.execute(
+            """
+            SELECT al.id, al.user_id, al.action, al.details, al.created_at, u.full_name AS user_name, u.email AS user_email
+            FROM audit_logs al
+            LEFT JOIN users u ON u.id = al.user_id
+            WHERE al.action = 'auth_login_success'
+            ORDER BY al.created_at DESC
+            LIMIT 50
+            """
+        )
+        recent_login_rows = [row_to_dict(r) for r in c.fetchall()]
+        c.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'attendance_clockin_blocked'
+              AND substr(created_at, 1, 10) = ?
+            """,
+            (now.strftime("%Y-%m-%d"),),
+        )
+        blocked_today = int((c.fetchone() or [0])[0] or 0)
+        c.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'attendance_clockin_blocked'
+              AND substr(created_at, 1, 10) >= ?
+            """,
+            ((now - timedelta(days=7)).strftime("%Y-%m-%d"),),
+        )
+        blocked_last_7_days = int((c.fetchone() or [0])[0] or 0)
+        c.execute(
+            """
+            SELECT al.id, al.user_id, al.details, al.created_at, u.full_name AS user_name, u.email AS user_email
+            FROM audit_logs al
+            LEFT JOIN users u ON u.id = al.user_id
+            WHERE al.action = 'attendance_clockin_blocked'
+            ORDER BY al.created_at DESC
+            LIMIT 50
+            """
+        )
+        recent_block_rows = [row_to_dict(r) for r in c.fetchall()]
+
+    recent_logins = []
+    for r in recent_login_rows:
+        details = r.get("details")
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = {"raw": details}
+        recent_logins.append(
+            {
+                "id": r.get("id"),
+                "created_at": r.get("created_at"),
+                "user": {
+                    "id": r.get("user_id"),
+                    "full_name": r.get("user_name"),
+                    "email": r.get("user_email"),
+                },
+                "identifier": (details or {}).get("identifier"),
+                "login_method": (details or {}).get("login_method"),
+            }
+        )
+
+    recent_security_alerts = []
+    for r in recent_block_rows:
+        details = r.get("details")
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = {"raw": details}
+        recent_security_alerts.append(
+            {
+                "id": r.get("id"),
+                "created_at": r.get("created_at"),
+                "user": {
+                    "id": r.get("user_id"),
+                    "full_name": r.get("user_name"),
+                    "email": r.get("user_email"),
+                },
+                "reason": (details or {}).get("reason") or "blocked",
+                "client_ip": (details or {}).get("client_ip"),
+                "cooldown_minutes": (details or {}).get("cooldown_minutes"),
+            }
+        )
+
+    return {
+        "generated_at": now.isoformat(),
+        "health": {"status": "ok", "db_reachable": True},
+        "uptime": {"started_at": APP_STARTED_AT.isoformat(), "seconds": uptime_seconds},
+        "system": {
+            "users_active": users_active,
+            "users_inactive": users_inactive,
+            "open_attendance_sessions": open_attendance_sessions,
+            "db_size_bytes": db_size_bytes,
+        },
+        "logins": {
+            "today": logins_today,
+            "last_7_days": logins_last_7_days,
+            "recent": recent_logins,
+        },
+        "security": {
+            "blocked_clockins_today": blocked_today,
+            "blocked_clockins_last_7_days": blocked_last_7_days,
+            "recent_blocked_clockins": recent_security_alerts,
+        },
+    }
+
+
 @app.get("/audit")
 def list_audit(limit: int = 100, user_id: str = Depends(get_current_user_id)):
     with cursor() as c:
@@ -2643,6 +3176,210 @@ def set_setting(req: SettingUpdate, user_id: str = Depends(get_current_user_id))
     with cursor() as c:
         c.execute("INSERT OR REPLACE INTO settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)", (key, value, user_id, now))
     return {"ok": True}
+
+
+DEFAULT_DEPARTMENTS = [
+    "IT Department",
+    "Business Department",
+    "Operation",
+    "Human Resources",
+    "CEO offices",
+    "Executive Office",
+    "Legal",
+    "Risk & Compliance",
+    "Finance",
+    "Credit",
+    "Audit",
+]
+
+
+def _department_options() -> list[str]:
+    base = [str(x).strip() for x in DEFAULT_DEPARTMENTS if str(x or "").strip()]
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("custom_departments",))
+        row = c.fetchone()
+    custom: list[str] = []
+    if row and row[0] is not None:
+        raw = str(row[0]).strip()
+        try:
+            parsed = json.loads(raw) if raw else []
+            if isinstance(parsed, list):
+                custom = [str(x).strip() for x in parsed if str(x or "").strip()]
+        except Exception:
+            custom = []
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in base + custom:
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+class DepartmentCreate(BaseModel):
+    name: str
+
+
+@app.get("/departments/options")
+def list_department_options(user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin", "hr"))
+    return {"rows": _department_options()}
+
+
+@app.post("/departments")
+def create_department(req: DepartmentCreate, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin", "hr"))
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Department name is required")
+    rows = _department_options()
+    if any((x or "").strip().casefold() == name.casefold() for x in rows):
+        return {"ok": True, "rows": rows, "created": False}
+    base_set = {str(x).strip().casefold() for x in DEFAULT_DEPARTMENTS if str(x or "").strip()}
+    custom = [x for x in rows if x.casefold() not in base_set]
+    custom.append(name)
+    now = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)",
+            ("custom_departments", json.dumps(custom), user_id, now),
+        )
+    return {"ok": True, "rows": _department_options(), "created": True}
+
+
+class AdminCleanupRequest(BaseModel):
+    target: str = Field(..., description="One of: notifications, audit_logs")
+    older_than_days: int = Field(..., ge=1, le=3650)
+    confirm_text: str = Field(..., description="Safety confirmation phrase")
+
+
+def _cleanup_rules(target: str) -> dict:
+    t = (target or "").strip().lower()
+    if t == "notifications":
+        return {
+            "target": "notifications",
+            "table": "notifications",
+            "created_at_col": "created_at",
+            "min_days": 30,
+            "confirm_text": "CLEAR NOTIFICATIONS",
+        }
+    if t == "audit_logs":
+        return {
+            "target": "audit_logs",
+            "table": "audit_logs",
+            "created_at_col": "created_at",
+            "min_days": 90,
+            "confirm_text": "CLEAR AUDIT",
+        }
+    raise HTTPException(status_code=400, detail="Unsupported cleanup target")
+
+
+def _cleanup_candidate_count(table: str, created_at_col: str, older_than_days: int) -> int:
+    with cursor() as c:
+        c.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE datetime(COALESCE({created_at_col}, '')) < datetime('now', ?)",
+            (f"-{int(older_than_days)} days",),
+        )
+        row = c.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _archive_cleanup_rows(target: str, older_than_days: int, actor_user_id: str, rows: list[dict]) -> str:
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    archive_dir = os.path.join(UPLOAD_DIR, "maintenance-archives")
+    os.makedirs(archive_dir, exist_ok=True)
+    filename = f"{target}-older-than-{older_than_days}d-{ts}.json"
+    full_path = os.path.join(archive_dir, filename)
+    payload = {
+        "target": target,
+        "older_than_days": int(older_than_days),
+        "archived_at": datetime.utcnow().isoformat() + "Z",
+        "archived_by_user_id": actor_user_id,
+        "row_count": len(rows),
+        "rows": rows,
+    }
+    with open(full_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
+    return f"maintenance-archives/{filename}"
+
+
+@app.get("/admin/data-maintenance/summary")
+def admin_data_maintenance_summary(
+    notifications_days: int = Query(30, ge=1, le=3650),
+    audit_days: int = Query(180, ge=1, le=3650),
+    user_id: str = Depends(get_current_user_id),
+):
+    _require_roles(user_id, ("admin",))
+    n_rules = _cleanup_rules("notifications")
+    a_rules = _cleanup_rules("audit_logs")
+    n_days = max(int(notifications_days), int(n_rules["min_days"]))
+    a_days = max(int(audit_days), int(a_rules["min_days"]))
+    return {
+        "notifications": {
+            "min_days": n_rules["min_days"],
+            "effective_days": n_days,
+            "confirm_text": n_rules["confirm_text"],
+            "eligible_rows": _cleanup_candidate_count(n_rules["table"], n_rules["created_at_col"], n_days),
+        },
+        "audit_logs": {
+            "min_days": a_rules["min_days"],
+            "effective_days": a_days,
+            "confirm_text": a_rules["confirm_text"],
+            "eligible_rows": _cleanup_candidate_count(a_rules["table"], a_rules["created_at_col"], a_days),
+        },
+    }
+
+
+@app.post("/admin/data-maintenance/cleanup")
+def admin_data_maintenance_cleanup(req: AdminCleanupRequest, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin",))
+    rules = _cleanup_rules(req.target)
+    days = int(req.older_than_days)
+    if days < int(rules["min_days"]):
+        raise HTTPException(status_code=400, detail=f"Minimum retention is {rules['min_days']} days")
+    if (req.confirm_text or "").strip() != rules["confirm_text"]:
+        raise HTTPException(status_code=400, detail=f"Type exact confirmation: {rules['confirm_text']}")
+
+    table = rules["table"]
+    created_col = rules["created_at_col"]
+    with cursor() as c:
+        c.execute(
+            f"SELECT * FROM {table} WHERE datetime(COALESCE({created_col}, '')) < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    rows = [r for r in rows if r]
+    archive_rel_path = _archive_cleanup_rows(rules["target"], days, user_id, rows)
+
+    deleted = 0
+    with cursor() as c:
+        c.execute(
+            f"DELETE FROM {table} WHERE datetime(COALESCE({created_col}, '')) < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        deleted = int(c.rowcount or 0)
+
+    _audit_log(
+        "admin_data_cleanup",
+        table,
+        user_id,
+        None,
+        {
+            "target": rules["target"],
+            "older_than_days": days,
+            "deleted_rows": deleted,
+            "archive_file": archive_rel_path,
+        },
+    )
+    return {
+        "ok": True,
+        "target": rules["target"],
+        "older_than_days": days,
+        "deleted_rows": deleted,
+        "archive_file": archive_rel_path,
+    }
 
 
 # ---------- Appraisal module ----------
@@ -2815,11 +3552,19 @@ def appraisal_list_kpis(cycle_id: str, user_id: str = Depends(get_current_user_i
 
 @app.post("/appraisal/kpis")
 def appraisal_create_kpi(req: KPICreate, user_id: str = Depends(get_current_user_id)):
+    """Logged-in staff create their own KPIs for an open cycle; blocked when the calendar year is closed (reopen via HR/Admin cycle status)."""
     _appraisal_require_roles(user_id, ["admin", "hr", "employee", "manager", "hod"])
     with cursor() as c:
         c.execute("SELECT * FROM appraisal_cycles WHERE id = ? AND status IN ('active', 'draft')", (req.cycle_id,))
-        if not c.fetchone():
-            raise HTTPException(status_code=400, detail="Cycle not found or not open for KPIs")
+        cy_row = c.fetchone()
+    if not cy_row:
+        raise HTTPException(status_code=400, detail="Cycle not found or not open for KPIs")
+    cy_year = int(dict(cy_row).get("year") or 0)
+    if _is_year_closed(cy_year):
+        raise HTTPException(
+            status_code=400,
+            detail="This performance year is closed. HR or Admin can set a cycle for this year back to Draft or Active to allow new KPIs.",
+        )
     kid = new_id()
     with cursor() as c:
         c.execute(
@@ -2857,7 +3602,16 @@ def appraisal_update_kpi(kpi_id: str, req: KPIUpdate, user_id: str = Depends(get
         _appraisal_require_roles(user_id, ["admin", "hr"])
     status = r.get("status") or "draft"
     if status not in ("draft", "returned"):
-        raise HTTPException(status_code=400, detail="Cannot edit KPI in current status")
+        raise HTTPException(
+            status_code=400,
+            detail="KPIs can only be edited while Draft or Returned. After submission or approval, changes are not allowed.",
+        )
+    cy_year = _kpi_cycle_year(str(r.get("cycle_id") or ""))
+    if _is_year_closed(cy_year):
+        raise HTTPException(
+            status_code=400,
+            detail="This performance year is closed for KPI edits. HR or Admin must reopen a cycle for this year first.",
+        )
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if not updates:
         return row_to_dict(row)
@@ -2882,6 +3636,12 @@ def appraisal_submit_kpi(kpi_id: str, user_id: str = Depends(get_current_user_id
         raise HTTPException(status_code=403, detail="Forbidden")
     if r.get("status") not in ("draft", "returned"):
         raise HTTPException(status_code=400, detail="KPI already submitted or beyond")
+    cy_year = _kpi_cycle_year(str(r.get("cycle_id") or ""))
+    if _is_year_closed(cy_year):
+        raise HTTPException(
+            status_code=400,
+            detail="This performance year is closed. HR or Admin can reopen a cycle for this year before you submit KPIs.",
+        )
     now = datetime.utcnow().isoformat()
     owner = str(r["user_id"])
     first = _get_staff_manager_id(owner)
@@ -3201,30 +3961,39 @@ def appraisal_update_score(appraisal_id: str, kpi_item_id: str, req: AppraisalSc
         raise HTTPException(status_code=404, detail="Appraisal not found")
     if (row["cycle_status"] or "") != "active":
         raise HTTPException(status_code=400, detail="Scores can only be entered when cycle is Active")
+    appr = dict(row)
     is_owner = str(row["user_id"]) == str(user_id)
+    app_status = appr.get("status") or ""
     updates = {}
     if req.self_score is not None:
         if not is_owner and role not in ("admin", "hr"):
             raise HTTPException(status_code=403, detail="Only staff can set self score")
+        if is_owner and role not in ("admin", "hr") and app_status not in ("draft", "returned"):
+            raise HTTPException(status_code=400, detail="Self scores can only be edited while appraisal is draft or returned")
         updates["self_score"] = max(0, min(100, req.self_score))
     if req.self_comment is not None:
         if not is_owner and role not in ("admin", "hr"):
             raise HTTPException(status_code=403, detail="Only staff can set self comment")
+        if is_owner and role not in ("admin", "hr") and app_status not in ("draft", "returned"):
+            raise HTTPException(status_code=400, detail="Self comments can only be edited while appraisal is draft or returned")
         updates["self_comment"] = (req.self_comment or "").strip() or None
     if req.supervisor_score is not None:
         if is_owner and role not in ("admin", "hr"):
             raise HTTPException(status_code=403, detail="Only supervisor can set supervisor score")
-        _appraisal_require_roles(user_id, ["admin", "hr", "manager"])
+        if not _can_edit_supervisor_appraisal_scores(user_id, role, appr):
+            raise HTTPException(status_code=403, detail="Only the assigned supervisor (or HR/Admin) can set supervisor scores at this step")
         updates["supervisor_score"] = max(0, min(100, req.supervisor_score))
     if req.supervisor_comment is not None:
         if is_owner and role not in ("admin", "hr"):
             raise HTTPException(status_code=403, detail="Only supervisor can set supervisor comment")
-        _appraisal_require_roles(user_id, ["admin", "hr", "manager"])
+        if not _can_edit_supervisor_appraisal_scores(user_id, role, appr):
+            raise HTTPException(status_code=403, detail="Only the assigned supervisor (or HR/Admin) can set supervisor comments at this step")
         updates["supervisor_comment"] = (req.supervisor_comment or "").strip() or None
     if req.agreed_score is not None:
         if is_owner and role not in ("admin", "hr"):
             raise HTTPException(status_code=403, detail="Only supervisor can set agreed score")
-        _appraisal_require_roles(user_id, ["admin", "hr", "hod", "manager"])
+        if not _can_edit_supervisor_appraisal_scores(user_id, role, appr):
+            raise HTTPException(status_code=403, detail="Only the assigned supervisor (or HR/Admin) can set agreed scores at this step")
         updates["agreed_score"] = max(0, min(100, req.agreed_score))
     if req.hod_comment is not None:
         _appraisal_require_roles(user_id, ["admin", "hr", "hod"])
@@ -3353,7 +4122,7 @@ def appraisal_return_appraisal(appraisal_id: str, req: ReturnComment, user_id: s
         raise HTTPException(status_code=400, detail="This appraisal cannot be returned in its current status")
     with cursor() as c:
         c.execute(
-            "UPDATE appraisals SET status = 'returned', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE appraisals SET status = 'returned', current_approver_id = NULL, employee_agreed_scores_at = NULL, updated_at = ? WHERE id = ?",
             (datetime.utcnow().isoformat(), appraisal_id),
         )
     wid = new_id()
@@ -3423,6 +4192,17 @@ def appraisal_approve_appraisal(appraisal_id: str, user_id: str = Depends(get_cu
         raise HTTPException(status_code=404, detail="Appraisal not found")
     if (row["status"] or "") != "verified":
         raise HTTPException(status_code=400, detail="Only verified appraisals can be approved")
+    if _appraisal_needs_employee_score_agreement(appraisal_id):
+        if not _appraisal_all_agreed_scores_filled(appraisal_id):
+            raise HTTPException(
+                status_code=400,
+                detail="All KPI lines must have an agreed % (set by the supervisor) before HOD/HR can approve.",
+            )
+        if not dict(row).get("employee_agreed_scores_at"):
+            raise HTTPException(
+                status_code=400,
+                detail="Employee must confirm agreement with the agreed scores (My Appraisals) before this appraisal can be approved.",
+            )
     with cursor() as c:
         c.execute("UPDATE appraisals SET status = 'approved', updated_at = ? WHERE id = ?", (datetime.utcnow().isoformat(), appraisal_id))
     _appraisal_log("appraisal", appraisal_id, "approved", user_id, _appraisal_user_role(user_id), "hr")
@@ -3481,6 +4261,110 @@ def appraisal_appraisal_workflow(appraisal_id: str, user_id: str = Depends(get_c
         c.execute("SELECT * FROM workflow_comments WHERE reference_type = 'appraisal' AND reference_id = ? ORDER BY created_at", (appraisal_id,))
         comments = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
     return {"logs": logs, "comments": comments}
+
+
+def _appraisal_user_can_view_appraisal(user_id: str, role: str, appr: dict) -> bool:
+    if role in ("admin", "hr"):
+        return True
+    if str(appr.get("user_id")) == str(user_id):
+        return True
+    if role == "hod":
+        return True
+    if role == "manager":
+        with cursor() as c:
+            c.execute("SELECT manager_id FROM users WHERE id = ?", (str(appr.get("user_id")),))
+            r = c.fetchone()
+        mid = (r[0] or "").strip() if r and r[0] else ""
+        return mid == str(user_id).strip()
+    return False
+
+
+@app.post("/appraisal/appraisals/{appraisal_id}/confirm-agreed-scores")
+def appraisal_confirm_agreed_scores(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    """Employee confirms they agree with supervisor-entered agreed % on each KPI line (required before HOD approval when scores exist)."""
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    appr = dict(row)
+    if str(appr.get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (appr.get("status") or "") != "verified":
+        raise HTTPException(status_code=400, detail="Appraisal must be supervisor-verified before you can confirm agreed scores")
+    if not _appraisal_needs_employee_score_agreement(appraisal_id):
+        raise HTTPException(status_code=400, detail="This appraisal has no scored KPI lines to confirm")
+    if not _appraisal_all_agreed_scores_filled(appraisal_id):
+        raise HTTPException(status_code=400, detail="Supervisor must enter agreed % on every KPI line before you can confirm")
+    now = datetime.utcnow().isoformat() + "Z"
+    with cursor() as c:
+        c.execute("UPDATE appraisals SET employee_agreed_scores_at = ?, updated_at = ? WHERE id = ?", (now, datetime.utcnow().isoformat(), appraisal_id))
+    _appraisal_log("appraisal", appraisal_id, "employee_confirmed_agreed_scores", user_id, "employee", None)
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisals WHERE id = ?", (appraisal_id,))
+        return row_to_dict(c.fetchone())
+
+
+@app.get("/appraisal/appraisals/{appraisal_id}/agreed-summary")
+def appraisal_agreed_summary(appraisal_id: str, user_id: str = Depends(get_current_user_id)):
+    """HTML summary of agreed appraisal (for print / Save as PDF). Staff (own), manager, HOD, HR."""
+    role = _appraisal_user_role(user_id)
+    with cursor() as c:
+        c.execute(
+            "SELECT a.*, u.full_name as staff_name, u.email as staff_email, cy.year, cy.quarter, cy.type as cycle_type, cy.start_date as cycle_start, cy.end_date as cycle_end "
+            "FROM appraisals a JOIN users u ON a.user_id = u.id JOIN appraisal_cycles cy ON a.cycle_id = cy.id WHERE a.id = ?",
+            (appraisal_id,),
+        )
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Appraisal not found")
+    appr = dict(row)
+    if not _appraisal_user_can_view_appraisal(user_id, role, appr):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    st = appr.get("status") or ""
+    if st not in ("verified", "approved", "received", "acknowledged"):
+        raise HTTPException(status_code=400, detail="Summary is available after supervisor verification and agreed scores are set")
+    if _appraisal_needs_employee_score_agreement(appraisal_id) and not appr.get("employee_agreed_scores_at") and role not in ("admin", "hr", "hod"):
+        raise HTTPException(status_code=400, detail="Employee must confirm agreed scores before downloading this summary")
+    with cursor() as c:
+        c.execute(
+            "SELECT s.*, i.description, i.weight, i.target FROM appraisal_scores s "
+            "JOIN appraisal_kpi_items i ON s.kpi_item_id = i.id WHERE s.appraisal_id = ? ORDER BY i.sort_order, i.created_at",
+            (appraisal_id,),
+        )
+        scores = [dict(r) for r in c.fetchall()]
+    period = f"{appr.get('year')}"
+    if (appr.get("cycle_type") or "") == "quarterly" and appr.get("quarter"):
+        period = f"{appr.get('year')} {appr.get('quarter')}"
+    esc = html.escape
+    rows_html = ""
+    for s in scores:
+        rows_html += (
+            f"<tr><td>{esc(str(s.get('description') or ''))}</td>"
+            f"<td>{esc(str(s.get('target') or ''))}</td>"
+            f"<td>{s.get('weight') or ''}</td>"
+            f"<td>{s.get('self_score') if s.get('self_score') is not None else '—'}</td>"
+            f"<td>{s.get('supervisor_score') if s.get('supervisor_score') is not None else '—'}</td>"
+            f"<td><strong>{s.get('agreed_score') if s.get('agreed_score') is not None else '—'}</strong></td>"
+            f"<td>{s.get('weighted_score') if s.get('weighted_score') is not None else '—'}</td></tr>"
+        )
+    body = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Appraisal {esc(period)}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:24px;}}table{{border-collapse:collapse;width:100%;}}th,td{{border:1px solid #ccc;padding:8px;text-align:left;}}th{{background:#f5f5f5;}}</style></head><body>
+<h1>Performance appraisal (agreed record)</h1>
+<p><strong>Period:</strong> {esc(period)} &nbsp; <strong>Cycle:</strong> {esc(str(appr.get('cycle_start') or ''))} – {esc(str(appr.get('cycle_end') or ''))}</p>
+<p><strong>Employee:</strong> {esc(str(appr.get('staff_name') or ''))} ({esc(str(appr.get('staff_email') or ''))})</p>
+<p><strong>Status:</strong> {esc(st)} &nbsp; <strong>Total score:</strong> {appr.get('total_score') if appr.get('total_score') is not None else '—'} &nbsp; <strong>Rating:</strong> {esc(str(appr.get('rating') or '—'))}</p>
+<p><strong>Achievements:</strong><br>{esc(str(appr.get('achievements') or '—'))}</p>
+<p><strong>Challenges:</strong><br>{esc(str(appr.get('challenges') or '—'))}</p>
+<p><strong>Overall comments:</strong><br>{esc(str(appr.get('overall_comments') or '—'))}</p>
+<h2>KPI scores (agreed %)</h2>
+<table><thead><tr><th>KPI</th><th>Target</th><th>Weight %</th><th>Self %</th><th>Supervisor %</th><th>Agreed %</th><th>Weighted</th></tr></thead><tbody>{rows_html or '<tr><td colspan="7">No score lines</td></tr>'}</tbody></table>
+<p style="margin-top:48px;"><strong>Employee signature</strong> _________________________ &nbsp; Date _________</p>
+<p><strong>Supervisor signature</strong> _________________________ &nbsp; Date _________</p>
+<p style="font-size:12px;color:#666;">Generated from CopeDu Staff Clock Tracker. Print this page or use Print → Save as PDF.</p>
+</body></html>"""
+
+    return HTMLResponse(content=body)
 
 
 # Dashboards
@@ -3544,8 +4428,11 @@ def appraisal_dashboard_manager(user_id: str = Depends(get_current_user_id)):
     with cursor() as c:
         c.execute(
             """
-            SELECT k.*, u.full_name as user_name FROM kpis k
+            SELECT k.*, u.full_name as user_name, c.type as cycle_type, c.year, c.quarter,
+                   c.start_date as cycle_start_date, c.end_date as cycle_end_date
+            FROM kpis k
             JOIN users u ON k.user_id = u.id
+            JOIN appraisal_cycles c ON k.cycle_id = c.id
             WHERE k.status = 'pending_supervisor'
               AND LOWER(TRIM(COALESCE(k.current_approver_id, ''))) = LOWER(?)
             ORDER BY k.updated_at
@@ -3556,8 +4443,11 @@ def appraisal_dashboard_manager(user_id: str = Depends(get_current_user_id)):
     with cursor() as c:
         c.execute(
             """
-            SELECT a.*, u.full_name as user_name FROM appraisals a
+            SELECT a.*, u.full_name as user_name, c.type as cycle_type, c.year, c.quarter,
+                   c.start_date as cycle_start_date, c.end_date as cycle_end_date
+            FROM appraisals a
             JOIN users u ON a.user_id = u.id
+            JOIN appraisal_cycles c ON a.cycle_id = c.id
             WHERE a.status = 'pending_supervisor'
               AND LOWER(TRIM(COALESCE(a.current_approver_id, ''))) = LOWER(?)
             ORDER BY a.updated_at
@@ -3585,26 +4475,41 @@ def appraisal_dashboard_manager(user_id: str = Depends(get_current_user_id)):
 
 @app.get("/appraisal/dashboard/hod")
 def appraisal_dashboard_hod(user_id: str = Depends(get_current_user_id)):
+    """HOD sees their reporting line (``manager_id`` = HOD), not the whole organisation department."""
     _appraisal_require_roles(user_id, ["admin", "hr", "hod"])
     with cursor() as c:
-        c.execute("SELECT department FROM users WHERE id = ?", (user_id,))
-        r = c.fetchone()
-    dept = (r[0] or "").strip() if r else ""
+        c.execute(
+            "SELECT id FROM users WHERE (is_active = 1 OR is_active IS NULL) AND manager_id = ?",
+            (user_id,),
+        )
+        team_user_ids = [x[0] for x in c.fetchall()]
+    if not team_user_ids:
+        empty = []
+        return {
+            "kpis_pending_approve": [],
+            "appraisals_pending_approve": [],
+            "team_overview": empty,
+            "department_overview": empty,
+        }
+    placeholders = ",".join("?" * len(team_user_ids))
     with cursor() as c:
-        c.execute("SELECT id FROM users WHERE department = ? AND (is_active = 1 OR is_active IS NULL)", (dept,))
-        dept_user_ids = [x[0] for x in c.fetchall()]
-    if not dept_user_ids:
-        return {"kpis_pending_approve": [], "appraisals_pending_approve": [], "department_overview": []}
-    placeholders = ",".join("?" * len(dept_user_ids))
-    with cursor() as c:
-        c.execute(f"SELECT k.*, u.full_name as user_name FROM kpis k JOIN users u ON k.user_id = u.id WHERE k.user_id IN ({placeholders}) AND k.status = 'verified' ORDER BY k.updated_at", dept_user_ids)
+        c.execute(
+            f"SELECT k.*, u.full_name as user_name FROM kpis k JOIN users u ON k.user_id = u.id "
+            f"WHERE k.user_id IN ({placeholders}) AND k.status = 'verified' ORDER BY k.updated_at",
+            team_user_ids,
+        )
         kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
     with cursor() as c:
-        c.execute(f"SELECT a.*, u.full_name as user_name FROM appraisals a JOIN users u ON a.user_id = u.id WHERE a.user_id IN ({placeholders}) AND a.status = 'verified' ORDER BY a.updated_at", dept_user_ids)
+        c.execute(
+            f"SELECT a.*, u.full_name as user_name, cy.year, cy.quarter, cy.type as cycle_type FROM appraisals a "
+            f"JOIN users u ON a.user_id = u.id JOIN appraisal_cycles cy ON a.cycle_id = cy.id "
+            f"WHERE a.user_id IN ({placeholders}) AND a.status = 'verified' ORDER BY a.updated_at",
+            team_user_ids,
+        )
         appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
     overview = []
     with cursor() as c:
-        for uid in dept_user_ids:
+        for uid in team_user_ids:
             c.execute("SELECT full_name FROM users WHERE id = ?", (uid,))
             name_row = c.fetchone()
             c.execute("SELECT COUNT(*) FROM kpis WHERE user_id = ? AND status = 'acknowledged'", (uid,))
@@ -3612,7 +4517,12 @@ def appraisal_dashboard_hod(user_id: str = Depends(get_current_user_id)):
             c.execute("SELECT COUNT(*) FROM appraisals WHERE user_id = ? AND status = 'acknowledged'", (uid,))
             a_count = c.fetchone()[0]
             overview.append({"user_id": uid, "full_name": name_row[0] if name_row else "", "kpis_acknowledged": k_count, "appraisals_acknowledged": a_count})
-    return {"kpis_pending_approve": kpis, "appraisals_pending_approve": appraisals, "department_overview": overview}
+    return {
+        "kpis_pending_approve": kpis,
+        "appraisals_pending_approve": appraisals,
+        "team_overview": overview,
+        "department_overview": overview,
+    }
 
 
 @app.get("/appraisal/dashboard/hr")
@@ -3625,7 +4535,11 @@ def appraisal_dashboard_hr(user_id: str = Depends(get_current_user_id)):
         c.execute("SELECT k.*, u.full_name as user_name, u.department FROM kpis k JOIN users u ON k.user_id = u.id WHERE k.status IN ('approved', 'received', 'acknowledged') ORDER BY k.updated_at DESC")
         kpis = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
     with cursor() as c:
-        c.execute("SELECT a.*, u.full_name as user_name, u.department FROM appraisals a JOIN users u ON a.user_id = u.id WHERE a.status IN ('approved', 'received', 'acknowledged') ORDER BY a.updated_at DESC")
+        c.execute(
+            "SELECT a.*, u.full_name as user_name, u.department, cy.year, cy.quarter, cy.type as cycle_type "
+            "FROM appraisals a JOIN users u ON a.user_id = u.id JOIN appraisal_cycles cy ON a.cycle_id = cy.id "
+            "WHERE a.status IN ('approved', 'received', 'acknowledged') ORDER BY a.updated_at DESC"
+        )
         appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
     with cursor() as c:
         c.execute(
@@ -3721,6 +4635,35 @@ def _appraisal_recalc_total(appraisal_id: str):
         c.execute("UPDATE appraisals SET total_score = ?, rating = ?, updated_at = ? WHERE id = ?", (total, rating, now, appraisal_id))
 
 
+def _appraisal_score_rows_list(appraisal_id: str) -> list[dict]:
+    with cursor() as c:
+        c.execute("SELECT * FROM appraisal_scores WHERE appraisal_id = ?", (appraisal_id,))
+        return [dict(r) for r in c.fetchall()]
+
+
+def _appraisal_all_agreed_scores_filled(appraisal_id: str) -> bool:
+    rows = _appraisal_score_rows_list(appraisal_id)
+    if not rows:
+        return False
+    return all(r.get("agreed_score") is not None for r in rows)
+
+
+def _appraisal_needs_employee_score_agreement(appraisal_id: str) -> bool:
+    """True when quarterly score rows exist (employee must confirm agreed % before HOD approves)."""
+    return len(_appraisal_score_rows_list(appraisal_id)) > 0
+
+
+def _can_edit_supervisor_appraisal_scores(user_id: str, role: str, appr: dict) -> bool:
+    if role in ("admin", "hr"):
+        return True
+    if role != "manager":
+        return False
+    if (appr.get("status") or "") != "pending_supervisor":
+        return False
+    cur = (appr.get("current_approver_id") or "").strip()
+    return str(user_id).strip() == cur
+
+
 # Annual KPIs: one set per user per year; workflow Supervisor -> HOD -> HR lock
 def _annual_kpi_editable(status: str) -> bool:
     return (status or "") in ("draft", "returned_supervisor", "returned_hod")
@@ -3731,6 +4674,13 @@ def _is_year_closed(year: int) -> bool:
     with cursor() as c:
         c.execute("SELECT 1 FROM appraisal_cycles WHERE year = ? AND status = 'closed' LIMIT 1", (year,))
         return c.fetchone() is not None
+
+
+def _kpi_cycle_year(cycle_id: str) -> int:
+    with cursor() as c:
+        c.execute("SELECT year FROM appraisal_cycles WHERE id = ?", ((cycle_id or "").strip(),))
+        r = c.fetchone()
+    return int(r[0] or 0) if r else 0
 
 
 class AnnualKPICreate(BaseModel):
@@ -4236,6 +5186,14 @@ def mark_all_notifications_read(user_id: str = Depends(get_current_user_id)):
     return {"ok": True}
 
 
+@app.delete("/notifications")
+def clear_all_notifications(user_id: str = Depends(get_current_user_id)):
+    with cursor() as c:
+        c.execute("DELETE FROM notifications WHERE user_id = ?", (user_id,))
+        deleted = int(c.rowcount or 0)
+    return {"ok": True, "deleted": deleted}
+
+
 # ---------- Staff documents (per employee: HR confidential or employee certificates) ----------
 @app.get("/staff-documents")
 def list_staff_documents(
@@ -4252,7 +5210,7 @@ def list_staff_documents(
     if role not in ("admin", "hr"):
         if sub != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        kind_sql = "kind = 'employee_certificate'"
+        kind_sql = "kind IN ('employee_certificate', 'signed_appraisal')"
         params = (sub,)
     else:
         if not (subject_user_id or "").strip():
@@ -4286,9 +5244,10 @@ async def upload_staff_document(
     title: str = Form(...),
     kind: str = Form(...),
     subject_user_id: str = Form(...),
+    appraisal_id: str | None = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
-    """kind = hr_confidential (HR/Admin only, about subject) or employee_certificate (subject uploads their own)."""
+    """kind = hr_confidential | employee_certificate | signed_appraisal (signed appraisal PDF/scan; optional appraisal_id links to quarterly appraisal)."""
     with cursor() as c:
         c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
         row = c.fetchone()
@@ -4299,11 +5258,25 @@ async def upload_staff_document(
     if not sub:
         raise HTTPException(status_code=400, detail="subject_user_id required")
     k = (kind or "").strip().lower()
-    if k not in ("hr_confidential", "employee_certificate"):
+    if k not in ("hr_confidential", "employee_certificate", "signed_appraisal"):
         raise HTTPException(status_code=400, detail="Invalid kind")
     if k == "hr_confidential":
         if role not in ("admin", "hr"):
             raise HTTPException(status_code=403, detail="Only HR or Admin can upload confidential staff documents")
+    elif k == "signed_appraisal":
+        if sub != user_id:
+            raise HTTPException(status_code=403, detail="You can only upload a signed appraisal to your own profile")
+        aid = (appraisal_id or "").strip()
+        if not aid:
+            raise HTTPException(status_code=400, detail="appraisal_id is required for signed_appraisal uploads")
+        with cursor() as c:
+            c.execute("SELECT * FROM appraisals WHERE id = ?", (aid,))
+            arow = c.fetchone()
+        if not arow or str(dict(arow).get("user_id")) != str(user_id):
+            raise HTTPException(status_code=400, detail="Appraisal not found or does not belong to you")
+        ast = dict(arow).get("status") or ""
+        if ast not in ("approved", "received", "acknowledged"):
+            raise HTTPException(status_code=400, detail="Signed appraisal can be uploaded after HR has approved the appraisal")
     else:
         if sub != user_id:
             raise HTTPException(status_code=403, detail="You can only upload certificates to your own profile")
@@ -4335,6 +5308,18 @@ async def upload_staff_document(
             _notify_hr_admins_staff_certificate(sub, (title or "").strip() or file.filename)
         except Exception as e:
             logger.warning("Certificate notification failed: %s", e)
+    if k == "signed_appraisal":
+        try:
+            _notify_hr_admins_staff_certificate(sub, f"[Signed appraisal] {(title or '').strip() or file.filename}")
+        except Exception as e:
+            logger.warning("Signed appraisal notification failed: %s", e)
+        aid = (appraisal_id or "").strip()
+        if aid:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE appraisals SET signed_document_id = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                    (hid, datetime.utcnow().isoformat(), aid, sub),
+                )
     with cursor() as c:
         c.execute(
             "SELECT s.*, u.full_name as uploader_name FROM staff_documents s LEFT JOIN users u ON s.uploaded_by = u.id WHERE s.id = ?",
@@ -4365,6 +5350,8 @@ def get_staff_document_file(document_id: str, user_id: str = Depends(get_current
     if role in ("admin", "hr"):
         pass
     elif dk == "employee_certificate" and sub_uid == user_id:
+        pass
+    elif dk == "signed_appraisal" and sub_uid == user_id:
         pass
     else:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -4400,6 +5387,8 @@ def delete_staff_document(document_id: str, user_id: str = Depends(get_current_u
     if role in ("admin", "hr"):
         pass
     elif dk == "employee_certificate" and sub_uid == user_id and up == user_id:
+        pass
+    elif dk == "signed_appraisal" and sub_uid == user_id and up == user_id:
         pass
     else:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -4462,10 +5451,46 @@ def _next_leave_approver_after_step(approver_user_id: str, requester_user_id: st
     next_id = (approver.get("manager_id") or "").strip()
     if not next_id or next_id == requester_user_id:
         return None
+    # Guard against circular reporting lines (A->B->C->A) causing endless forwarding loops.
+    seen = {approver_user_id}
+    walk = next_id
+    for _ in range(25):
+        if not walk:
+            break
+        if walk in seen:
+            return None
+        seen.add(walk)
+        wprof = _get_user_profile_min(walk)
+        if not wprof or not _user_is_active_row(wprof):
+            break
+        walk = (wprof.get("manager_id") or "").strip()
     nxt = _get_user_profile_min(next_id)
     if not nxt or not _user_is_active_row(nxt):
         return None
     return next_id
+
+
+def _is_user_in_requester_supervisor_chain(requester_user_id: str, candidate_user_id: str) -> bool:
+    """True when candidate appears in requester's active manager chain."""
+    req = (requester_user_id or "").strip()
+    cand = (candidate_user_id or "").strip()
+    if not req or not cand or req == cand:
+        return False
+    seen = set()
+    current = _get_staff_manager_id(req)
+    for _ in range(30):
+        if not current:
+            return False
+        if current == cand:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
+        prof = _get_user_profile_min(current)
+        if not prof or not _user_is_active_row(prof):
+            return False
+        current = (prof.get("manager_id") or "").strip()
+    return False
 
 
 def _require_roles(user_id: str, allowed_roles: tuple[str, ...]):
@@ -4526,6 +5551,7 @@ def _annual_entitlement_days(uid: str) -> float:
 
 
 def _refresh_annual_balance_allocation(uid: str, year: int) -> None:
+    """Overwrite this user's ANNUAL row with statutory entitlement minus used (see POST /leave/hr/recompute-statutory-annual)."""
     if not (uid or "").strip():
         return
     ent = _annual_entitlement_days(uid)
@@ -4554,7 +5580,7 @@ def _refresh_annual_balance_allocation(uid: str, year: int) -> None:
 
 
 def _refresh_all_annual_leave_balances_for_year(year: int) -> None:
-    """Recompute ANNUAL allocated/remaining for all users for this year (HR list view)."""
+    """Recompute ANNUAL allocated/remaining for every user with a row this year (overwrites imports). HR-only action."""
     raw = (os.getenv("HR_SUITE_ANNUAL_LEAVE_DAYS") or "").strip()
     now = _now_iso()
     if raw:
@@ -4595,6 +5621,73 @@ def _refresh_all_annual_leave_balances_for_year(year: int) -> None:
             )
 
 
+def _rollover_leave_balances_for_year(year: int) -> None:
+    """
+    Year-start allocation policy:
+    - base entitlement for the target year (leave type defaults; ANNUAL uses statutory/env override)
+    - plus carry-over from previous year's remaining days for the same user/type.
+    Existing used_days in target year are preserved; remaining is recalculated from new allocation.
+    """
+    prev_year = int(year) - 1
+    now = _now_iso()
+    annual_override = None
+    raw = (os.getenv("HR_SUITE_ANNUAL_LEAVE_DAYS") or "").strip()
+    if raw:
+        try:
+            annual_override = float(raw)
+        except ValueError:
+            annual_override = None
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE is_active = 1")
+        user_ids = [str(r[0]) for r in c.fetchall()]
+        c.execute("SELECT id, code, default_days FROM leave_types WHERE is_active = 1")
+        leave_types = [(str(r[0]), (r[1] or "").strip().upper(), float(r[2] or 0)) for r in c.fetchall()]
+    for uid in user_ids:
+        for lt_id, code, default_days in leave_types:
+            base_alloc = default_days
+            if code == "ANNUAL":
+                base_alloc = annual_override if annual_override is not None else _annual_entitlement_days(uid)
+            with cursor() as c:
+                c.execute(
+                    """
+                    SELECT COALESCE(remaining_days, COALESCE(allocated_days, 0) - COALESCE(used_days, 0))
+                    FROM leave_balances
+                    WHERE user_id = ? AND leave_type_id = ? AND year = ?
+                    LIMIT 1
+                    """,
+                    (uid, lt_id, prev_year),
+                )
+                prev = c.fetchone()
+                c.execute(
+                    """
+                    SELECT id, COALESCE(used_days, 0) FROM leave_balances
+                    WHERE user_id = ? AND leave_type_id = ? AND year = ?
+                    LIMIT 1
+                    """,
+                    (uid, lt_id, year),
+                )
+                cur_row = c.fetchone()
+            carry = max(float(prev[0] or 0), 0.0) if prev else 0.0
+            new_alloc = max(base_alloc + carry, 0.0)
+            if cur_row:
+                bid, used_days = str(cur_row[0]), float(cur_row[1] or 0)
+                new_remaining = max(new_alloc - used_days, 0.0)
+                with cursor() as c:
+                    c.execute(
+                        "UPDATE leave_balances SET allocated_days = ?, remaining_days = ?, updated_at = ? WHERE id = ?",
+                        (new_alloc, new_remaining, now, bid),
+                    )
+                continue
+            with cursor() as c:
+                c.execute(
+                    """
+                    INSERT INTO leave_balances (id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    """,
+                    (new_id(), uid, lt_id, year, new_alloc, new_alloc, now, now),
+                )
+
+
 def _calculate_leave_days(start_date: str, end_date: str) -> float:
     sd = _parse_yyyy_mm_dd(start_date)
     ed = _parse_yyyy_mm_dd(end_date)
@@ -4614,9 +5707,17 @@ def _leave_log(leave_request_id: str, action: str, from_user_id: str | None, fro
         )
 
 
+def _audit_log(action: str, resource: str, actor_user_id: str | None, resource_id: str | None = None, details: dict | None = None) -> None:
+    details_str = json.dumps(details) if details else None
+    with cursor() as c:
+        c.execute(
+            "INSERT INTO audit_logs (id, user_id, action, resource, resource_id, details) VALUES (?, ?, ?, ?, ?, ?)",
+            (new_id(), actor_user_id, action, resource, resource_id, details_str),
+        )
+
+
 def _sync_leave_balance_for_approved(req_row: dict):
     year = int((req_row.get("start_date") or "")[:4] or datetime.utcnow().year)
-    _refresh_annual_balance_allocation(req_row["user_id"], year)
     with cursor() as c:
         c.execute(
             """
@@ -4658,6 +5759,185 @@ def _sync_leave_balance_for_approved(req_row: dict):
         )
 
 
+def _apply_leave_balance_delta(user_id: str, leave_type_id: str, year: int, delta_days: float) -> None:
+    """Adjust used/remaining days by a signed delta (positive adds used, negative reverses used)."""
+    d = float(delta_days or 0)
+    if abs(d) < 1e-9:
+        return
+    with cursor() as c:
+        c.execute("SELECT id, default_days, code FROM leave_types WHERE id = ?", (leave_type_id,))
+        lt = c.fetchone()
+    default_days = float(lt[1]) if lt else 0.0
+    if lt and (lt[2] or "").strip().upper() == "ANNUAL":
+        default_days = _annual_entitlement_days(user_id)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, allocated_days, used_days FROM leave_balances
+            WHERE user_id = ? AND leave_type_id = ? AND year = ?
+            """,
+            (user_id, leave_type_id, year),
+        )
+        bal = c.fetchone()
+    if not bal:
+        used_days = max(d, 0.0)
+        with cursor() as c:
+            c.execute(
+                """
+                INSERT INTO leave_balances (id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (new_id(), user_id, leave_type_id, year, default_days, used_days, max(default_days - used_days, 0), _now_iso(), _now_iso()),
+            )
+        return
+    allocated = float(bal[1] or 0)
+    used_days = max(float(bal[2] or 0) + d, 0.0)
+    with cursor() as c:
+        c.execute(
+            "UPDATE leave_balances SET used_days = ?, remaining_days = ?, updated_at = ? WHERE id = ?",
+            (used_days, max(allocated - used_days, 0), _now_iso(), bal[0]),
+        )
+
+
+def _norm_uid_compare(a: str | None, b: str | None) -> bool:
+    return (str(a or "").strip().lower()) == (str(b or "").strip().lower())
+
+
+def _repoint_workflows_after_staff_manager_change(employee_id: str, old_manager_id: str | None, actor_user_id: str) -> None:
+    """
+    When an employee's direct supervisor changes, in-flight items that were waiting on the *previous*
+    direct supervisor should wait on the new first approver (or auto-complete when no supervisor remains).
+    """
+    old_mid = (old_manager_id or "").strip()
+    if not old_mid:
+        return
+    eid = (employee_id or "").strip()
+    if not eid:
+        return
+    now = _now_iso()
+    actor_role = (_get_user_profile_min(actor_user_id) or {}).get("role") or "hr"
+    pending_leave = ("submitted", "pending_manager", "pending_hod", "pending_hr")
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT id FROM leave_requests
+            WHERE user_id = ?
+              AND status IN ({",".join("?" * len(pending_leave))})
+              AND LOWER(TRIM(COALESCE(current_approver_id, ''))) = LOWER(?)
+            """,
+            (eid, *pending_leave, old_mid),
+        )
+        leave_ids = [str(r[0]) for r in c.fetchall()]
+    new_leave_first = _first_leave_approver(eid)
+    for rid in leave_ids:
+        if new_leave_first:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE leave_requests SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                    (new_leave_first, now, rid),
+                )
+            _leave_log(rid, "supervisor_reassigned", actor_user_id, actor_role, new_leave_first, "supervisor", None)
+            try:
+                _notify_leave_approver(
+                    rid,
+                    new_leave_first,
+                    "You are the current approver: a team member's supervisor was updated and this leave request was reassigned to you.",
+                )
+                _notify_leave_approver_inbox(rid, new_leave_first)
+            except Exception as ex:
+                logger.warning("Leave reassignment notify failed: %s", ex)
+        else:
+            with cursor() as c:
+                c.execute(
+                    """
+                    UPDATE leave_requests
+                    SET status = 'approved', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (actor_user_id, now, now, rid),
+                )
+            _leave_log(rid, "auto_approved_supervisor_removed", actor_user_id, actor_role, None, None, None)
+            with cursor() as c:
+                c.execute("SELECT * FROM leave_requests WHERE id = ?", (rid,))
+                approved = row_to_dict(c.fetchone())
+            if approved:
+                _sync_leave_balance_for_approved(approved)
+            try:
+                _notify_leave_employee(
+                    rid,
+                    "Your leave request was approved (no active supervisor on file after an org update).",
+                    "",
+                )
+                _notify_leave_hr_info(
+                    "[Leave] Approved after supervisor change",
+                    rid,
+                    "A pending leave request was auto-approved because the employee has no active supervisor after HR/Admin updated reporting lines.",
+                )
+            except Exception as ex:
+                logger.warning("Leave auto-approve after supervisor change notify failed: %s", ex)
+
+    new_chain = _get_staff_manager_id(eid)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id FROM kpis
+            WHERE user_id = ? AND status = 'pending_supervisor'
+              AND LOWER(TRIM(COALESCE(current_approver_id, ''))) = LOWER(?)
+            """,
+            (eid, old_mid),
+        )
+        kpi_ids = [str(r[0]) for r in c.fetchall()]
+    for kid in kpi_ids:
+        if new_chain:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE kpis SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                    (new_chain, now, kid),
+                )
+            _appraisal_log("kpi", kid, "supervisor_reassigned", actor_user_id, actor_role, "supervisor")
+            try:
+                _notify_manager_appraisal_submitted(new_chain, eid, "KPI")
+            except Exception as ex:
+                logger.warning("KPI reassignment notify failed: %s", ex)
+        else:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE kpis SET status = 'verified', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                    (now, kid),
+                )
+            _appraisal_log("kpi", kid, "supervisor_removed_auto_verified", actor_user_id, actor_role, None)
+
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id FROM appraisals
+            WHERE user_id = ? AND status = 'pending_supervisor'
+              AND LOWER(TRIM(COALESCE(current_approver_id, ''))) = LOWER(?)
+            """,
+            (eid, old_mid),
+        )
+        appr_ids = [str(r[0]) for r in c.fetchall()]
+    for aid in appr_ids:
+        if new_chain:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE appraisals SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                    (new_chain, now, aid),
+                )
+            _appraisal_log("appraisal", aid, "supervisor_reassigned", actor_user_id, actor_role, "supervisor")
+            try:
+                _notify_manager_appraisal_submitted(new_chain, eid, "Appraisal")
+            except Exception as ex:
+                logger.warning("Appraisal reassignment notify failed: %s", ex)
+        else:
+            with cursor() as c:
+                c.execute(
+                    "UPDATE appraisals SET status = 'verified', current_approver_id = NULL, updated_at = ? WHERE id = ?",
+                    (now, aid),
+                )
+            _appraisal_log("appraisal", aid, "supervisor_removed_auto_verified", actor_user_id, actor_role, None)
+
+
 def _setting_str(key: str) -> str:
     with cursor() as c:
         c.execute("SELECT value FROM settings WHERE key = ?", (key,))
@@ -4685,26 +5965,38 @@ def _setting_bool(key: str) -> bool:
 
 
 def _leave_emails_enabled() -> bool:
+    # Settings are the primary source so Admin Settings changes apply immediately.
+    # Env remains a fallback for first-time boot or unmanaged deployments.
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("leave_email_enabled",))
+        row = c.fetchone()
+    if row and row[0] is not None and str(row[0]).strip() != "":
+        v = str(row[0]).strip().lower().strip('"')
+        return v in ("1", "true", "yes", "on")
     env = (os.environ.get("LEAVE_EMAIL_ENABLED") or "").strip().lower()
-    if env in ("1", "true", "yes"):
+    if env in ("1", "true", "yes", "on"):
         return True
-    if env in ("0", "false", "no"):
+    if env in ("0", "false", "no", "off"):
         return False
-    return _setting_bool("leave_email_enabled")
+    cfg = _get_smtp_config()
+    return bool((cfg.get("host") or "").strip() and (cfg.get("from") or "").strip())
 
 
 def _get_smtp_config() -> dict:
-    host = (os.environ.get("SMTP_HOST") or _setting_str("smtp_host")).strip()
+    # Settings first so values saved from Admin Settings are effective immediately.
+    host = (_setting_str("smtp_host") or os.environ.get("SMTP_HOST") or "").strip()
     try:
-        port = int(os.environ.get("SMTP_PORT") or _setting_str("smtp_port") or "587")
+        port = int(_setting_str("smtp_port") or os.environ.get("SMTP_PORT") or "587")
     except ValueError:
         port = 587
-    user = (os.environ.get("SMTP_USER") or _setting_str("smtp_user")).strip()
-    password = os.environ.get("SMTP_PASSWORD") or _setting_str("smtp_password")
-    from_addr = (os.environ.get("SMTP_FROM") or _setting_str("smtp_from")).strip()
-    use_tls = _setting_bool("smtp_use_tls")
-    if (os.environ.get("SMTP_USE_TLS") or "").lower() in ("0", "false", "no"):
-        use_tls = False
+    user = (_setting_str("smtp_user") or os.environ.get("SMTP_USER") or "").strip()
+    password = _setting_str("smtp_password") or os.environ.get("SMTP_PASSWORD")
+    from_addr = (_setting_str("smtp_from") or os.environ.get("SMTP_FROM") or "").strip()
+    if _setting_str("smtp_use_tls") != "":
+        use_tls = _setting_bool("smtp_use_tls")
+    else:
+        env_tls = (os.environ.get("SMTP_USE_TLS") or "").strip().lower()
+        use_tls = env_tls in ("1", "true", "yes", "on")
     return {"host": host, "port": port, "user": user, "password": password, "from": from_addr, "use_tls": use_tls}
 
 
@@ -4799,8 +6091,13 @@ def _notify_leave_approver(req_id: str, approver_id: str | None, intro: str):
     to = _user_email(approver_id)
     if not to:
         return
-    lines = [intro, ""] + _leave_email_body(d)
-    _send_leave_email([to], f"[Leave] Action required - {d.get('employee_name')}", "\n".join(lines))
+    emp = (d.get("employee_name") or "Employee").strip() or "Employee"
+    leave_type = (d.get("leave_type_name") or "Leave").strip() or "Leave"
+    days = float(d.get("days_requested") or 0)
+    day_label = "day" if abs(days - 1.0) < 1e-9 else "days"
+    lead = f"{emp} requested {leave_type} for {days:g} {day_label}. Login to approve."
+    lines = [lead, "", intro, ""] + _leave_email_body(d)
+    _send_leave_email([to], f"[Leave] Approval needed - {emp} ({leave_type}, {days:g} {day_label})", "\n".join(lines))
 
 
 def _notify_leave_employee(req_id: str, title: str, extra: str = ""):
@@ -4857,6 +6154,46 @@ def _send_app_email(to_addrs: list[str], subject: str, body: str) -> None:
         logger.warning("App email failed (%s): %s", subject, e)
 
 
+def _notification_emails_enabled() -> bool:
+    """Feature flag for mirroring in-app notifications to user email.
+
+    Priority:
+    1) `NOTIFICATION_EMAIL_ENABLED` env (explicit override)
+    2) `notification_email_enabled` setting (explicit override)
+    3) fallback to leave email toggle so admins enabling SMTP for leave also get bell-email mirroring
+    """
+    env = (os.environ.get("NOTIFICATION_EMAIL_ENABLED") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("notification_email_enabled",))
+        row = c.fetchone()
+    if row and row[0] is not None and str(row[0]).strip() != "":
+        v = str(row[0]).strip().lower().strip('"')
+        return v in ("1", "true", "yes", "on")
+    return _leave_emails_enabled()
+
+
+def _notification_link_url(link: str | None) -> str | None:
+    lk = (link or "").strip()
+    if not lk:
+        return None
+    if lk.startswith("http://") or lk.startswith("https://"):
+        return lk
+    base = (
+        os.environ.get("APP_WEB_URL")
+        or os.environ.get("FRONTEND_BASE_URL")
+        or _setting_str("app_web_url")
+    ).strip().rstrip("/")
+    if not base:
+        return lk
+    if not lk.startswith("/"):
+        lk = f"/{lk}"
+    return f"{base}{lk}"
+
+
 def _insert_notification(recipient_id: str, kind: str, title: str, body: str | None, link: str | None):
     rid = (recipient_id or "").strip()
     if not rid:
@@ -4868,6 +6205,20 @@ def _insert_notification(recipient_id: str, kind: str, title: str, body: str | N
             "INSERT INTO notifications (id, user_id, kind, title, body, link, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (nid, rid, (kind or "notice")[:80], (title or "Notice")[:500], body, lk, _now_iso()),
         )
+    if _notification_emails_enabled():
+        try:
+            to = _user_email(rid)
+            if to:
+                parts = [(title or "Notification").strip()]
+                b = (body or "").strip()
+                if b:
+                    parts.extend(["", b])
+                full_link = _notification_link_url(lk)
+                if full_link:
+                    parts.extend(["", f"Open in HR Suite: {full_link}"])
+                _send_app_email([to], f"[HR Suite] {(title or 'Notification').strip()}", "\n".join(parts))
+        except Exception as ex:
+            logger.warning("Notification email mirror failed (%s): %s", rid, ex)
 
 
 def _employee_display_name(uid: str) -> str:
@@ -4880,8 +6231,41 @@ def _notify_leave_approver_inbox(req_id: str, approver_id: str | None):
         return
     d = _leave_request_email_detail(req_id)
     emp = (d or {}).get("employee_name") or _employee_display_name((d or {}).get("user_id") or "")
-    sub = f"{(d or {}).get('leave_type_name') or 'Leave'} · {(d or {}).get('start_date')} → {(d or {}).get('end_date')}"
-    _insert_notification(approver_id, "leave_pending", f"Leave to approve: {emp}", sub, "/hr/leave")
+    leave_type = (d or {}).get("leave_type_name") or "Leave"
+    days = float((d or {}).get("days_requested") or 0)
+    day_label = "day" if abs(days - 1.0) < 1e-9 else "days"
+    title = f"{emp} requested {leave_type} for {days:g} {day_label}"
+    sub = f"Dates: {(d or {}).get('start_date')} → {(d or {}).get('end_date')}. Login to approve."
+    _insert_notification(approver_id, "leave_pending", title, sub, "/hr/leave")
+
+
+def _notify_leave_employee_inbox(req_id: str, title: str, body: str | None = None):
+    d = _leave_request_email_detail(req_id)
+    if not d:
+        return
+    uid = (d.get("user_id") or "").strip()
+    if not uid:
+        return
+    leave_type = (d.get("leave_type_name") or "Leave").strip() or "Leave"
+    days = float(d.get("days_requested") or 0)
+    day_label = "day" if abs(days - 1.0) < 1e-9 else "days"
+    full_title = f"{title}: {leave_type} ({days:g} {day_label})"
+    _insert_notification(uid, "leave_update", full_title, (body or "").strip() or None, "/employee/leave")
+
+
+def _notify_leave_hr_inbox(req_id: str, title: str, body: str | None = None):
+    d = _leave_request_email_detail(req_id)
+    if not d:
+        return
+    with cursor() as c:
+        c.execute("SELECT id FROM users WHERE is_active = 1 AND role IN ('hr','admin')")
+        recipients = [str(r[0]) for r in c.fetchall()]
+    seen = set()
+    for rid in recipients:
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        _insert_notification(rid, "leave_notice", title, (body or "").strip() or None, "/hr/leave")
 
 
 def _notify_hr_admins_staff_certificate(staff_user_id: str, doc_title: str):
@@ -4909,10 +6293,47 @@ def _notify_manager_appraisal_submitted(manager_id: str | None, staff_id: str, w
         _send_app_email([to], "[HR Suite] " + title, body + "\n\nOpen Appraisal (manager) in the HR Suite to continue.")
 
 
+def _employee_leave_balance_display_year(uid: str, calendar_year: int | None = None) -> int:
+    """
+    Which `leave_balances.year` to show employees on Leave / dashboard.
+
+    Orange imports often land on the entitlement policy year (e.g. 2025) while the clock shows 2026.
+    Startup then backfills 2026 rows with statutory ANNUAL (~18), which would hide a 28.5 import on 2025.
+    If the current year's ANNUAL row still matches the statutory template and an older year in-window
+    has a higher ANNUAL allocation, use that older year. If there is no row for the current year, use
+    the year with the highest ANNUAL allocation in the window.
+    """
+    cy = calendar_year or datetime.utcnow().year
+    stat = _annual_entitlement_days(uid)
+    lo = cy - 5
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT lb.year, MAX(lb.allocated_days) AS mx
+            FROM leave_balances lb
+            JOIN leave_types lt ON lt.id = lb.leave_type_id AND UPPER(TRIM(lt.code)) = 'ANNUAL'
+            WHERE lb.user_id = ? AND lb.year BETWEEN ? AND ?
+            GROUP BY lb.year
+            """,
+            (uid, lo, cy),
+        )
+        per_year = {int(r[0]): float(r[1] or 0) for r in c.fetchall()}
+    if not per_year:
+        return cy
+    cy_a = float(per_year.get(cy, -1.0))
+    if cy not in per_year:
+        return max(per_year.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    best_y, best_a = max(per_year.items(), key=lambda kv: (kv[1], kv[0]))
+    # Allow small drift (e.g. 18.5 vs statutory 18) to still treat current year as "template" vs a richer import year.
+    if best_y < cy and best_a > cy_a + 0.01 and abs(cy_a - stat) < 0.26:
+        return best_y
+    return cy
+
+
 def _ensure_leave_balance_rows_for_user(uid: str, year: int) -> None:
     """
-    Create leave_balances rows from leave_types defaults when missing for this user/year.
-    Without rows, the UI falls back to lt.default_days for everyone (same numbers for all staff).
+    Create missing leave_balances rows for this user/year (defaults / statutory for new ANNUAL rows only).
+    Existing rows — including OrangeHRM imports — are not changed here.
     """
     if not (uid or "").strip():
         return
@@ -4947,11 +6368,10 @@ def _ensure_leave_balance_rows_for_user(uid: str, year: int) -> None:
                 """,
                 (bid, uid, lt_id, year, alloc, alloc, _now_iso(), _now_iso()),
             )
-    _refresh_annual_balance_allocation(uid, year)
 
 
 def _leave_balances_for_user(uid: str, year: int) -> list[dict]:
-    _refresh_annual_balance_allocation(uid, year)
+    """Return saved leave_balances from the DB (no statutory overwrite on read)."""
     with cursor() as c:
         c.execute(
             """
@@ -4974,6 +6394,20 @@ class LeaveRequestCreate(BaseModel):
     start_date: str
     end_date: str
     reason: str | None = None
+
+
+class LeaveRequestUpdate(BaseModel):
+    leave_type_id: str
+    start_date: str
+    end_date: str
+    reason: str | None = None
+
+
+class LeaveRescheduleBody(BaseModel):
+    start_date: str
+    end_date: str
+    reason: str | None = None
+    leave_type_id: str | None = None
 
 
 class LeaveAssignBody(BaseModel):
@@ -5005,15 +6439,57 @@ def _assert_can_assign_leave_for_staff(actor: dict, staff_id: str):
         if (row[1] or "").strip() != aid:
             raise HTTPException(status_code=403, detail="You can only assign leave to your direct reports")
         return
-    # hod: same department as the HOD (trimmed, case-insensitive)
-    dept_staff = (row[2] or "").strip().lower()
-    dept_hod = ((actor or {}).get("department") or "").strip().lower()
-    if not dept_hod or dept_staff != dept_hod:
-        raise HTTPException(status_code=403, detail="You can only assign leave to staff in your department")
+    # hod: same rule as managers — direct reports only (manager_id), not whole department
+    if role == "hod":
+        if (row[1] or "").strip() != aid:
+            raise HTTPException(status_code=403, detail="You can only assign leave to your direct reports")
+        return
 
 
 class LeaveActionBody(BaseModel):
     comment: str | None = None
+
+
+class LeaveBalanceAdjustmentCreate(BaseModel):
+    target_user_id: str
+    leave_type_id: str
+    year: int
+    allocated_days: float
+    reason: str | None = None
+
+
+class LeaveTypeAssignCreate(BaseModel):
+    target_user_id: str
+    leave_type_id: str
+    year: int
+    allocated_days: float | None = None
+    reason: str | None = None
+
+
+class LeaveBalanceAdjustmentAction(BaseModel):
+    comment: str | None = None
+
+
+def _leave_balance_adjustment_row(adjustment_id: str) -> dict | None:
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT a.*,
+                   u.full_name AS target_user_name, u.email AS target_user_email, u.department AS target_user_department,
+                   lt.name AS leave_type_name, lt.code AS leave_type_code,
+                   rq.full_name AS requested_by_name, ap.full_name AS approved_by_name,
+                   ca.full_name AS current_approver_name
+            FROM leave_balance_adjustments a
+            JOIN users u ON u.id = a.target_user_id
+            JOIN leave_types lt ON lt.id = a.leave_type_id
+            JOIN users rq ON rq.id = a.requested_by_user_id
+            LEFT JOIN users ap ON ap.id = a.approved_by_user_id
+            LEFT JOIN users ca ON ca.id = a.current_approver_id
+            WHERE a.id = ?
+            """,
+            (adjustment_id,),
+        )
+        return row_to_dict(c.fetchone())
 
 
 @app.get("/leave/types")
@@ -5024,7 +6500,7 @@ def list_leave_types(_: str = Depends(get_current_user_id)):
 
 
 class LeaveTypeCreate(BaseModel):
-    """Admin-only: add a new leave type (code must be unique, letters/numbers/underscore)."""
+    """HR/Admin: add a new leave type (code must be unique, letters/numbers/underscore)."""
 
     code: str
     name: str
@@ -5033,7 +6509,7 @@ class LeaveTypeCreate(BaseModel):
 
 @app.post("/leave/types")
 def create_leave_type(body: LeaveTypeCreate, user_id: str = Depends(get_current_user_id)):
-    _require_roles(user_id, ("admin",))
+    _require_roles(user_id, ("admin", "hr"))
     raw_code = (body.code or "").strip().upper().replace(" ", "_").replace("-", "_")
     raw_code = "".join(ch for ch in raw_code if ch.isalnum() or ch == "_")
     if not raw_code or len(raw_code) > 40:
@@ -5062,6 +6538,32 @@ def create_leave_type(body: LeaveTypeCreate, user_id: str = Depends(get_current_
         )
         c.execute("SELECT * FROM leave_types WHERE id = ?", (lid,))
         return row_to_dict(c.fetchone())
+
+
+@app.delete("/leave/types/{leave_type_id}")
+def delete_leave_type(leave_type_id: str, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin",))
+    with cursor() as c:
+        c.execute("SELECT id, code, name FROM leave_types WHERE id = ? AND is_active = 1", (leave_type_id,))
+        row = c.fetchone()
+    lt = row_to_dict(row)
+    if not lt:
+        raise HTTPException(status_code=404, detail="Leave type not found")
+    with cursor() as c:
+        c.execute(
+            "SELECT COUNT(*) FROM leave_requests WHERE leave_type_id = ? AND status IN ('submitted','pending_manager','pending_hod','pending_hr')",
+            (leave_type_id,),
+        )
+        pending = int((c.fetchone() or [0])[0] or 0)
+    if pending:
+        raise HTTPException(status_code=400, detail="Cannot delete leave type with pending requests")
+    with cursor() as c:
+        c.execute(
+            "UPDATE leave_types SET is_active = 0, updated_at = ? WHERE id = ?",
+            (_now_iso(), leave_type_id),
+        )
+    _audit_log("leave_type_deleted", "leave_types", user_id, leave_type_id, {"code": lt.get("code"), "name": lt.get("name")})
+    return {"ok": True, "id": leave_type_id}
 
 
 @app.get("/leave/my-requests")
@@ -5103,6 +6605,63 @@ def create_leave_request(req: LeaveRequestCreate, user_id: str = Depends(get_cur
     _leave_log(rid, "created", user_id, current.get("role"), None, None, req.reason)
     with cursor() as c:
         c.execute("SELECT * FROM leave_requests WHERE id = ?", (rid,))
+        return row_to_dict(c.fetchone())
+
+
+@app.patch("/leave/requests/{leave_request_id}")
+def update_leave_request(leave_request_id: str, body: LeaveRequestUpdate, user_id: str = Depends(get_current_user_id)):
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    role = (current.get("role") or "").strip().lower()
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    is_owner = _norm_uid_compare(req.get("user_id"), user_id)
+    is_hr_admin = role in ("hr", "admin")
+    if not is_owner and not is_hr_admin:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not is_hr_admin and req.get("status") not in ("draft", "returned"):
+        raise HTTPException(status_code=400, detail="Only draft or returned requests can be edited")
+    if req.get("status") in ("cancelled", "rejected"):
+        raise HTTPException(status_code=400, detail="Cancelled or rejected requests cannot be edited")
+    days_requested = _calculate_leave_days(body.start_date, body.end_date)
+    with cursor() as c:
+        c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (body.leave_type_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=400, detail="Invalid leave type")
+    old_leave_type_id = req.get("leave_type_id")
+    old_start = str(req.get("start_date") or "")
+    old_days = float(req.get("days_requested") or 0)
+    old_year = int(old_start[:4] or datetime.utcnow().year)
+    old_status = (req.get("status") or "").strip().lower()
+    new_year = int((body.start_date or "")[:4] or datetime.utcnow().year)
+    with cursor() as c:
+        c.execute(
+            """
+            UPDATE leave_requests
+            SET leave_type_id = ?, start_date = ?, end_date = ?, days_requested = ?, reason = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                body.leave_type_id,
+                body.start_date,
+                body.end_date,
+                days_requested,
+                (body.reason or "").strip() or None,
+                _now_iso(),
+                leave_request_id,
+            ),
+        )
+    if old_status == "approved":
+        _apply_leave_balance_delta(req.get("user_id"), old_leave_type_id, old_year, -old_days)
+        _apply_leave_balance_delta(req.get("user_id"), body.leave_type_id, new_year, float(days_requested))
+    _leave_log(leave_request_id, "edited", user_id, role or None, None, None, body.reason)
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
         return row_to_dict(c.fetchone())
 
 
@@ -5206,11 +6765,13 @@ def submit_leave_request(leave_request_id: str, user_id: str = Depends(get_curre
             approved = row_to_dict(c.fetchone())
         _sync_leave_balance_for_approved(approved)
         _notify_leave_employee(leave_request_id, "Your leave request was approved (no supervisor assigned in your profile).", "")
+        _notify_leave_employee_inbox(leave_request_id, "Leave approved", "Your leave request was approved (no supervisor assigned).")
         _notify_leave_hr_info(
             "[Leave] Approved (auto)",
             leave_request_id,
             "A leave request was auto-approved (no active supervisor on file - set Manager / report-to in People).",
         )
+        _notify_leave_hr_inbox(leave_request_id, "Leave approved (auto)", "No active supervisor was assigned, so the request auto-approved.")
         return approved
     approver_profile = _get_user_profile_min(approver_id)
     approver_role = (approver_profile or {}).get("role") or "supervisor"
@@ -5256,6 +6817,114 @@ def cancel_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: 
         return row_to_dict(c.fetchone())
 
 
+@app.post("/leave/requests/{leave_request_id}/reschedule")
+def reschedule_approved_leave_request(
+    leave_request_id: str,
+    body: LeaveRescheduleBody,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Owner (or HR/Admin) asks to move an already-approved leave to new dates; resubmits into supervisor approval."""
+    current = _get_user_profile_min(user_id)
+    if not current:
+        raise HTTPException(status_code=401, detail="User not found")
+    role = (current.get("role") or "").strip().lower()
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    is_owner = _norm_uid_compare(req.get("user_id"), user_id)
+    if not is_owner and role not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if (req.get("status") or "").strip().lower() != "approved":
+        raise HTTPException(status_code=400, detail="Only approved leave can be rescheduled")
+
+    next_leave_type_id = (body.leave_type_id or req.get("leave_type_id") or "").strip()
+    if not next_leave_type_id:
+        raise HTTPException(status_code=400, detail="leave_type_id is required")
+    with cursor() as c:
+        c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (next_leave_type_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=400, detail="Invalid leave type")
+    new_days = _calculate_leave_days(body.start_date, body.end_date)
+    old_leave_type_id = req.get("leave_type_id")
+    old_year = int(str(req.get("start_date") or "")[:4] or datetime.utcnow().year)
+    old_days = float(req.get("days_requested") or 0)
+    new_year = int(str(body.start_date or "")[:4] or datetime.utcnow().year)
+
+    # Remove the already-approved balance impact before we re-submit.
+    _apply_leave_balance_delta(req.get("user_id"), old_leave_type_id, old_year, -old_days)
+
+    approver_id = _first_leave_approver(req.get("user_id") or "")
+    now = _now_iso()
+    if approver_id:
+        with cursor() as c:
+            c.execute(
+                """
+                UPDATE leave_requests
+                SET leave_type_id = ?, start_date = ?, end_date = ?, days_requested = ?, reason = ?,
+                    status = 'pending_manager', current_approver_id = ?, final_decision_by = NULL, final_decision_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_leave_type_id,
+                    body.start_date,
+                    body.end_date,
+                    new_days,
+                    (body.reason or "").strip() or req.get("reason"),
+                    approver_id,
+                    now,
+                    leave_request_id,
+                ),
+            )
+        _leave_log(leave_request_id, "reschedule_submitted", user_id, role or None, approver_id, "supervisor", body.reason)
+        _notify_leave_approver(
+            leave_request_id,
+            approver_id,
+            "A staff member rescheduled an already-approved leave request. Sign in to review and approve the new dates.",
+        )
+        _notify_leave_approver_inbox(leave_request_id, approver_id)
+        _notify_leave_employee_inbox(
+            leave_request_id,
+            "Reschedule submitted",
+            "Your approved leave was changed and submitted again for supervisor approval.",
+        )
+    else:
+        with cursor() as c:
+            c.execute(
+                """
+                UPDATE leave_requests
+                SET leave_type_id = ?, start_date = ?, end_date = ?, days_requested = ?, reason = ?,
+                    status = 'approved', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_leave_type_id,
+                    body.start_date,
+                    body.end_date,
+                    new_days,
+                    (body.reason or "").strip() or req.get("reason"),
+                    user_id,
+                    now,
+                    now,
+                    leave_request_id,
+                ),
+            )
+        _apply_leave_balance_delta(req.get("user_id"), next_leave_type_id, new_year, new_days)
+        _leave_log(leave_request_id, "reschedule_auto_approved_no_approver", user_id, role or None, None, None, body.reason)
+        _notify_leave_employee(leave_request_id, "Your leave reschedule was approved (no supervisor assigned).", "")
+        _notify_leave_employee_inbox(leave_request_id, "Reschedule approved", "No supervisor is assigned, so the reschedule was auto-approved.")
+        _notify_leave_hr_info(
+            "[Leave] Reschedule approved (auto)",
+            leave_request_id,
+            "A rescheduled leave request was auto-approved because no active supervisor is assigned.",
+        )
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        return row_to_dict(c.fetchone())
+
+
 @app.get("/leave/pending")
 def get_pending_leave_requests(user_id: str = Depends(get_current_user_id)):
     """Supervisor chain (OrangeHRM-style): inbox is only requests where you are the current approver."""
@@ -5293,54 +6962,44 @@ def _act_on_leave(leave_request_id: str, user_id: str, action: str, body: LeaveA
     req = row_to_dict(row)
     if not req:
         raise HTTPException(status_code=404, detail="Leave request not found")
-    if req.get("current_approver_id") != user_id and current.get("role") != "admin":
+    if req.get("current_approver_id") != user_id:
         raise HTTPException(status_code=403, detail="You are not the current approver")
+    if not _is_user_in_requester_supervisor_chain(req.get("user_id") or "", user_id):
+        raise HTTPException(status_code=403, detail="Only supervisors in the employee's reporting line can approve or reject")
     if req.get("status") not in ("pending_manager", "pending_hod", "pending_hr"):
         raise HTTPException(status_code=400, detail="Leave request is not pending approval")
     comment = (body.comment or "").strip()
     if action in ("reject", "return") and not comment:
         raise HTTPException(status_code=400, detail="Comment is required for this action")
     if action == "approve":
-        next_user_id = _next_leave_approver_after_step(user_id, req["user_id"])
-        if not next_user_id:
-            with cursor() as c:
-                c.execute(
-                    """
-                    UPDATE leave_requests
-                    SET status = 'approved', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (user_id, _now_iso(), _now_iso(), leave_request_id),
-                )
-            _leave_log(leave_request_id, "approved", user_id, current.get("role"), None, None, comment or None)
-            with cursor() as c:
-                c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
-                approved = row_to_dict(c.fetchone())
-            _sync_leave_balance_for_approved(approved)
-            extra = f"Approver note: {comment}" if comment else ""
-            _notify_leave_employee(leave_request_id, "Your leave request was fully approved.", extra)
-            _notify_leave_hr_info("[Leave] Final approval", leave_request_id, "A leave request was fully approved in the supervisor chain.")
-            return approved
-        nxt_profile = _get_user_profile_min(next_user_id)
-        next_role = (nxt_profile or {}).get("role") or "supervisor"
         with cursor() as c:
             c.execute(
-                "UPDATE leave_requests SET status = 'pending_manager', current_approver_id = ?, updated_at = ? WHERE id = ?",
-                (next_user_id, _now_iso(), leave_request_id),
+                """
+                UPDATE leave_requests
+                SET status = 'approved', current_approver_id = NULL, final_decision_by = ?, final_decision_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (user_id, _now_iso(), _now_iso(), leave_request_id),
             )
-        _leave_log(leave_request_id, "approved_step", user_id, current.get("role"), next_user_id, next_role, comment or None)
-        _notify_leave_approver(
-            leave_request_id,
-            next_user_id,
-            "You are the next approver in the supervisor chain: a leave request was forwarded to you after the previous approval.",
-        )
-        _notify_leave_approver_inbox(leave_request_id, next_user_id)
-        actor_nm = (current.get("full_name") or current.get("email") or "Approver").strip()
+        _leave_log(leave_request_id, "approved", user_id, current.get("role"), None, None, comment or None)
+        with cursor() as c:
+            c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+            approved = row_to_dict(c.fetchone())
+        _sync_leave_balance_for_approved(approved)
+        extra = f"Approver note: {comment}" if comment else ""
+        _notify_leave_employee(leave_request_id, "Your leave request was approved by your supervisor.", extra)
+        _notify_leave_employee_inbox(leave_request_id, "Leave approved", extra or "Your leave request was approved by your supervisor.")
         _notify_leave_hr_info(
-            "[Leave] Approval step (forwarded)",
+            "[Leave] Supervisor approval",
             leave_request_id,
-            f"{actor_nm} approved one step; the request was forwarded to the next approver in the reporting chain.",
+            "A leave request was approved by the assigned supervisor.",
         )
+        _notify_leave_hr_inbox(
+            leave_request_id,
+            "Leave approved by supervisor",
+            "A leave request was approved by the assigned supervisor.",
+        )
+        return approved
     elif action == "reject":
         with cursor() as c:
             c.execute(
@@ -5354,6 +7013,8 @@ def _act_on_leave(leave_request_id: str, user_id: str, action: str, body: LeaveA
         _leave_log(leave_request_id, "rejected", user_id, current.get("role"), req.get("user_id"), "employee", comment)
         _notify_leave_employee(leave_request_id, "Your leave request was rejected.", f"Comment: {comment}")
         _notify_leave_hr_info("[Leave] Rejected", leave_request_id, f"Rejected by workflow. Comment: {comment}")
+        _notify_leave_employee_inbox(leave_request_id, "Leave rejected", f"Comment: {comment}")
+        _notify_leave_hr_inbox(leave_request_id, "Leave rejected", f"Rejected by workflow. Comment: {comment}")
     elif action == "return":
         with cursor() as c:
             c.execute(
@@ -5362,6 +7023,9 @@ def _act_on_leave(leave_request_id: str, user_id: str, action: str, body: LeaveA
             )
         _leave_log(leave_request_id, "returned", user_id, current.get("role"), req.get("user_id"), "employee", comment)
         _notify_leave_employee(leave_request_id, "Your leave request was returned for changes.", f"Comment: {comment}")
+        _notify_leave_hr_info("[Leave] Returned", leave_request_id, f"Returned to employee for changes. Comment: {comment}")
+        _notify_leave_employee_inbox(leave_request_id, "Leave returned for changes", f"Comment: {comment}")
+        _notify_leave_hr_inbox(leave_request_id, "Leave returned", f"Returned to employee for changes. Comment: {comment}")
     with cursor() as c:
         c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
         return row_to_dict(c.fetchone())
@@ -5380,6 +7044,36 @@ def reject_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: 
 @app.post("/leave/requests/{leave_request_id}/return")
 def return_leave_request(leave_request_id: str, body: LeaveActionBody, user_id: str = Depends(get_current_user_id)):
     return _act_on_leave(leave_request_id, user_id, "return", body)
+
+
+@app.post("/leave/requests/{leave_request_id}/remind-approver")
+def remind_leave_approver(leave_request_id: str, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("hr", "admin"))
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_requests WHERE id = ?", (leave_request_id,))
+        row = c.fetchone()
+    req = row_to_dict(row)
+    if not req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    if (req.get("status") or "").strip().lower() not in ("submitted", "pending_manager", "pending_hod", "pending_hr"):
+        raise HTTPException(status_code=400, detail="Only pending requests can be reminded")
+    approver_id = (req.get("current_approver_id") or "").strip()
+    if not approver_id:
+        raise HTTPException(status_code=400, detail="No current approver assigned")
+    _notify_leave_approver(
+        leave_request_id,
+        approver_id,
+        "Reminder from HR: a leave request is waiting for your approval. Please sign in and review it.",
+    )
+    _notify_leave_approver_inbox(leave_request_id, approver_id)
+    _audit_log(
+        "leave_approver_reminder_sent",
+        "leave_requests",
+        user_id,
+        leave_request_id,
+        {"approver_id": approver_id},
+    )
+    return {"ok": True, "leave_request_id": leave_request_id, "approver_id": approver_id}
 
 
 @app.get("/leave/requests/{leave_request_id}/workflow")
@@ -5415,6 +7109,7 @@ def leave_reports_summary(
     to_date: str | None = None,
     as_of: str | None = None,
     department: str | None = None,
+    balance_year: int | None = None,
     user_id: str = Depends(get_current_user_id),
 ):
     """HR leave analytics: period uses calendar overlap (any leave touching the range). Department from user profile; blank → 'Unassigned'."""
@@ -5428,6 +7123,11 @@ def leave_reports_summary(
         raise HTTPException(status_code=400, detail="from_date must be on or before to_date")
     as_of_d = as_of or today
     _parse_yyyy_mm_dd(as_of_d)
+    by = int(str(as_of_d)[:4])
+    if balance_year is not None:
+        if balance_year < 1990 or balance_year > 2100:
+            raise HTTPException(status_code=400, detail="balance_year must be between 1990 and 2100")
+        by = int(balance_year)
 
     dept_filter_lr = ""
     dept_params: list = []
@@ -5461,9 +7161,13 @@ def leave_reports_summary(
 
         c.execute(
             f"""
-            SELECT u.full_name, u.email, COUNT(*) AS total_requests, SUM(lr.days_requested) AS total_days
+            SELECT u.full_name, u.email, {dept_expr_u} AS department,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone,
+                   COUNT(*) AS total_requests, SUM(lr.days_requested) AS total_days
             FROM leave_requests lr
             JOIN users u ON u.id = lr.user_id
+            LEFT JOIN branches b ON b.id = u.branch_id
             WHERE {overlap}
             {dept_filter_lr}
             GROUP BY lr.user_id
@@ -5477,6 +7181,8 @@ def leave_reports_summary(
         c.execute(
             f"""
             SELECT u.full_name, u.email, {dept_expr_u} AS department,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone,
                    SUM(CASE WHEN lr.status = 'approved' THEN lr.days_requested ELSE 0 END) AS approved_days,
                    SUM(CASE WHEN lr.status = 'approved' THEN 1 ELSE 0 END) AS approved_requests,
                    SUM(CASE WHEN lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
@@ -5487,6 +7193,7 @@ def leave_reports_summary(
                    SUM(lr.days_requested) AS total_days
             FROM leave_requests lr
             JOIN users u ON u.id = lr.user_id
+            LEFT JOIN branches b ON b.id = u.branch_id
             WHERE {overlap}
               AND {active_u}
             {dept_filter_lr}
@@ -5538,11 +7245,16 @@ def leave_reports_summary(
             JOIN users u ON u.id = lr.user_id
             WHERE lr.status = 'approved'
               AND lr.start_date <= ? AND lr.end_date >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM attendance_logs al
+                  WHERE al.user_id = lr.user_id
+                    AND substr(COALESCE(al.clock_in_at, ''), 1, 10) = ?
+              )
               AND {active_u}
             {dept_filter_lr}
             GROUP BY department
             """,
-            tuple([as_of_d, as_of_d] + dept_params),
+            tuple([as_of_d, as_of_d, as_of_d] + dept_params),
         )
         on_leave_by_dept = {row_to_dict(r)["department"]: row_to_dict(r) for r in c.fetchall()}
 
@@ -5553,30 +7265,87 @@ def leave_reports_summary(
             JOIN users u ON u.id = lr.user_id
             WHERE lr.status = 'approved'
               AND lr.start_date <= ? AND lr.end_date >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM attendance_logs al
+                  WHERE al.user_id = lr.user_id
+                    AND substr(COALESCE(al.clock_in_at, ''), 1, 10) = ?
+              )
               AND {active_u}
             {dept_filter_lr}
             """,
-            tuple([as_of_d, as_of_d] + dept_params),
+            tuple([as_of_d, as_of_d, as_of_d] + dept_params),
         )
         on_leave_total = int((c.fetchone() or [0])[0] or 0)
 
         c.execute(
             f"""
             SELECT lr.id, u.full_name, u.email, {dept_expr_u} AS department,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone,
                    lr.start_date, lr.end_date, lr.days_requested, lt.name AS leave_type_name
             FROM leave_requests lr
             JOIN users u ON u.id = lr.user_id
             JOIN leave_types lt ON lt.id = lr.leave_type_id
+            LEFT JOIN branches b ON b.id = u.branch_id
             WHERE lr.status = 'approved'
               AND lr.start_date <= ? AND lr.end_date >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM attendance_logs al
+                  WHERE al.user_id = lr.user_id
+                    AND substr(COALESCE(al.clock_in_at, ''), 1, 10) = ?
+              )
               AND {active_u}
             {dept_filter_lr}
             ORDER BY {dept_expr_u} COLLATE NOCASE, u.full_name COLLATE NOCASE
             LIMIT 200
             """,
-            tuple([as_of_d, as_of_d] + dept_params),
+            tuple([as_of_d, as_of_d, as_of_d] + dept_params),
         )
         on_leave_rows = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT lr.id, u.full_name, u.email, {dept_expr_u} AS department,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone,
+                   lr.start_date, lr.end_date, lr.days_requested, lt.name AS leave_type_name,
+                   lr.status, lr.final_decision_at
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            LEFT JOIN branches b ON b.id = u.branch_id
+            WHERE {overlap}
+              AND lr.status = 'approved'
+              AND {active_u}
+            {dept_filter_lr}
+            ORDER BY lr.final_decision_at DESC, u.full_name COLLATE NOCASE
+            LIMIT 500
+            """,
+            tuple(overlap_params + dept_params),
+        )
+        approved_requests_rows = [row_to_dict(r) for r in c.fetchall()]
+
+        c.execute(
+            f"""
+            SELECT lr.id, u.full_name, u.email, {dept_expr_u} AS department,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone,
+                   lr.start_date, lr.end_date, lr.days_requested, lt.name AS leave_type_name,
+                   lr.status, lr.updated_at
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            JOIN leave_types lt ON lt.id = lr.leave_type_id
+            LEFT JOIN branches b ON b.id = u.branch_id
+            WHERE {overlap}
+              AND lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
+              AND {active_u}
+            {dept_filter_lr}
+            ORDER BY lr.updated_at DESC, u.full_name COLLATE NOCASE
+            LIMIT 500
+            """,
+            tuple(overlap_params + dept_params),
+        )
+        pending_requests_rows = [row_to_dict(r) for r in c.fetchall()]
 
         c.execute(
             f"""
@@ -5595,8 +7364,11 @@ def leave_reports_summary(
 
         c.execute(
             f"""
-            SELECT u.full_name, u.email, {dept_expr_u} AS department, u.role
+            SELECT u.full_name, u.email, {dept_expr_u} AS department, u.role,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone
             FROM users u
+            LEFT JOIN branches b ON b.id = u.branch_id
             WHERE {active_u}
             {dept_filter_u}
             AND NOT EXISTS (
@@ -5640,6 +7412,51 @@ def leave_reports_summary(
             tuple(dept_params),
         )
         staff_in_scope = int((c.fetchone() or [0])[0] or 0)
+
+        c.execute(
+            f"""
+            SELECT u.id AS user_id, u.full_name, u.email, {dept_expr_u} AS department,
+                   COALESCE(b.name, '') AS branch_name,
+                   COALESCE(TRIM(u.phone), '') AS phone,
+                   lt.name AS leave_type_name,
+                   COALESCE(lb.allocated_days, lt.default_days) AS allocated_days,
+                   COALESCE(lb.used_days, 0) AS used_days,
+                   COALESCE(lb.remaining_days, COALESCE(lb.allocated_days, lt.default_days) - COALESCE(lb.used_days, 0)) AS remaining_days
+            FROM users u
+            JOIN leave_types lt ON lt.is_active = 1
+            LEFT JOIN leave_balances lb
+              ON lb.user_id = u.id AND lb.leave_type_id = lt.id AND lb.year = ?
+            LEFT JOIN branches b ON b.id = u.branch_id
+            WHERE {active_u}
+            {dept_filter_u}
+            ORDER BY u.full_name COLLATE NOCASE, lt.name COLLATE NOCASE
+            LIMIT 8000
+            """,
+            (by,) + tuple(dept_params),
+        )
+        staff_leave_balance_rows = [row_to_dict(r) for r in c.fetchall()]
+
+    totals_by_user: dict[str, dict] = {}
+    for r in staff_leave_balance_rows:
+        uid = str(r.get("user_id") or "")
+        if not uid:
+            continue
+        rem = float(r.get("remaining_days") or 0)
+        if uid not in totals_by_user:
+            totals_by_user[uid] = {
+                "user_id": uid,
+                "full_name": r.get("full_name"),
+                "email": r.get("email"),
+                "department": r.get("department"),
+                "branch_name": r.get("branch_name"),
+                "phone": r.get("phone"),
+                "total_remaining_days": 0.0,
+            }
+        totals_by_user[uid]["total_remaining_days"] = round(totals_by_user[uid]["total_remaining_days"] + rem, 2)
+    staff_leave_balance_totals = sorted(
+        totals_by_user.values(),
+        key=lambda x: ((x.get("full_name") or "") or "").lower(),
+    )
 
     all_depts = set(active_by_dept) | set(req_by_dept) | set(on_leave_by_dept) | set(no_leave_by_dept.keys())
 
@@ -5690,11 +7507,13 @@ def leave_reports_summary(
     pending_requests_period_total = sum(int(r.get("pending_requests_in_period") or 0) for r in department_breakdown)
 
     return {
-        "period": {"from_date": fd, "to_date": td, "as_of": as_of_d},
-        "note": "Counts use leave periods overlapping from_date–to_date. Staff scope: active users except admin. Empty department shows as Unassigned. Pending = submitted / in workflow / returned (not draft). Taken = approved leave days in the period.",
+        "period": {"from_date": fd, "to_date": td, "as_of": as_of_d, "balance_year": by},
+        "note": "",
         "staff_in_scope": staff_in_scope,
         "on_leave_as_of_count": on_leave_total,
         "on_leave_as_of": on_leave_rows,
+        "staff_leave_balance_rows": staff_leave_balance_rows,
+        "staff_leave_balance_totals": staff_leave_balance_totals,
         "no_approved_leave_in_period_count": no_leave_total,
         "no_approved_leave_in_period": no_leave_rows,
         "total_requests": total_requests,
@@ -5707,11 +7526,154 @@ def leave_reports_summary(
         "department_breakdown": department_breakdown,
         "top_requesters": top_requesters,
         "staff_leave_activity": staff_leave_activity,
+        "approved_requests_rows": approved_requests_rows,
+        "pending_requests_rows": pending_requests_rows,
         "leave_totals_in_period": {
             "approved_days": approved_days_period_total,
             "pending_days": pending_days_period_total,
             "pending_requests": pending_requests_period_total,
         },
+    }
+
+
+@app.get("/leave/reports/workflow-analytics")
+def leave_workflow_analytics(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    department: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Workflow-focused leave report for HR visibility:
+    - decision cycle times (created -> final decision)
+    - pending ageing buckets
+    - action volume by reviewer
+    - workflow action mix
+    """
+    _require_roles(user_id, ("hr", "admin"))
+    td = to_date or datetime.utcnow().strftime("%Y-%m-%d")
+    fd = from_date or (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+    _parse_yyyy_mm_dd(fd)
+    _parse_yyyy_mm_dd(td)
+    if td < fd:
+        raise HTTPException(status_code=400, detail="to_date cannot be before from_date")
+
+    dept_clause = ""
+    params_common: list = [fd, td]
+    if department and department.strip():
+        dept_clause = " AND TRIM(COALESCE(u.department,'')) = TRIM(?) "
+        params_common.append(department.strip())
+
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT
+                COUNT(*) AS decided_count,
+                COALESCE(AVG((julianday(lr.final_decision_at) - julianday(lr.created_at)) * 24.0), 0) AS avg_hours,
+                COALESCE(MIN((julianday(lr.final_decision_at) - julianday(lr.created_at)) * 24.0), 0) AS min_hours,
+                COALESCE(MAX((julianday(lr.final_decision_at) - julianday(lr.created_at)) * 24.0), 0) AS max_hours
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE lr.status IN ('approved','rejected')
+              AND lr.final_decision_at IS NOT NULL
+              AND substr(COALESCE(lr.final_decision_at,''), 1, 10) >= ?
+              AND substr(COALESCE(lr.final_decision_at,''), 1, 10) <= ?
+              {dept_clause}
+            """,
+            tuple(params_common),
+        )
+        row = c.fetchone()
+        decided = {
+            "count": int((row[0] or 0) if row else 0),
+            "avg_hours_to_decision": round(float((row[1] or 0) if row else 0), 2),
+            "min_hours_to_decision": round(float((row[2] or 0) if row else 0), 2),
+            "max_hours_to_decision": round(float((row[3] or 0) if row else 0), 2),
+        }
+
+    now_iso = datetime.utcnow().isoformat()
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN (julianday(?) - julianday(lr.created_at)) * 24.0 < 24 THEN 1 ELSE 0 END) AS lt_24h,
+                SUM(CASE WHEN (julianday(?) - julianday(lr.created_at)) * 24.0 >= 24 AND (julianday(?) - julianday(lr.created_at)) * 24.0 < 72 THEN 1 ELSE 0 END) AS h24_72,
+                SUM(CASE WHEN (julianday(?) - julianday(lr.created_at)) * 24.0 >= 72 AND (julianday(?) - julianday(lr.created_at)) * 24.0 < 168 THEN 1 ELSE 0 END) AS h72_168,
+                SUM(CASE WHEN (julianday(?) - julianday(lr.created_at)) * 24.0 >= 168 THEN 1 ELSE 0 END) AS gte_168h,
+                COUNT(*) AS pending_total
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.user_id
+            WHERE lr.status IN ('submitted','pending_manager','pending_hod','pending_hr','returned')
+              AND substr(COALESCE(lr.created_at,''), 1, 10) >= ?
+              AND substr(COALESCE(lr.created_at,''), 1, 10) <= ?
+              {dept_clause}
+            """,
+            tuple([now_iso, now_iso, now_iso, now_iso, now_iso, now_iso, fd, td] + ([department.strip()] if department and department.strip() else [])),
+        )
+        pr = c.fetchone()
+    pending_age = {
+        "lt_24h": int((pr[0] or 0) if pr else 0),
+        "h24_72": int((pr[1] or 0) if pr else 0),
+        "h72_168": int((pr[2] or 0) if pr else 0),
+        "gte_168h": int((pr[3] or 0) if pr else 0),
+        "pending_total": int((pr[4] or 0) if pr else 0),
+    }
+
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT
+                COALESCE(lwl.from_user_id, '') AS reviewer_id,
+                COALESCE(u.full_name, '') AS reviewer_name,
+                COALESCE(u.email, '') AS reviewer_email,
+                COUNT(*) AS actions_count
+            FROM leave_workflow_logs lwl
+            LEFT JOIN users u ON u.id = lwl.from_user_id
+            JOIN leave_requests lr ON lr.id = lwl.leave_request_id
+            JOIN users req_u ON req_u.id = lr.user_id
+            WHERE lwl.action IN ('approved_step','approved','rejected','returned')
+              AND substr(COALESCE(lwl.created_at,''), 1, 10) >= ?
+              AND substr(COALESCE(lwl.created_at,''), 1, 10) <= ?
+              {(" AND TRIM(COALESCE(req_u.department,'')) = TRIM(?) " if department and department.strip() else "")}
+            GROUP BY COALESCE(lwl.from_user_id, ''), COALESCE(u.full_name, ''), COALESCE(u.email, '')
+            ORDER BY actions_count DESC, reviewer_name COLLATE NOCASE
+            LIMIT 40
+            """,
+            tuple([fd, td] + ([department.strip()] if department and department.strip() else [])),
+        )
+        reviewer_volume = [
+            {
+                "reviewer_id": r[0],
+                "reviewer_name": r[1] or "(system)",
+                "reviewer_email": r[2] or "",
+                "actions_count": int(r[3] or 0),
+            }
+            for r in c.fetchall()
+        ]
+
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT lwl.action, COUNT(*) AS n
+            FROM leave_workflow_logs lwl
+            JOIN leave_requests lr ON lr.id = lwl.leave_request_id
+            JOIN users req_u ON req_u.id = lr.user_id
+            WHERE substr(COALESCE(lwl.created_at,''), 1, 10) >= ?
+              AND substr(COALESCE(lwl.created_at,''), 1, 10) <= ?
+              {(" AND TRIM(COALESCE(req_u.department,'')) = TRIM(?) " if department and department.strip() else "")}
+            GROUP BY lwl.action
+            ORDER BY n DESC
+            """,
+            tuple([fd, td] + ([department.strip()] if department and department.strip() else [])),
+        )
+        action_mix = [{"action": r[0], "count": int(r[1] or 0)} for r in c.fetchall()]
+
+    return {
+        "period": {"from_date": fd, "to_date": td, "department": (department or "").strip() or None},
+        "decision_cycle_time": decided,
+        "pending_age_buckets": pending_age,
+        "reviewer_action_volume": reviewer_volume,
+        "workflow_action_mix": action_mix,
+        "note": "Decision cycle time uses created_at to final_decision_at for approved/rejected requests. Pending ageing uses current UTC time against created_at.",
     }
 
 
@@ -5724,12 +7686,16 @@ def leave_balances(
     current = _get_user_profile_min(user_id)
     if not current:
         raise HTTPException(status_code=401, detail="User not found")
-    y = year or datetime.utcnow().year
+    cy = datetime.utcnow().year
+    y = year if year is not None else cy
     if target_user_id and target_user_id != user_id and current.get("role") not in ("hr", "admin"):
         raise HTTPException(status_code=403, detail="Forbidden")
     # Single-user balance view
     if target_user_id or current.get("role") not in ("hr", "admin"):
         uid = target_user_id or user_id
+        if year is None:
+            y = _employee_leave_balance_display_year(uid, cy)
+        _ensure_leave_balance_rows_for_user(uid, cy)
         _ensure_leave_balance_rows_for_user(uid, y)
         with cursor() as c:
             c.execute(
@@ -5751,8 +7717,7 @@ def leave_balances(
             )
             rows = [row_to_dict(r) for r in c.fetchall()]
         return {"year": y, "user_id": uid, "rows": rows}
-    # HR/Admin all users summary
-    _refresh_all_annual_leave_balances_for_year(y)
+    # HR/Admin all users summary — rows as stored (use POST /leave/hr/recompute-statutory-annual to apply formula)
     with cursor() as c:
         c.execute(
             """
@@ -5761,6 +7726,7 @@ def leave_balances(
                 u.full_name,
                 u.email,
                 u.department,
+                lt.id as leave_type_id,
                 lt.name as leave_name,
                 COALESCE(lb.allocated_days, lt.default_days) as allocated_days,
                 COALESCE(lb.used_days, 0) as used_days,
@@ -5778,15 +7744,356 @@ def leave_balances(
     return {"year": y, "rows": rows}
 
 
+@app.get("/leave/hr/balance-adjustments")
+def leave_hr_balance_adjustments(
+    status: str | None = None,
+    limit: int = 200,
+    user_id: str = Depends(get_current_user_id),
+):
+    _require_roles(user_id, ("hr", "admin"))
+    limit = min(max(int(limit or 200), 1), 500)
+    where = ["1=1"]
+    params: list = []
+    if status and status.strip():
+        allowed = {"pending", "approved", "rejected", "cancelled"}
+        parts = [s.strip().lower() for s in status.split(",") if s.strip()]
+        parts = [p for p in parts if p in allowed]
+        if parts:
+            qs = ",".join("?" * len(parts))
+            where.append(f"a.status IN ({qs})")
+            params.extend(parts)
+    where_sql = " AND ".join(where)
+    with cursor() as c:
+        c.execute(
+            f"""
+            SELECT a.*,
+                   u.full_name AS target_user_name, u.email AS target_user_email, u.department AS target_user_department,
+                   lt.name AS leave_type_name, lt.code AS leave_type_code,
+                   rq.full_name AS requested_by_name, ap.full_name AS approved_by_name,
+                   ca.full_name AS current_approver_name
+            FROM leave_balance_adjustments a
+            JOIN users u ON u.id = a.target_user_id
+            JOIN leave_types lt ON lt.id = a.leave_type_id
+            JOIN users rq ON rq.id = a.requested_by_user_id
+            LEFT JOIN users ap ON ap.id = a.approved_by_user_id
+            LEFT JOIN users ca ON ca.id = a.current_approver_id
+            WHERE {where_sql}
+            ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END, a.created_at DESC
+            LIMIT ?
+            """,
+            tuple(params + [limit]),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    return {"rows": rows, "limit": limit}
+
+
+@app.post("/leave/hr/balance-adjustments")
+def leave_hr_create_balance_adjustment(
+    body: LeaveBalanceAdjustmentCreate,
+    user_id: str = Depends(get_current_user_id),
+):
+    current = _get_user_profile_min(user_id)
+    if not current or current.get("role") not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    target_uid = (body.target_user_id or "").strip()
+    if not target_uid:
+        raise HTTPException(status_code=400, detail="target_user_id is required")
+    if body.year < 1990 or body.year > 2100:
+        raise HTTPException(status_code=400, detail="year out of range")
+    try:
+        alloc = float(body.allocated_days)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="allocated_days must be a number")
+    if alloc < 0 or alloc > 3660:
+        raise HTTPException(status_code=400, detail="allocated_days out of range")
+    with cursor() as c:
+        c.execute("SELECT id, is_active FROM users WHERE id = ?", (target_uid,))
+        target = c.fetchone()
+        if not target or not target[1]:
+            raise HTTPException(status_code=404, detail="Target user not found or inactive")
+        c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (body.leave_type_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=400, detail="Invalid leave type")
+    approver_id = _first_leave_approver(user_id)
+    if not approver_id:
+        raise HTTPException(status_code=400, detail="Your profile must have an active supervisor to review this request")
+    if _norm_uid_compare(approver_id, user_id):
+        raise HTTPException(status_code=400, detail="Your supervisor cannot be your own account for this workflow")
+    aid = new_id()
+    now = _now_iso()
+    with cursor() as c:
+        c.execute(
+            """
+            INSERT INTO leave_balance_adjustments (
+                id, target_user_id, leave_type_id, year, requested_allocated_days, reason, status,
+                requested_by_user_id, current_approver_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                aid,
+                target_uid,
+                body.leave_type_id,
+                int(body.year),
+                alloc,
+                (body.reason or "").strip() or None,
+                user_id,
+                approver_id,
+                now,
+                now,
+            ),
+        )
+    requester_name = (current.get("full_name") or current.get("email") or "HR requester").strip() or "HR requester"
+    target_profile = _get_user_profile_min(target_uid) or {}
+    target_name = (target_profile.get("full_name") or target_profile.get("email") or "Employee").strip() or "Employee"
+    _insert_notification(
+        approver_id,
+        "leave_adjustment_pending",
+        f"Leave entitlement change to approve: {target_name}",
+        f"{requester_name} requested a leave entitlement update that requires your approval.",
+        "/hr/leave-balances",
+    )
+    _audit_log(
+        "leave_balance_adjustment_requested",
+        "leave_balance_adjustments",
+        user_id,
+        aid,
+        {
+            "target_user_id": target_uid,
+            "leave_type_id": body.leave_type_id,
+            "year": int(body.year),
+            "requested_allocated_days": alloc,
+            "reason": (body.reason or "").strip() or None,
+            "current_approver_id": approver_id,
+        },
+    )
+    return _leave_balance_adjustment_row(aid)
+
+
+@app.post("/leave/hr/assign-type")
+def leave_hr_assign_leave_type(
+    body: LeaveTypeAssignCreate,
+    user_id: str = Depends(get_current_user_id),
+):
+    target_uid = (body.target_user_id or "").strip()
+    if not target_uid:
+        raise HTTPException(status_code=400, detail="target_user_id is required")
+    if body.year < 1990 or body.year > 2100:
+        raise HTTPException(status_code=400, detail="year out of range")
+    with cursor() as c:
+        c.execute("SELECT default_days FROM leave_types WHERE id = ? AND is_active = 1", (body.leave_type_id,))
+        row_lt = c.fetchone()
+    if not row_lt:
+        raise HTTPException(status_code=400, detail="Invalid leave type")
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT allocated_days
+            FROM leave_balances
+            WHERE user_id = ? AND leave_type_id = ? AND year = ?
+            """,
+            (target_uid, body.leave_type_id, int(body.year)),
+        )
+        row_bal = c.fetchone()
+    alloc = body.allocated_days
+    if alloc is None:
+        alloc = float((row_bal[0] if row_bal else row_lt[0]) or 0)
+    reason = (body.reason or "").strip() or "Assign leave type to employee"
+    req = LeaveBalanceAdjustmentCreate(
+        target_user_id=target_uid,
+        leave_type_id=body.leave_type_id,
+        year=int(body.year),
+        allocated_days=float(alloc),
+        reason=reason,
+    )
+    return leave_hr_create_balance_adjustment(req, user_id=user_id)
+
+
+@app.post("/leave/hr/balance-adjustments/{adjustment_id}/approve")
+def leave_hr_approve_balance_adjustment(
+    adjustment_id: str,
+    body: LeaveBalanceAdjustmentAction,
+    user_id: str = Depends(get_current_user_id),
+):
+    current = _get_user_profile_min(user_id)
+    if not current or current.get("role") not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_balance_adjustments WHERE id = ?", (adjustment_id,))
+        row = c.fetchone()
+    adj = row_to_dict(row)
+    if not adj:
+        raise HTTPException(status_code=404, detail="Adjustment request not found")
+    if (adj.get("status") or "") != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be approved")
+    assigned_approver = (adj.get("current_approver_id") or "").strip() or (_first_leave_approver(adj.get("requested_by_user_id") or "") or "")
+    if not assigned_approver:
+        raise HTTPException(status_code=400, detail="No supervisor is assigned to approve this request")
+    if not adj.get("current_approver_id"):
+        with cursor() as c:
+            c.execute(
+                "UPDATE leave_balance_adjustments SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (assigned_approver, _now_iso(), adjustment_id),
+            )
+    if not _norm_uid_compare(assigned_approver, user_id):
+        raise HTTPException(status_code=403, detail="Only the assigned supervisor can approve this request")
+    if _norm_uid_compare(adj.get("requested_by_user_id"), user_id):
+        raise HTTPException(status_code=400, detail="Requester cannot approve their own request")
+    target_uid = adj.get("target_user_id")
+    lt_id = adj.get("leave_type_id")
+    year = int(adj.get("year") or datetime.utcnow().year)
+    requested_alloc = float(adj.get("requested_allocated_days") or 0)
+    _ensure_leave_balance_rows_for_user(target_uid, year)
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, used_days FROM leave_balances
+            WHERE user_id = ? AND leave_type_id = ? AND year = ?
+            """,
+            (target_uid, lt_id, year),
+        )
+        bal = c.fetchone()
+    used_days = float((bal[1] if bal else 0) or 0)
+    now = _now_iso()
+    if bal:
+        with cursor() as c:
+            c.execute(
+                """
+                UPDATE leave_balances
+                SET allocated_days = ?, remaining_days = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (requested_alloc, max(requested_alloc - used_days, 0), now, bal[0]),
+            )
+    else:
+        with cursor() as c:
+            c.execute(
+                """
+                INSERT INTO leave_balances (id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                """,
+                (new_id(), target_uid, lt_id, year, requested_alloc, requested_alloc, now, now),
+            )
+    with cursor() as c:
+        c.execute(
+            """
+            UPDATE leave_balance_adjustments
+            SET status = 'approved', current_approver_id = NULL, approved_by_user_id = ?, approved_at = ?, rejection_comment = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (user_id, now, now, adjustment_id),
+        )
+    _audit_log(
+        "leave_balance_adjustment_approved",
+        "leave_balance_adjustments",
+        user_id,
+        adjustment_id,
+        {
+            "target_user_id": target_uid,
+            "leave_type_id": lt_id,
+            "year": year,
+            "requested_allocated_days": requested_alloc,
+            "comment": (body.comment or "").strip() or None,
+        },
+    )
+    if body.comment and body.comment.strip():
+        _notify_leave_hr_info("[Leave] Balance adjustment approved", adjustment_id, body.comment.strip())
+    return _leave_balance_adjustment_row(adjustment_id)
+
+
+@app.post("/leave/hr/balance-adjustments/{adjustment_id}/reject")
+def leave_hr_reject_balance_adjustment(
+    adjustment_id: str,
+    body: LeaveBalanceAdjustmentAction,
+    user_id: str = Depends(get_current_user_id),
+):
+    current = _get_user_profile_min(user_id)
+    if not current or current.get("role") not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    comment = (body.comment or "").strip()
+    if not comment:
+        raise HTTPException(status_code=400, detail="Comment is required")
+    with cursor() as c:
+        c.execute("SELECT * FROM leave_balance_adjustments WHERE id = ?", (adjustment_id,))
+        row = c.fetchone()
+    adj = row_to_dict(row)
+    if not adj:
+        raise HTTPException(status_code=404, detail="Adjustment request not found")
+    if (adj.get("status") or "") != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be rejected")
+    assigned_approver = (adj.get("current_approver_id") or "").strip() or (_first_leave_approver(adj.get("requested_by_user_id") or "") or "")
+    if not assigned_approver:
+        raise HTTPException(status_code=400, detail="No supervisor is assigned to approve this request")
+    if not adj.get("current_approver_id"):
+        with cursor() as c:
+            c.execute(
+                "UPDATE leave_balance_adjustments SET current_approver_id = ?, updated_at = ? WHERE id = ?",
+                (assigned_approver, _now_iso(), adjustment_id),
+            )
+    if not _norm_uid_compare(assigned_approver, user_id):
+        raise HTTPException(status_code=403, detail="Only the assigned supervisor can reject this request")
+    if _norm_uid_compare(adj.get("requested_by_user_id"), user_id):
+        raise HTTPException(status_code=400, detail="Requester cannot reject their own request")
+    now = _now_iso()
+    with cursor() as c:
+        c.execute(
+            """
+            UPDATE leave_balance_adjustments
+            SET status = 'rejected', current_approver_id = NULL, approved_by_user_id = ?, approved_at = ?, rejection_comment = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (user_id, now, comment, now, adjustment_id),
+        )
+    _audit_log(
+        "leave_balance_adjustment_rejected",
+        "leave_balance_adjustments",
+        user_id,
+        adjustment_id,
+        {
+            "target_user_id": adj.get("target_user_id"),
+            "leave_type_id": adj.get("leave_type_id"),
+            "year": adj.get("year"),
+            "requested_allocated_days": adj.get("requested_allocated_days"),
+            "comment": comment,
+        },
+    )
+    return _leave_balance_adjustment_row(adjustment_id)
+
+
+@app.post("/leave/hr/recompute-statutory-annual")
+def leave_hr_recompute_statutory_annual(
+    year: int | None = Query(None, description="Calendar year; defaults to current UTC year"),
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Apply year-end rollover for all active users/leave types:
+    target-year allocation = base entitlement + previous-year remaining carry-over.
+    ANNUAL base uses statutory ladder (or `HR_SUITE_ANNUAL_LEAVE_DAYS` override); other types use default_days.
+    """
+    current = _get_user_profile_min(user_id)
+    if not current or current.get("role") not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    y = year or datetime.utcnow().year
+    _rollover_leave_balances_for_year(int(y))
+    return {
+        "ok": True,
+        "year": y,
+        "detail": "Year-end rollover applied: each leave type now uses current-year base entitlement plus carry-over from previous-year remaining days.",
+    }
+
+
 @app.get("/leave/my-dashboard")
 def leave_my_dashboard(user_id: str = Depends(get_current_user_id)):
-    """Employee-focused leave snapshot: balances, pending requests, approver workload."""
+    """Employee-focused leave snapshot: balances from DB, pending requests, approver workload."""
     current = _get_user_profile_min(user_id)
     if not current:
         raise HTTPException(status_code=401, detail="User not found")
-    y = datetime.utcnow().year
+    cy = datetime.utcnow().year
+    y = _employee_leave_balance_display_year(user_id, cy)
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    _ensure_leave_balance_rows_for_user(user_id, y)
+    _ensure_leave_balance_rows_for_user(user_id, cy)
+    if y != cy:
+        _ensure_leave_balance_rows_for_user(user_id, y)
     balances = _leave_balances_for_user(user_id, y)
     total_remaining = sum(float(r.get("remaining_days") or 0) for r in balances)
     with cursor() as c:
@@ -5834,6 +8141,13 @@ def leave_my_dashboard(user_id: str = Depends(get_current_user_id)):
             pending_approvals_preview = [row_to_dict(r) for r in c.fetchall()]
     return {
         "year": y,
+        "calendar_year": cy,
+        "balances_effective_year_note": (
+            None
+            if y == cy
+            else f"Leave balances are shown for {y} because that year has your imported or higher annual allocation; "
+            f"{cy} rows look like defaults only. HR can copy entitlements into {cy} or you can pick year on reports."
+        ),
         "viewer": {"id": user_id, "full_name": current.get("full_name") or ""},
         "balances": balances,
         "total_remaining_days": round(total_remaining, 2),
@@ -5891,62 +8205,101 @@ def _rolling_month_keys_ending_now(count: int = 12):
 
 
 @app.get("/leave/overview")
-def leave_overview(user_id: str = Depends(get_current_user_id)):
-    """HR/Admin dashboard: pipeline counts, today on leave, month snapshot."""
+def leave_overview(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    on_date: str | None = None,
+    department: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    """HR/Admin dashboard: pipeline, selected-date on-leave snapshot, and selected-range decision stats."""
     _require_roles(user_id, ("hr", "admin"))
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    ym = datetime.utcnow().strftime("%Y-%m")
+    today = on_date or datetime.utcnow().strftime("%Y-%m-%d")
+    _parse_yyyy_mm_dd(today)
+    td = to_date or today
+    fd = from_date or (datetime.strptime(td, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
+    _parse_yyyy_mm_dd(fd)
+    _parse_yyyy_mm_dd(td)
+    if td < fd:
+        raise HTTPException(status_code=400, detail="to_date cannot be before from_date")
+    dept = (department or "").strip()
+    dept_clause = ""
+    dept_param = []
+    if dept:
+        dept_clause = " AND TRIM(COALESCE(u.department,'')) = TRIM(?) "
+        dept_param = [dept]
     with cursor() as c:
         c.execute(
-            """
+            f"""
             SELECT status, COUNT(*) as n FROM leave_requests
+            JOIN users u ON u.id = leave_requests.user_id
             WHERE status IN ('pending_manager','pending_hod','pending_hr')
+              {dept_clause}
             GROUP BY status
-            """
+            """,
+            tuple(dept_param),
         )
         pipeline = {row[0]: row[1] for row in c.fetchall()}
         c.execute(
-            "SELECT COUNT(*) FROM leave_requests WHERE status IN ('pending_manager','pending_hod','pending_hr')"
+            f"""
+            SELECT COUNT(*) FROM leave_requests
+            JOIN users u ON u.id = leave_requests.user_id
+            WHERE status IN ('pending_manager','pending_hod','pending_hr')
+              {dept_clause}
+            """,
+            tuple(dept_param),
         )
         pending_total = c.fetchone()[0]
         c.execute(
-            """
+            f"""
             SELECT COUNT(DISTINCT user_id) FROM leave_requests
+            JOIN users u ON u.id = leave_requests.user_id
             WHERE status = 'approved' AND start_date <= ? AND end_date >= ?
+              {dept_clause}
             """,
-            (today, today),
+            tuple([today, today] + dept_param),
         )
         staff_on_leave_today = c.fetchone()[0]
         c.execute(
-            """
+            f"""
             SELECT COUNT(*) FROM leave_requests
-            WHERE status = 'approved' AND final_decision_at IS NOT NULL AND substr(final_decision_at,1,7) = ?
+            JOIN users u ON u.id = leave_requests.user_id
+            WHERE status = 'approved' AND final_decision_at IS NOT NULL
+              AND substr(final_decision_at,1,10) >= ?
+              AND substr(final_decision_at,1,10) <= ?
+              {dept_clause}
             """,
-            (ym,),
+            tuple([fd, td] + dept_param),
         )
         approved_this_month = c.fetchone()[0]
         c.execute(
-            """
+            f"""
             SELECT COUNT(*) FROM leave_requests
-            WHERE status = 'rejected' AND final_decision_at IS NOT NULL AND substr(final_decision_at,1,7) = ?
+            JOIN users u ON u.id = leave_requests.user_id
+            WHERE status = 'rejected' AND final_decision_at IS NOT NULL
+              AND substr(final_decision_at,1,10) >= ?
+              AND substr(final_decision_at,1,10) <= ?
+              {dept_clause}
             """,
-            (ym,),
+            tuple([fd, td] + dept_param),
         )
         rejected_this_month = c.fetchone()[0]
         c.execute(
-            """
+            f"""
             SELECT lr.id, u.full_name, u.email, lt.name as leave_type_name, lr.start_date, lr.end_date, lr.days_requested, lr.status
             FROM leave_requests lr
             JOIN users u ON u.id = lr.user_id
             JOIN leave_types lt ON lt.id = lr.leave_type_id
             WHERE lr.status IN ('pending_manager','pending_hod','pending_hr')
+              {dept_clause}
             ORDER BY lr.created_at DESC
             LIMIT 15
-            """
+            """,
+            tuple(dept_param),
         )
         recent_pending = [row_to_dict(r) for r in c.fetchall()]
         c.execute(
-            """
+            f"""
             SELECT lr.id, lr.user_id, u.full_name, u.email, u.department, lt.name as leave_type_name,
                    lr.start_date, lr.end_date, lr.days_requested
             FROM leave_requests lr
@@ -5954,10 +8307,11 @@ def leave_overview(user_id: str = Depends(get_current_user_id)):
             JOIN leave_types lt ON lt.id = lr.leave_type_id
             WHERE lr.status = 'approved' AND u.is_active = 1
               AND lr.start_date <= ? AND lr.end_date >= ?
+              {dept_clause}
             ORDER BY u.department COLLATE NOCASE, u.full_name COLLATE NOCASE
             LIMIT 80
             """,
-            (today, today),
+            tuple([today, today] + dept_param),
         )
         on_leave_today_detail = [row_to_dict(r) for r in c.fetchall()]
         c.execute(
@@ -5990,6 +8344,7 @@ def leave_overview(user_id: str = Depends(get_current_user_id)):
             }
         )
     return {
+        "period": {"from_date": fd, "to_date": td, "on_date": today, "department": dept or None},
         "pending_total": pending_total,
         "pipeline": pipeline,
         "staff_on_leave_today": staff_on_leave_today,
@@ -6090,7 +8445,7 @@ def leave_org_requests(
     with cursor() as c:
         c.execute(
             f"""
-            SELECT lr.id, lr.user_id, u.full_name, u.email, u.department, lt.name as leave_type_name,
+            SELECT lr.id, lr.user_id, lr.leave_type_id, lr.reason, u.full_name, u.email, u.department, lt.name as leave_type_name,
                    lr.start_date, lr.end_date, lr.days_requested, lr.status, lr.created_at
             FROM leave_requests lr
             JOIN users u ON u.id = lr.user_id
@@ -6106,8 +8461,21 @@ def leave_org_requests(
 
 
 @app.get("/leave/team-balances")
-def leave_team_balances(year: int | None = None, user_id: str = Depends(get_current_user_id)):
-    """Managers: direct reports. HOD: same department. HR/Admin: employees (preview list)."""
+def leave_team_balances(
+    year: int | None = None,
+    scope: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Team leave balances list used for supervisor booking and visibility.
+
+    Default: manager and HOD -> users whose ``manager_id`` is the current user (your team only). HR/Admin ->
+    active employees (preview, cap 250).
+
+    Pass ``scope=direct_reports`` (or ``direct`` / ``my_team``) to force the direct-report list for any role.
+
+    HOD only: pass ``scope=department`` to list everyone in your department (legacy wide view).
+    """
     current = _get_user_profile_min(user_id)
     if not current:
         raise HTTPException(status_code=401, detail="User not found")
@@ -6116,8 +8484,21 @@ def leave_team_balances(year: int | None = None, user_id: str = Depends(get_curr
         raise HTTPException(status_code=403, detail="Forbidden")
     y = year or datetime.utcnow().year
     members = []
+    sc = (scope or "").strip().lower()
+    direct_only = sc in ("direct_reports", "direct", "my_team")
+    hod_department = role == "hod" and sc in ("department", "dept")
     with cursor() as c:
-        if role == "manager":
+        if direct_only:
+            c.execute(
+                """
+                SELECT id, full_name, email, department FROM users
+                WHERE is_active = 1 AND manager_id = ?
+                ORDER BY full_name
+                """,
+                (user_id,),
+            )
+            members = c.fetchall()
+        elif role == "manager":
             c.execute(
                 """
                 SELECT id, full_name, email, department FROM users
@@ -6129,7 +8510,7 @@ def leave_team_balances(year: int | None = None, user_id: str = Depends(get_curr
             members = c.fetchall()
         elif role == "hod":
             dept = (current.get("department") or "").strip()
-            if dept:
+            if hod_department and dept:
                 c.execute(
                     """
                     SELECT id, full_name, email, department FROM users
@@ -6137,6 +8518,16 @@ def leave_team_balances(year: int | None = None, user_id: str = Depends(get_curr
                     ORDER BY full_name
                     """,
                     (dept, user_id),
+                )
+                members = c.fetchall()
+            else:
+                c.execute(
+                    """
+                    SELECT id, full_name, email, department FROM users
+                    WHERE is_active = 1 AND manager_id = ?
+                    ORDER BY full_name
+                    """,
+                    (user_id,),
                 )
                 members = c.fetchall()
         else:
@@ -6162,4 +8553,10 @@ def leave_team_balances(year: int | None = None, user_id: str = Depends(get_curr
                 "balances": _leave_balances_for_user(mid, y),
             }
         )
-    return {"year": y, "members": out}
+    if direct_only or role == "manager":
+        list_scope = "direct_reports"
+    elif role == "hod":
+        list_scope = "department" if hod_department and (current.get("department") or "").strip() else "direct_reports"
+    else:
+        list_scope = "all_employees"
+    return {"year": y, "members": out, "list_scope": list_scope}

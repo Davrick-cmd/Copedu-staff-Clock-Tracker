@@ -9,10 +9,9 @@ import {
   DashboardPageHeader,
   QuickLinkCard,
   QuickLinksSection,
-  StatTile,
 } from '../../components/dashboard/DashboardWidgets';
-import { UserListModal } from '../../components/dashboard/UserListModal';
 import { DashboardSwitcher } from '../../components/dashboard/DashboardSwitcher';
+import { AttendanceTodayDonut, LeaveInsightCharts } from '../../components/dashboard/InsightChartCards';
 
 export function HRDashboard() {
   const role = useSelector((s) => s.auth.profile?.role);
@@ -21,7 +20,6 @@ export function HRDashboard() {
   const [leaveOverview, setLeaveOverview] = useState(null);
   const [myLeaveInbox, setMyLeaveInbox] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [modal, setModal] = useState(null);
 
   const todayLabel = new Date().toLocaleDateString(undefined, {
     weekday: 'long',
@@ -62,37 +60,8 @@ export function HRDashboard() {
   const present = s.present ?? 0;
   const absent = s.absent ?? 0;
   const late = s.late ?? 0;
-  const onTime = s.on_time ?? 0;
   const noClockOut = s.no_clock_out ?? 0;
   const totalStaff = s.total_staff ?? 0;
-  const pctLate = s.pct_late ?? 0;
-  const pctOnTime = s.pct_on_time ?? 0;
-  const pctAbsent = s.pct_absent ?? 0;
-  const users = s.users || {};
-
-  const statCard = (label, value, sub, colorClass, modalKey, modalTitle) => {
-    const count = typeof value === 'number' ? value : 0;
-    const clickable = count > 0 && modalKey && users[modalKey]?.length;
-    return (
-      <motion.button
-        type="button"
-        disabled={!clickable}
-        className={`text-left w-full rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 backdrop-blur-sm p-5 shadow-soft transition-all ${
-          clickable ? 'cursor-pointer hover:shadow-soft-lg hover:border-primary-300/80 dark:hover:border-primary-600' : ''
-        }`}
-        whileHover={clickable ? { y: -2 } : {}}
-        transition={{ duration: 0.2 }}
-        onClick={clickable ? () => setModal({ key: modalKey, title: modalTitle, list: users[modalKey] }) : undefined}
-      >
-        <p className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-[0.08em]">{label}</p>
-        <p className={`text-3xl font-bold tabular-nums mt-1 ${colorClass}`}>{value}</p>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
-          {sub}
-          {clickable && <span className="block mt-1 text-primary-600 dark:text-primary-400 font-medium">Tap to view names</span>}
-        </p>
-      </motion.button>
-    );
-  };
 
   return (
     <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-8 pb-8">
@@ -120,9 +89,44 @@ export function HRDashboard() {
         </div>
       )}
 
+      <section className="space-y-3">
+        <h2 className="text-lg font-bold text-slate-900 dark:text-white">Executive snapshot</h2>
+        <p className="text-sm text-slate-500 dark:text-slate-400">Clear numbers first, then charts. Open detail pages only when you need deeper records.</p>
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-5">
+          <KpiCard label="Total staff" value={totalStaff} tone="slate" />
+          <KpiCard label="Present" value={present} tone="emerald" />
+          <KpiCard label="Late" value={late} tone="amber" />
+          <KpiCard label="Absent" value={absent} tone="rose" />
+          <KpiCard label="No clock-out" value={noClockOut} tone="sky" />
+        </div>
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+          <KpiCard label="Pending leave" value={leaveOverview?.pending_total ?? 0} tone="amber" />
+          <KpiCard label="On leave today" value={leaveOverview?.staff_on_leave_today ?? 0} tone="violet" />
+          <KpiCard label="Approved (range)" value={leaveOverview?.approved_this_month ?? 0} tone="emerald" />
+          <KpiCard label="My approvals queue" value={myLeaveInbox?.approval_queue_count ?? 0} tone="amber" />
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-bold text-slate-900 dark:text-white">Visual insights</h2>
+        <p className="text-sm text-slate-500 dark:text-slate-400">Attendance mix plus leave pipeline and decisions in one view.</p>
+        <div className="grid gap-6 xl:grid-cols-3">
+          <AttendanceTodayDonut summary={s} />
+          <div className="xl:col-span-2">
+            <LeaveInsightCharts leaveOverview={leaveOverview} />
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Link to={ROUTES.HR.DASHBOARD_ATTENDANCE} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">Open attendance details</Link>
+          <Link to={ROUTES.HR.DASHBOARD_LEAVE} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">Open leave details</Link>
+          <Link to={ROUTES.HR.ORGANIZATION} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">Open organization details</Link>
+          <Link to={ROUTES.HR.REPORTS} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">Open full reports</Link>
+        </div>
+      </section>
+
       <QuickLinksSection
         title="Quick access"
-        description="Jump to the tools you use most - charts and deep lists live on each dedicated dashboard."
+        description="Detailed workflows and full tables."
       >
         <QuickLinkCard
           to={ROUTES.HR.DASHBOARD_ATTENDANCE}
@@ -144,13 +148,6 @@ export function HRDashboard() {
           title="Organization dashboard"
           description="Headcount, gender, age bands, departments, and branches."
           accent="emerald"
-        />
-        <QuickLinkCard
-          to={ROUTES.HR.REPORTS}
-          emoji="📊"
-          title="Reports hub"
-          description="Daily & monthly attendance, raw export, recognition, and leave analytics with CSV export."
-          accent="primary"
         />
         <QuickLinkCard
           to={ROUTES.HR.LEAVE_ORGANIZATION}
@@ -188,122 +185,27 @@ export function HRDashboard() {
           accent="primary"
         />
       </QuickLinksSection>
-
-      {leaveOverview && (
-        <section className="grid gap-4 sm:grid-cols-3">
-          <StatTile
-            label="Pending leave (all stages)"
-            value={leaveOverview.pending_total ?? 0}
-            hint="Open Approvals inbox to clear the queue."
-            variant="amber"
-          />
-          <StatTile
-            label="On approved leave today"
-            value={leaveOverview.staff_on_leave_today ?? 0}
-            hint="Distinct people with approved leave overlapping today."
-            variant="green"
-          />
-          <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft flex flex-col justify-center">
-            <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-slate-500 dark:text-slate-400">Leave shortcuts</p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Link
-                to={ROUTES.HR.LEAVE_ORGANIZATION}
-                className="text-sm font-medium text-primary-600 dark:text-primary-400 hover:underline"
-              >
-                Calendar view
-              </Link>
-              <span className="text-slate-300 dark:text-slate-600">·</span>
-              <Link to={ROUTES.HR.REPORTS} className="text-sm font-medium text-primary-600 dark:text-primary-400 hover:underline">
-                Leave report CSV
-              </Link>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {leaveOverview?.on_leave_today_detail?.length > 0 && (
-        <section className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft">
-          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-3">
-            <div>
-              <h2 className="text-lg font-bold text-slate-900 dark:text-white">On approved leave today</h2>
-              <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-                People with approved leave overlapping today (HR also receives email when requests are approved or assigned).
-              </p>
-            </div>
-            <Link
-              to={ROUTES.HR.LEAVE_ORGANIZATION}
-              className="text-sm font-semibold text-primary-600 dark:text-primary-400 hover:underline shrink-0"
-            >
-              Open leave calendar
-            </Link>
-          </div>
-          <ul className="flex flex-wrap gap-2">
-            {leaveOverview.on_leave_today_detail.slice(0, 24).map((r) => (
-              <li
-                key={r.id || `${r.user_id}-${r.start_date}`}
-                className="inline-flex flex-col px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-slate-100 dark:border-slate-700 text-sm max-w-[220px]"
-              >
-                <span className="font-medium text-slate-900 dark:text-white truncate">{r.full_name || 'Employee'}</span>
-                <span className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                  {r.leave_type_name || 'Leave'} · {r.start_date} to {r.end_date}
-                </span>
-                {r.department && <span className="text-[11px] text-slate-400 mt-0.5 truncate">{r.department}</span>}
-              </li>
-            ))}
-          </ul>
-          {leaveOverview.on_leave_today_detail.length > 24 && (
-            <p className="text-xs text-slate-500 mt-3">Showing 24 of {leaveOverview.staff_on_leave_today ?? 'many'}; open the calendar for the full list.</p>
-          )}
-        </section>
-      )}
-
-      <section>
-        <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-2">Today’s attendance</h2>
-        <p className="text-sm text-slate-500 dark:text-slate-400 mb-5">
-          Live counts refresh about every 15 seconds. Trends, donut chart, and clock-in feed are on the{' '}
-          <Link to={ROUTES.HR.DASHBOARD_ATTENDANCE} className="font-medium text-primary-600 dark:text-primary-400 hover:underline">
-            Attendance dashboard
-          </Link>
-          .
-        </p>
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-5">
-          {statCard('Present', present, `${pctOnTime}% on time`, 'text-green-600 dark:text-green-400', 'on_time', 'On time today')}
-          {statCard('Late', late, `${pctLate}% of present`, 'text-amber-600 dark:text-amber-400', 'late', 'Late arrivals')}
-          {statCard('Absent', absent, `${pctAbsent}% (no clock-in)`, 'text-red-600 dark:text-red-400', 'absent', 'Did not clock in')}
-          {statCard('No clock-out', noClockOut, 'Still clocked in', 'text-blue-600 dark:text-blue-400', 'no_clock_out', 'Did not clock out')}
-          <motion.div
-            className="rounded-2xl border border-primary-200/60 dark:border-primary-900/40 bg-gradient-to-br from-primary-50/90 to-white dark:from-primary-950/35 dark:to-slate-900/80 p-5 shadow-soft"
-            whileHover={{ y: -2 }}
-            transition={{ duration: 0.2 }}
-          >
-            <p className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-[0.08em]">Total staff</p>
-            <p className="text-3xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">{totalStaff}</p>
-            <Link to={ROUTES.HR.DASHBOARD_ATTENDANCE} className="text-sm font-medium text-primary-600 dark:text-primary-400 hover:underline mt-3 inline-block">
-              Attendance dashboard →
-            </Link>
-          </motion.div>
-        </div>
-      </section>
-
-      {modal && <UserListModal title={modal.title} users={modal.list} onClose={() => setModal(null)} />}
-
-      {absent > 0 && (
-        <div className="rounded-2xl border border-red-200 dark:border-red-900/40 bg-red-50/40 dark:bg-red-950/20 p-6">
-          <h2 className="font-semibold text-gray-900 dark:text-white mb-1">Absent today</h2>
-          <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">No clock-in recorded for these staff.</p>
-          <ul className="flex flex-wrap gap-2">
-            {(users.absent || []).map((u, i) => (
-              <li
-                key={u.user_id || i}
-                className="inline-flex items-center px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-red-100 dark:border-red-900/50 text-red-900 dark:text-red-200 text-sm shadow-sm"
-              >
-                <span className="font-medium">{u.full_name || '-'}</span>
-                {u.email && <span className="ml-2 text-red-700/80 dark:text-red-300/90 text-xs">{u.email}</span>}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
     </motion.div>
+  );
+}
+
+function KpiCard({ label, value, tone = 'slate' }) {
+  const toneClass =
+    tone === 'emerald'
+      ? 'text-emerald-700 dark:text-emerald-300'
+      : tone === 'violet'
+        ? 'text-violet-700 dark:text-violet-300'
+        : tone === 'amber'
+          ? 'text-amber-700 dark:text-amber-300'
+          : tone === 'rose'
+            ? 'text-rose-700 dark:text-rose-300'
+            : tone === 'sky'
+              ? 'text-sky-700 dark:text-sky-300'
+              : 'text-slate-900 dark:text-white';
+  return (
+    <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/80 bg-white dark:bg-slate-900/80 p-4 shadow-soft">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{label}</p>
+      <p className={`mt-2 text-3xl font-extrabold tabular-nums ${toneClass}`}>{Number(value || 0)}</p>
+    </div>
   );
 }

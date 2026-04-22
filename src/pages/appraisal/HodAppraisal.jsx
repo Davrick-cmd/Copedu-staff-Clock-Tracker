@@ -110,7 +110,7 @@ export function HodAppraisal() {
 
   const kpis = data?.kpis_pending_approve || [];
   const appraisals = data?.appraisals_pending_approve || [];
-  const overview = data?.department_overview || [];
+  const overview = data?.team_overview || data?.department_overview || [];
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
@@ -178,7 +178,7 @@ export function HodAppraisal() {
       </div>
 
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
-        <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Department overview</h2>
+        <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Team overview</h2>
         {overview.length === 0 ? <EmptyState title="No data" /> : (
           <ul className="space-y-2 text-sm">
             {overview.map((o) => (

@@ -227,7 +227,9 @@ export function RecognitionFeed() {
   return (
     <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 backdrop-blur-sm shadow-soft p-6 md:p-8">
       <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-2">Recognition</h2>
-      <p className="text-sm text-slate-500 dark:text-slate-400 mb-6 leading-relaxed">Share recognition by type. In the message or comments, type @ to mention colleagues by name.</p>
+      <p className="text-sm text-slate-500 dark:text-slate-400 mb-6 leading-relaxed">
+        Share recognition by type. In the message or comments, type @ to mention colleagues by name. Posts are removed automatically after five working days (Monday–Friday).
+      </p>
 
       <form onSubmit={handleSubmit} className="mb-6 space-y-3">
         <div>

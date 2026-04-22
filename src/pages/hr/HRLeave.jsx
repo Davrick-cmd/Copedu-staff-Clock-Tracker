@@ -4,6 +4,7 @@ import { useSelector } from 'react-redux';
 import * as api from '../../services/api';
 import { useToast } from '../../hooks/useToast';
 import { ROUTES, ROLES } from '../../utils/constants';
+import { LeaveBackLink, LeaveHubNav } from '../../components/LeaveHubNav';
 
 export function HRLeave() {
   const toast = useToast();
@@ -48,8 +49,19 @@ export function HRLeave() {
     }
   };
 
+  const remind = async (id) => {
+    try {
+      await api.remindLeaveApprover(id);
+      toast('Reminder sent to current supervisor approver', 'success');
+    } catch (err) {
+      toast(err?.response?.data?.detail || 'Failed to send reminder', 'error');
+    }
+  };
+
   return (
     <div className="space-y-6">
+      <LeaveBackLink />
+      <LeaveHubNav role={role} />
       <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Leave Approvals & Reports</h1>
       <p className="text-sm text-gray-600 dark:text-gray-400 max-w-3xl leading-relaxed">
         Your inbox lists requests where <strong>you</strong> are the current approver. The <strong>first</strong> approver is always the
@@ -58,7 +70,7 @@ export function HRLeave() {
         <Link to={ROUTES.EMPLOYEE.TEAM_LEAVE} className="font-medium text-primary-600 dark:text-primary-400 hover:underline">
           Team leave balances
         </Link>{' '}
-        to assign approved leave to your staff (managers: direct reports; HOD: same department).
+        to assign approved leave to your staff (managers and HOD: direct reports only).
         {(role === ROLES.HR || role === ROLES.ADMIN) && (
           <>
             {' '}
@@ -79,8 +91,8 @@ export function HRLeave() {
         <div className="space-y-3">
           <p className="text-xs text-gray-500 dark:text-gray-400">
             Snapshot uses default period (last ~year). Full breakdown:{' '}
-            <Link to={`${ROUTES.HR.REPORTS}?mode=leave`} className="text-primary-600 dark:text-primary-400 font-medium hover:underline">
-              HR → Reports → Leave
+            <Link to={ROUTES.HR.REPORTS_LEAVE} className="text-primary-600 dark:text-primary-400 font-medium hover:underline">
+              Reports → Leave reports
             </Link>
             .
           </p>
@@ -155,6 +167,9 @@ export function HRLeave() {
                   <button type="button" onClick={() => action(r.id, 'approve')} className="text-green-600 hover:underline">Approve</button>
                   <button type="button" onClick={() => action(r.id, 'return')} className="text-amber-600 hover:underline">Return</button>
                   <button type="button" onClick={() => action(r.id, 'reject')} className="text-red-600 hover:underline">Reject</button>
+                  {(role === ROLES.HR || role === ROLES.ADMIN) && (
+                    <button type="button" onClick={() => remind(r.id)} className="text-blue-600 hover:underline">Remind supervisor</button>
+                  )}
                 </td>
               </tr>
             ))}

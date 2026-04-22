@@ -1,7 +1,15 @@
+/**
+ * Guards routes that require authentication (and optionally a role allow-list).
+ *
+ * - No session → redirect to login (preserves `location` in state for future deep-link restore).
+ * - Session but wrong role → redirect to that role’s default home (see `roleBasePath`).
+ * - `loading` true while `loadSession` runs → show a simple spinner to avoid flash of login.
+ */
 import { Navigate, useLocation } from 'react-router-dom';
 import { useSelector } from 'react-redux';
 import { ROLES, ROUTES } from '../utils/constants';
 
+/** Default landing route per role when user hits a page their role cannot access. */
 const roleBasePath = {
   [ROLES.ADMIN]: ROUTES.ADMIN.DASHBOARD,
   [ROLES.HR]: ROUTES.HR.DASHBOARD,

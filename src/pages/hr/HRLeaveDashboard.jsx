@@ -53,9 +53,51 @@ export function HRLeaveDashboard() {
         </div>
       )}
 
+      <section className="space-y-3">
+        <h2 className="text-lg font-bold text-slate-900 dark:text-white">Leave summary</h2>
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Clear numbers first. Use the detail links below when you need full tables and workflows.
+        </p>
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-5">
+          <KpiCard label="Pending total" value={leaveOverview?.pending_total ?? 0} tone="violet" />
+          <KpiCard label="Awaiting supervisor" value={leaveOverview?.pipeline?.pending_manager ?? 0} tone="amber" />
+          <KpiCard label="Awaiting HOD" value={leaveOverview?.pipeline?.pending_hod ?? 0} tone="sky" />
+          <KpiCard label="Awaiting HR" value={leaveOverview?.pipeline?.pending_hr ?? 0} tone="slate" />
+          <KpiCard label="On leave today" value={leaveOverview?.staff_on_leave_today ?? 0} tone="emerald" />
+        </div>
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
+          <KpiCard label="Approved (range)" value={leaveOverview?.approved_this_month ?? 0} tone="emerald" />
+          <KpiCard label="Rejected (range)" value={leaveOverview?.rejected_this_month ?? 0} tone="rose" />
+          <KpiCard label="My queue" value={myLeaveInbox?.approval_queue_count ?? 0} tone="amber" />
+          <KpiCard label="Recent pending" value={leaveOverview?.recent_pending?.length ?? 0} tone="violet" />
+        </div>
+      </section>
+
+      <section className="space-y-2">
+        <h2 className="text-lg font-bold text-slate-900 dark:text-white">Leave at a glance</h2>
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Pie and bar charts for quick understanding. Open detail pages only when you need deeper records.
+        </p>
+        <LeaveInsightCharts leaveOverview={leaveOverview} />
+        <div className="flex flex-wrap gap-2 pt-1">
+          <Link to={ROUTES.HR.LEAVE_OVERVIEW} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+            Open leave overview details
+          </Link>
+          <Link to={ROUTES.HR.LEAVE} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+            Open approvals inbox
+          </Link>
+          <Link to={ROUTES.HR.LEAVE_ORGANIZATION} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+            Open organization leave
+          </Link>
+          <Link to={ROUTES.HR.LEAVE_BALANCES} className="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+            Open leave balances
+          </Link>
+        </div>
+      </section>
+
       <QuickLinksSection
         title="Leave tools"
-        description="Everything for requests, coverage, and balances - full detail tables live on each screen."
+        description="Need to take action? Open the full workflow/detail screens below."
       >
         <QuickLinkCard
           to={ROUTES.HR.LEAVE}
@@ -86,14 +128,27 @@ export function HRLeaveDashboard() {
           accent="slate"
         />
       </QuickLinksSection>
-
-      <section className="space-y-2">
-        <h2 className="text-lg font-bold text-slate-900 dark:text-white">Leave at a glance</h2>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          Pipeline, monthly outcomes, and who is out today by leave type - detail tables stay on Leave overview.
-        </p>
-        <LeaveInsightCharts leaveOverview={leaveOverview} />
-      </section>
     </motion.div>
+  );
+}
+
+function KpiCard({ label, value, tone = 'slate' }) {
+  const toneClass =
+    tone === 'emerald'
+      ? 'text-emerald-700 dark:text-emerald-300'
+      : tone === 'violet'
+        ? 'text-violet-700 dark:text-violet-300'
+        : tone === 'amber'
+          ? 'text-amber-700 dark:text-amber-300'
+          : tone === 'rose'
+            ? 'text-rose-700 dark:text-rose-300'
+            : tone === 'sky'
+              ? 'text-sky-700 dark:text-sky-300'
+              : 'text-slate-900 dark:text-white';
+  return (
+    <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/80 bg-white dark:bg-slate-900/80 p-4 shadow-soft">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{label}</p>
+      <p className={`mt-2 text-3xl font-extrabold tabular-nums ${toneClass}`}>{Number(value || 0)}</p>
+    </div>
   );
 }

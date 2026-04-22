@@ -35,6 +35,22 @@ function initials(name) {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
+/** Renders full name with extra space between given name(s) and family name (last token). */
+function ProfileDisplayName({ name }) {
+  const parts = (name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2) {
+    return <>{name || ''}</>;
+  }
+  const last = parts[parts.length - 1];
+  const rest = parts.slice(0, -1).join(' ');
+  return (
+    <>
+      <span className="inline-block">{rest}</span>
+      <span className="inline-block ml-3 sm:ml-4">{last}</span>
+    </>
+  );
+}
+
 function Countdown({ workStart, threshold, onTick }) {
   const [secs, setSecs] = useState(() => secondsUntilLate(workStart, threshold));
   useEffect(() => {
@@ -292,8 +308,8 @@ export function EmployeeDashboard() {
         </div>
       </motion.div>
 
-      {/* Profile + leave + colleagues */}
-      <div className="grid gap-5 lg:grid-cols-12 lg:items-stretch">
+      {/* Profile + leave + colleagues — items-start so short cards (e.g. on leave today) are not stretched to match the leave list height */}
+      <div className="grid gap-5 lg:grid-cols-12 lg:items-start">
         <motion.div
           className={`lg:col-span-5 ${cardSurface} p-6 sm:p-7 flex flex-col ring-1 ring-slate-200/50 dark:ring-slate-700/50 min-w-0`}
           initial={{ opacity: 0, y: 8 }}
@@ -311,11 +327,22 @@ export function EmployeeDashboard() {
                 {greeting()}
               </p>
               <h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white leading-snug break-words">
-                {displayName}
+                <ProfileDisplayName name={displayName} />
               </h2>
               {(empId || staffCode) && (
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono tabular-nums">
-                  {[empId, staffCode].filter(Boolean).join(' · ')}
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+                  <span className="font-semibold text-slate-600 dark:text-slate-300">Employee Code</span>
+                  <span className="mx-0.5">:</span>
+                  <span className="font-mono tabular-nums text-slate-700 dark:text-slate-200">
+                    {staffCode != null && String(staffCode).trim() !== '' ? staffCode : empId}
+                  </span>
+                  {staffCode != null && String(staffCode).trim() !== '' && empId != null && String(empId).trim() !== '' && String(staffCode).trim() !== String(empId).trim() && (
+                    <span className="block mt-0.5 text-[11px] text-slate-400 dark:text-slate-500">
+                      <span className="font-medium">Employee ID</span>
+                      <span className="mx-0.5">:</span>
+                      <span className="font-mono tabular-nums">{empId}</span>
+                    </span>
+                  )}
                 </p>
               )}
             </div>
@@ -457,12 +484,17 @@ export function EmployeeDashboard() {
             <div>
               <h2 className="text-base font-bold text-slate-900 dark:text-white">Available leave</h2>
               {leaveDash && (
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Year {leaveDash.year} · Total remaining:{' '}
-                  <span className="font-semibold text-slate-800 dark:text-slate-100 tabular-nums">
-                    {Number(leaveDash.total_remaining_days ?? 0).toFixed(1)} days
-                  </span>
-                </p>
+                <>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Year {leaveDash.year} · Total remaining:{' '}
+                    <span className="font-semibold text-slate-800 dark:text-slate-100 tabular-nums">
+                      {Number(leaveDash.total_remaining_days ?? 0).toFixed(1)} days
+                    </span>
+                  </p>
+                  {leaveDash.balances_effective_year_note && (
+                    <p className="text-xs text-amber-800 dark:text-amber-200/90 mt-1">{leaveDash.balances_effective_year_note}</p>
+                  )}
+                </>
               )}
             </div>
             <Link
@@ -475,7 +507,7 @@ export function EmployeeDashboard() {
           {!leaveDash ? (
             <div className="flex justify-center py-8 text-slate-500 dark:text-slate-400 text-sm">Loading balances…</div>
           ) : (
-            <ul className="space-y-4 flex-1">
+            <ul className="space-y-4 max-h-[min(26rem,52vh)] overflow-y-auto overflow-x-hidden pr-1 -mr-1">
               {(leaveDash.balances || []).map((b, i) => {
                 const alloc = Number(b.allocated_days ?? 0);
                 const rem = Number(b.remaining_days ?? 0);
@@ -505,7 +537,7 @@ export function EmployeeDashboard() {
         </motion.div>
 
         <motion.div
-          className={`lg:col-span-3 ${cardSurface} p-6 flex flex-col`}
+          className={`lg:col-span-3 ${cardSurface} p-5 sm:p-6 flex flex-col h-fit`}
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.1 }}
@@ -517,14 +549,14 @@ export function EmployeeDashboard() {
               : 'Colleagues in your department'}
           </p>
           {!colleaguesLeave ? (
-            <div className="flex justify-center py-8 text-slate-500 dark:text-slate-400 text-sm flex-1 items-center">Loading…</div>
+            <div className="flex justify-center py-6 text-slate-500 dark:text-slate-400 text-sm">Loading…</div>
           ) : colleaguesLeave.department == null ? (
-            <div className="rounded-xl bg-slate-50/80 dark:bg-slate-800/40 border border-dashed border-slate-200 dark:border-slate-600 px-4 py-6 text-center text-sm text-slate-600 dark:text-slate-400 flex-1 flex items-center justify-center">
+            <div className="rounded-xl bg-slate-50/80 dark:bg-slate-800/40 border border-dashed border-slate-200 dark:border-slate-600 px-4 py-5 text-center text-sm text-slate-600 dark:text-slate-400">
               Add your department in employee records to see who else is off.
             </div>
           ) : (colleaguesLeave.rows || []).length === 0 ? (
-            <div className="rounded-xl bg-slate-50/80 dark:bg-slate-800/30 border border-slate-200/90 dark:border-slate-700 px-4 py-8 text-center text-sm text-slate-600 dark:text-slate-400 flex-1 flex flex-col items-center justify-center gap-2">
-              <span className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-lg" aria-hidden>
+            <div className="rounded-xl bg-slate-50/80 dark:bg-slate-800/30 border border-slate-200/90 dark:border-slate-700 px-4 py-5 text-center text-sm text-slate-600 dark:text-slate-400 flex flex-col items-center gap-2">
+              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-base" aria-hidden>
                 ✓
               </span>
               No colleague in your department is on leave today.

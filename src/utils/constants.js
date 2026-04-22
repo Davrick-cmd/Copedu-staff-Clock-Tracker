@@ -1,9 +1,22 @@
-// App name and role constants
+/**
+ * Shared frontend constants: product naming, routes, roles, departments.
+ * Keep route paths aligned with `src/routes/index.jsx` and sidebar link definitions.
+ * Reports: `REPORTS` is the hub; `REPORTS_ATTENDANCE` / `REPORTS_LEAVE` / `REPORTS_RECOGNITION` are module-scoped.
+ */
 export const APP_NAME = 'copedustaffclocktracker';
 /** Short product name (headers, login). */
 export const APP_DISPLAY_NAME = 'Copedu HR Suite';
 /** Full formal product name (marketing, login). */
 export const APP_FORMAL_NAME = 'Copedu Human Resource Suite';
+
+/**
+ * Brand logo served as a static URL (Vite `public/` → site root).
+ * Replace `public/images/copedu-logo.jpeg` when marketing updates the asset; optional copy from repo `/images/`.
+ */
+export const APP_LOGO_SRC = '/images/copedu-logo.jpeg';
+
+/** In-app and login-page contact for staff who need HR assistance. */
+export const HR_SUPPORT_EMAIL = 'hr@copeduplc.rw';
 
 export const ROLES = {
   ADMIN: 'admin',
@@ -54,7 +67,13 @@ export const ROUTES = {
     DASHBOARD_LEAVE: '/hr/dashboard-leave',
     ORGANIZATION: '/hr/organization',
     EMPLOYEES: '/hr/employees',
+    /** Reports landing (pick a module); use scoped paths for direct entry. */
     REPORTS: '/hr/reports',
+    REPORTS_ATTENDANCE: '/hr/reports/attendance',
+    REPORTS_LEAVE: '/hr/reports/leave',
+    REPORTS_RECOGNITION: '/hr/reports/recognition',
+    REPORTS_PERFORMANCE: '/hr/reports/performance',
+    REPORTS_ORGANIZATION: '/hr/reports/organization',
     LEAVE_BALANCES: '/hr/leave-balances',
     FLAGGED: '/hr/flagged',
     ANNOUNCEMENTS: '/hr/announcements',

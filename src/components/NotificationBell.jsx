@@ -1,6 +1,22 @@
+/**
+ * Header bell: unread count from `/notifications/unread-count`, list from `/notifications`.
+ * Polling interval is fixed in `refreshCount`’s interval (keep lightweight for SQLite backend).
+ */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import * as api from '../services/api';
+
+const NOTIFICATION_KIND_LABELS = {
+  recognition_mention: 'Recognition',
+  leave_pending: 'Leave',
+  appraisal_pending: 'Appraisal',
+  staff_certificate: 'HR',
+};
+
+function notificationKindLabel(kind) {
+  if (!kind) return '';
+  return NOTIFICATION_KIND_LABELS[kind] || kind.replace(/_/g, ' ');
+}
 
 export function NotificationBell() {
   const navigate = useNavigate();
@@ -8,6 +24,7 @@ export function NotificationBell() {
   const [count, setCount] = useState(0);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [panelStyle, setPanelStyle] = useState({});
   const rootRef = useRef(null);
 
   const refreshCount = useCallback(() => {
@@ -36,11 +53,27 @@ export function NotificationBell() {
 
   useEffect(() => {
     if (!open) return;
+    const placePanel = () => {
+      const el = rootRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const maxWidth = Math.min(window.innerWidth - 16, 352);
+      const left = Math.max(8, Math.min(rect.right - maxWidth, window.innerWidth - maxWidth - 8));
+      const top = Math.min(rect.bottom + 6, window.innerHeight - 120);
+      setPanelStyle({ left: `${left}px`, top: `${top}px`, width: `${maxWidth}px` });
+    };
+    placePanel();
+    window.addEventListener('resize', placePanel);
+    window.addEventListener('scroll', placePanel, true);
     const onDoc = (e) => {
       if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
     };
     document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      window.removeEventListener('resize', placePanel);
+      window.removeEventListener('scroll', placePanel, true);
+    };
   }, [open]);
 
   const onPick = async (n) => {
@@ -60,6 +93,19 @@ export function NotificationBell() {
       await api.markAllNotificationsRead();
       setItems((prev) => prev.map((x) => ({ ...x, read_at: x.read_at || new Date().toISOString() })));
       refreshCount();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const clearAll = async () => {
+    if (!items.length) return;
+    const ok = window.confirm('Clear all notifications? This cannot be undone.');
+    if (!ok) return;
+    try {
+      await api.clearAllNotifications();
+      setItems([]);
+      setCount(0);
     } catch {
       /* ignore */
     }
@@ -89,14 +135,24 @@ export function NotificationBell() {
         )}
       </button>
       {open && (
-        <div className="absolute right-0 mt-1 w-[min(100vw-2rem,22rem)] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-xl z-[100] overflow-hidden">
+        <div
+          style={panelStyle}
+          className="fixed rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-xl z-[120] overflow-hidden"
+        >
           <div className="flex items-center justify-between px-3 py-2 border-b border-slate-100 dark:border-slate-800">
             <span className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Alerts</span>
-            {items.some((i) => !i.read_at) && (
-              <button type="button" onClick={markAll} className="text-xs font-medium text-primary-600 dark:text-primary-400 hover:underline">
-                Mark all read
-              </button>
-            )}
+            <div className="flex items-center gap-3">
+              {items.some((i) => !i.read_at) && (
+                <button type="button" onClick={markAll} className="text-xs font-medium text-primary-600 dark:text-primary-400 hover:underline">
+                  Mark all read
+                </button>
+              )}
+              {!!items.length && (
+                <button type="button" onClick={clearAll} className="text-xs font-medium text-rose-600 dark:text-rose-400 hover:underline">
+                  Clear all
+                </button>
+              )}
+            </div>
           </div>
           <div className="max-h-72 overflow-y-auto">
             {loading && <p className="px-3 py-4 text-sm text-slate-500 text-center">Loading…</p>}
@@ -113,7 +169,7 @@ export function NotificationBell() {
                 >
                   <p className="text-sm font-medium text-slate-900 dark:text-white leading-snug">{n.title}</p>
                   {n.body && <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2">{n.body}</p>}
-                  <p className="text-[10px] text-slate-400 mt-1">{n.kind}</p>
+                  <p className="text-[10px] text-slate-400 mt-1 capitalize">{notificationKindLabel(n.kind)}</p>
                 </button>
               ))}
           </div>

@@ -1,11 +1,22 @@
 /**
- * API service layer: all backend calls go through the Python API (SQLite).
- * Auth: JWT stored in localStorage; sent as Authorization header.
+ * API service layer: all HTTP calls to the FastAPI backend.
+ *
+ * - Base URL: `VITE_API_BASE_URL` or localhost (see `.env` / Vite docs).
+ * - JWT: kept in runtime memory only; request interceptor attaches `Authorization: Bearer`.
+ * - 401 responses clear runtime token so navigation treats user as signed out.
  */
 import axios from 'axios';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
-const TOKEN_KEY = 'copedu_token';
+let authToken = null;
+
+function getAuthToken() {
+  return authToken;
+}
+
+function setAuthToken(token) {
+  authToken = token ? String(token) : null;
+}
 
 export const api = axios.create({
   baseURL: API_BASE,
@@ -14,7 +25,7 @@ export const api = axios.create({
 });
 
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = getAuthToken();
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
@@ -22,13 +33,13 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (r) => r,
   (err) => {
-    if (err.response?.status === 401) localStorage.removeItem(TOKEN_KEY);
+    if (err.response?.status === 401) setAuthToken(null);
     return Promise.reject(err);
   }
 );
 
 function getAuthHeader() {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
@@ -36,23 +47,23 @@ function getAuthHeader() {
 /** Login: identifier = email (app user) or AD username / UPN (domain user). Backend expects "identifier" + "password". */
 export async function signIn(identifier, password) {
   const { data } = await api.post('/auth/login', { identifier: identifier || '', password: password || '' });
-  if (data.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+  if (data.access_token) setAuthToken(data.access_token);
   return { session: data.session, profile: data.profile };
 }
 
 /** Sign in with Active Directory / LDAP (username + password). Same endpoint, sends identifier. */
 export async function signInWithAD(adUsername, password) {
   const { data } = await api.post('/auth/login', { identifier: adUsername || '', password: password || '' });
-  if (data.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+  if (data.access_token) setAuthToken(data.access_token);
   return { session: data.session, profile: data.profile };
 }
 
 export async function signOut() {
-  localStorage.removeItem(TOKEN_KEY);
+  setAuthToken(null);
 }
 
 export async function getSession() {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = getAuthToken();
   if (!token) return null;
   try {
     const { data } = await api.get('/auth/me', { headers: { Authorization: `Bearer ${token}` } });
@@ -246,6 +257,12 @@ export async function getRecognitionReport(params = {}) {
   return data;
 }
 
+/** HR/Admin: KPI and appraisal pipeline by appraisal cycle (for reports). */
+export async function getAppraisalPerformanceReport(params = {}) {
+  const { data } = await api.get('/reports/appraisal-performance', { params });
+  return data;
+}
+
 // ---------- Branches ----------
 export async function getBranches() {
   const { data } = await api.get('/branches');
@@ -266,10 +283,25 @@ export async function deleteBranch(id) {
   await api.delete(`/branches/${id}`);
 }
 
+export async function getDepartmentOptions() {
+  const { data } = await api.get('/departments/options');
+  return data?.rows || [];
+}
+
+export async function createDepartment(name) {
+  const { data } = await api.post('/departments', { name });
+  return data || {};
+}
+
 // ---------- Audit ----------
 export async function getAuditLogs(limit = 100) {
   const { data } = await api.get('/audit', { params: { limit } });
   return data || [];
+}
+
+export async function getAdminSystemReport() {
+  const { data } = await api.get('/admin/system-report');
+  return data || {};
 }
 
 export async function createAuditLog(payload) {
@@ -290,6 +322,16 @@ export async function getWorkHours() {
 
 export async function setSetting(key, value) {
   await api.patch('/settings', { key, value: typeof value === 'string' ? value : JSON.stringify(value) });
+}
+
+export async function getAdminDataMaintenanceSummary(params = {}) {
+  const { data } = await api.get('/admin/data-maintenance/summary', { params });
+  return data || {};
+}
+
+export async function runAdminDataCleanup(payload) {
+  const { data } = await api.post('/admin/data-maintenance/cleanup', payload);
+  return data || {};
 }
 
 // ---------- HR Documents ----------
@@ -316,7 +358,7 @@ export async function uploadHrDocument(file, title) {
 
 /** Fetch HR document file as blob for download/print. */
 export async function getHrDocumentFileBlob(documentId) {
-  const token = localStorage.getItem('copedu_token');
+  const token = getAuthToken();
   const res = await fetch(`${API_BASE}/hr-documents/${documentId}/file`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
@@ -332,12 +374,13 @@ export async function getStaffDocuments(subjectUserId) {
   return data || [];
 }
 
-export async function uploadStaffDocument(file, title, kind, subjectUserId) {
+export async function uploadStaffDocument(file, title, kind, subjectUserId, appraisalId = null) {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('title', title || file.name || 'Document');
   formData.append('kind', kind);
   formData.append('subject_user_id', subjectUserId);
+  if (appraisalId) formData.append('appraisal_id', appraisalId);
   const { data } = await api.post('/staff-documents/upload', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   });
@@ -350,7 +393,7 @@ export async function deleteStaffDocument(documentId) {
 }
 
 export async function getStaffDocumentFileBlob(documentId) {
-  const token = localStorage.getItem('copedu_token');
+  const token = getAuthToken();
   const res = await fetch(`${API_BASE}/staff-documents/${documentId}/file`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
@@ -376,6 +419,11 @@ export async function markNotificationRead(notificationId) {
 
 export async function markAllNotificationsRead() {
   const { data } = await api.post('/notifications/mark-all-read');
+  return data;
+}
+
+export async function clearAllNotifications() {
+  const { data } = await api.delete('/notifications');
   return data;
 }
 
@@ -657,15 +705,32 @@ export async function updateAppraisalScore(appraisalId, kpiItemId, payload) {
   return data;
 }
 
+export async function confirmAppraisalAgreedScores(appraisalId) {
+  const { data } = await api.post(`/appraisal/appraisals/${appraisalId}/confirm-agreed-scores`);
+  return data;
+}
+
+/** Returns HTML blob for print / Save as PDF (auth via axios). */
+export async function fetchAppraisalAgreedSummaryBlob(appraisalId) {
+  const res = await api.get(`/appraisal/appraisals/${appraisalId}/agreed-summary`, { responseType: 'blob' });
+  return res.data;
+}
+
 // ---------- Leave ----------
 export async function getLeaveTypes() {
   const { data } = await api.get('/leave/types');
   return data || [];
 }
 
-/** Admin only: create a new leave type (unique code). */
+/** HR/Admin: create a new leave type (unique code). */
 export async function createLeaveType(payload) {
   const { data } = await api.post('/leave/types', payload);
+  return data;
+}
+
+/** Admin only: deactivate (delete) a leave type. */
+export async function deleteLeaveType(leaveTypeId) {
+  const { data } = await api.delete(`/leave/types/${leaveTypeId}`);
   return data;
 }
 
@@ -676,6 +741,12 @@ export async function getMyLeaveRequests() {
 
 export async function createLeaveRequest(payload) {
   const { data } = await api.post('/leave/requests', payload);
+  return data;
+}
+
+/** Owner (draft/returned) or HR/Admin: edit leave request dates/type/reason. */
+export async function updateLeaveRequest(leaveRequestId, payload) {
+  const { data } = await api.patch(`/leave/requests/${leaveRequestId}`, payload);
   return data;
 }
 
@@ -715,6 +786,16 @@ export async function returnLeaveRequest(leaveRequestId, comment) {
   return data;
 }
 
+export async function remindLeaveApprover(leaveRequestId) {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/remind-approver`);
+  return data;
+}
+
+export async function rescheduleApprovedLeaveRequest(leaveRequestId, payload) {
+  const { data } = await api.post(`/leave/requests/${leaveRequestId}/reschedule`, payload);
+  return data;
+}
+
 export async function getLeaveWorkflow(leaveRequestId) {
   const { data } = await api.get(`/leave/requests/${leaveRequestId}/workflow`);
   return data;
@@ -725,8 +806,44 @@ export async function getLeaveReportSummary(params = {}) {
   return data;
 }
 
+export async function getLeaveWorkflowAnalytics(params = {}) {
+  const { data } = await api.get('/leave/reports/workflow-analytics', { params });
+  return data;
+}
+
 export async function getLeaveBalances(params = {}) {
   const { data } = await api.get('/leave/balances', { params });
+  return data;
+}
+
+/** HR/Admin only: apply year-end rollover (base entitlement + previous-year carry-over). */
+export async function postLeaveHrRecomputeStatutoryAnnual(params = {}) {
+  const { data } = await api.post('/leave/hr/recompute-statutory-annual', {}, { params });
+  return data;
+}
+
+export async function getLeaveBalanceAdjustments(params = {}) {
+  const { data } = await api.get('/leave/hr/balance-adjustments', { params });
+  return data || { rows: [], limit: 0 };
+}
+
+export async function createLeaveBalanceAdjustment(payload) {
+  const { data } = await api.post('/leave/hr/balance-adjustments', payload);
+  return data;
+}
+
+export async function assignLeaveTypeToEmployee(payload) {
+  const { data } = await api.post('/leave/hr/assign-type', payload);
+  return data;
+}
+
+export async function approveLeaveBalanceAdjustment(adjustmentId, comment = '') {
+  const { data } = await api.post(`/leave/hr/balance-adjustments/${adjustmentId}/approve`, { comment });
+  return data;
+}
+
+export async function rejectLeaveBalanceAdjustment(adjustmentId, comment) {
+  const { data } = await api.post(`/leave/hr/balance-adjustments/${adjustmentId}/reject`, { comment });
   return data;
 }
 
@@ -735,8 +852,8 @@ export async function getLeaveMyDashboard() {
   return data;
 }
 
-export async function getLeaveOverview() {
-  const { data } = await api.get('/leave/overview');
+export async function getLeaveOverview(params = {}) {
+  const { data } = await api.get('/leave/overview', { params });
   return data;
 }
 

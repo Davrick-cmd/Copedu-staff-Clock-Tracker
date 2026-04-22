@@ -1,19 +1,22 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import * as api from '../../services/api';
 import { useToast } from '../../hooks/useToast';
-import { ROUTES } from '../../utils/constants';
 import { useSelector } from 'react-redux';
+import { LeaveHubNav } from '../../components/LeaveHubNav';
 
 export function EmployeeLeave() {
   const toast = useToast();
+  const [searchParams] = useSearchParams();
   const profile = useSelector((s) => s.auth.profile);
-  const canTeamBalances = ['manager', 'hod', 'hr', 'admin'].includes(profile?.role);
+  const role = profile?.role;
   const [leaveTypes, setLeaveTypes] = useState([]);
   const [requests, setRequests] = useState([]);
   const [dash, setDash] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [leaveTab, setLeaveTab] = useState('apply');
+  const [leaveTab, setLeaveTab] = useState(() =>
+    searchParams.get('tab') === 'requests' ? 'requests' : 'apply'
+  );
   const [form, setForm] = useState({
     leave_type_id: '',
     start_date: '',
@@ -43,6 +46,12 @@ export function EmployeeLeave() {
     load();
   }, []);
 
+  useEffect(() => {
+    const t = searchParams.get('tab');
+    if (t === 'requests') setLeaveTab('requests');
+    else if (t === 'apply') setLeaveTab('apply');
+  }, [searchParams]);
+
   const createAndSubmit = async (e) => {
     e.preventDefault();
     try {
@@ -63,6 +72,25 @@ export function EmployeeLeave() {
       load();
     } catch (err) {
       toast(err?.response?.data?.detail || 'Failed to cancel request', 'error');
+    }
+  };
+
+  const rescheduleApproved = async (r) => {
+    const start = window.prompt('New start date (YYYY-MM-DD):', String(r.start_date || ''));
+    if (!start) return;
+    const end = window.prompt('New end date (YYYY-MM-DD):', String(r.end_date || ''));
+    if (!end) return;
+    const reason = window.prompt('Reason for reschedule (optional):', String(r.reason || '')) || '';
+    try {
+      await api.rescheduleApprovedLeaveRequest(r.id, {
+        start_date: start.trim(),
+        end_date: end.trim(),
+        reason: reason.trim() || undefined,
+      });
+      toast('Reschedule submitted for supervisor approval', 'success');
+      load();
+    } catch (err) {
+      toast(err?.response?.data?.detail || 'Failed to reschedule leave', 'error');
     }
   };
 
@@ -101,17 +129,14 @@ export function EmployeeLeave() {
           {(dash?.viewer?.full_name || profile?.full_name) && (
             <p className="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
               Balances for <span className="font-medium text-gray-700 dark:text-gray-300">{dash?.viewer?.full_name || profile?.full_name}</span>
+              {dash?.balances_effective_year_note && (
+                <span className="block mt-1 text-amber-800 dark:text-amber-200/90 text-xs font-normal">
+                  {dash.balances_effective_year_note}
+                </span>
+              )}
             </p>
           )}
         </div>
-        {canTeamBalances && (
-          <Link
-            to={ROUTES.EMPLOYEE.TEAM_LEAVE}
-            className="text-sm font-medium text-primary-600 dark:text-primary-400 hover:text-primary-500 dark:hover:text-primary-300"
-          >
-            Team leave balances
-          </Link>
-        )}
       </div>
 
       {dash && (
@@ -124,7 +149,10 @@ export function EmployeeLeave() {
               {annualRemaining != null ? `${annualRemaining.toFixed(1)} days` : '-'}
             </p>
             <p className="mt-2 text-xs text-gray-500 dark:text-gray-400 leading-snug">
-              Starts at 18 days; +1 day per 3 full years of service (max 21), using your hire date on file.
+              These figures are read from your saved leave balances in this system (allocated, used, and remaining),
+              including types such as annual leave and day off in lieu after an OrangeHRM import. Contact HR if totals
+              still differ from the old app. New accounts without a balance row get defaults until HR or an import sets
+              your record.
             </p>
           </div>
           <div className="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/90 p-5 shadow-sm">
@@ -153,31 +181,7 @@ export function EmployeeLeave() {
         </div>
       )}
 
-      <div
-        className="flex flex-wrap gap-2 border-b border-gray-200 dark:border-gray-700 pb-3"
-        role="tablist"
-        aria-label="Leave sections"
-      >
-        {[
-          { id: 'apply', label: 'Apply' },
-          { id: 'requests', label: 'My Leave' },
-        ].map(({ id, label }) => (
-          <button
-            key={id}
-            type="button"
-            role="tab"
-            aria-selected={leaveTab === id}
-            onClick={() => setLeaveTab(id)}
-            className={`rounded-full px-4 py-2 text-sm font-semibold transition-colors ${
-              leaveTab === id
-                ? 'bg-sky-100 text-sky-900 dark:bg-sky-900/50 dark:text-sky-100 ring-1 ring-sky-200 dark:ring-sky-700'
-                : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <LeaveHubNav role={role} />
 
       {leaveTab === 'apply' && (
         <form
@@ -290,6 +294,7 @@ export function EmployeeLeave() {
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Start</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">End</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Days</th>
+                <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Comments</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Status</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Action</th>
               </tr>
@@ -297,14 +302,14 @@ export function EmployeeLeave() {
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
               {loading && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
+                  <td colSpan={8} className="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
                     Loading…
                   </td>
                 </tr>
               )}
               {!loading && requests.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-12 text-center">
+                  <td colSpan={8} className="px-4 py-12 text-center">
                     <p className="text-sm font-medium text-gray-700 dark:text-gray-300">No leave requests yet</p>
                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 max-w-sm mx-auto">
                       Your applications and leave assigned by a supervisor appear here.
@@ -326,8 +331,21 @@ export function EmployeeLeave() {
                     <td className="px-4 py-3 tabular-nums">{r.start_date}</td>
                     <td className="px-4 py-3 tabular-nums">{r.end_date}</td>
                     <td className="px-4 py-3 tabular-nums">{r.days_requested}</td>
+                    <td className="px-4 py-3 max-w-[14rem] text-xs text-gray-600 dark:text-gray-400 align-top">
+                      {(() => {
+                        const raw = String(r.reason || '').trim();
+                        if (!raw) return '—';
+                        const body = raw.replace(/\n*\s*Imported from OrangeHRM leave_request_id=\d+\s*$/i, '').trim();
+                        const show = body || '—';
+                        return (
+                          <span className="block truncate" title={raw}>
+                            {show}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="px-4 py-3">
-                      <StatusBadge status={r.status} />
+                      <StatusBadge status={r.status} endDate={r.end_date} />
                     </td>
                     <td className="px-4 py-3">
                       {!['approved', 'rejected', 'cancelled'].includes(r.status) && (
@@ -337,6 +355,15 @@ export function EmployeeLeave() {
                           className="text-sm font-medium text-red-600 dark:text-red-400 hover:underline"
                         >
                           Cancel
+                        </button>
+                      )}
+                      {r.status === 'approved' && (
+                        <button
+                          type="button"
+                          onClick={() => rescheduleApproved(r)}
+                          className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Reschedule
                         </button>
                       )}
                     </td>
@@ -351,9 +378,14 @@ export function EmployeeLeave() {
   );
 }
 
-function StatusBadge({ status }) {
+function StatusBadge({ status, endDate }) {
   const s = String(status || '');
   const base = 'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium';
+  const ed = (endDate || '').toString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+  if (s === 'approved' && ed && ed < today) {
+    return <span className={`${base} bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-200`}>Taken</span>;
+  }
   if (s === 'approved') return <span className={`${base} bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300`}>Approved</span>;
   if (s === 'rejected') return <span className={`${base} bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300`}>Rejected</span>;
   if (s === 'cancelled') return <span className={`${base} bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300`}>Cancelled</span>;

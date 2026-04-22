@@ -1,3 +1,9 @@
+/**
+ * Authenticated app shell: sidebar + scrollable main area + global toasts.
+ *
+ * Sidebar open state lives in Redux (`ui.sidebarOpen`) so it survives navigation.
+ * Mobile drawer uses local `mobileOpen` (overlay + slide-in); desktop uses width collapse.
+ */
 import { useState } from 'react';
 import { Outlet } from 'react-router-dom';
 import { useSelector, useDispatch } from 'react-redux';

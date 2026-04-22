@@ -1,16 +1,23 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSelector } from 'react-redux';
 import * as api from '../../services/api';
-import { ROUTES, ROLE_LABELS } from '../../utils/constants';
+import { ROLE_LABELS } from '../../utils/constants';
 import { useToast } from '../../hooks/useToast';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
-import { Link } from 'react-router-dom';
+import { LeaveBackLink, LeaveHubNav } from '../../components/LeaveHubNav';
+
+/** HR/Admin: all-staff preview vs direct reports. HOD: direct reports (default) vs whole department. */
+const MODE_WIDE = 'wide';
+const MODE_DIRECT = 'direct';
+const MODE_DEPT = 'department';
 
 export function TeamLeaveBalances() {
   const toast = useToast();
   const profile = useSelector((s) => s.auth.profile);
   const role = profile?.role;
   const [year, setYear] = useState(new Date().getFullYear());
+  const [teamListMode, setTeamListMode] = useState(MODE_WIDE);
+  const teamModeInit = useRef(false);
   const [payload, setPayload] = useState(null);
   const [loading, setLoading] = useState(true);
   const [leaveTypes, setLeaveTypes] = useState([]);
@@ -23,10 +30,25 @@ export function TeamLeaveBalances() {
   });
   const [assigning, setAssigning] = useState(false);
 
+  const showTeamScopeToggle = role === 'admin' || role === 'hr' || role === 'hod';
+
+  useEffect(() => {
+    if (!role || teamModeInit.current) return;
+    teamModeInit.current = true;
+    if (role === 'hod') setTeamListMode(MODE_DIRECT);
+    else if (role === 'admin' || role === 'hr') setTeamListMode(MODE_WIDE);
+  }, [role]);
+
   const load = () => {
     setLoading(true);
+    const params = { year };
+    if (role === 'hod' && teamListMode === MODE_DEPT) {
+      params.scope = 'department';
+    } else if ((role === 'admin' || role === 'hr') && teamListMode === MODE_DIRECT) {
+      params.scope = 'direct_reports';
+    }
     api
-      .getLeaveTeamBalances({ year })
+      .getLeaveTeamBalances(params)
       .then(setPayload)
       .catch(() => toast('You may not have access to team leave balances', 'error'))
       .finally(() => setLoading(false));
@@ -34,7 +56,7 @@ export function TeamLeaveBalances() {
 
   useEffect(() => {
     load();
-  }, [year, toast]);
+  }, [year, teamListMode, toast, showTeamScopeToggle]);
 
   useEffect(() => {
     api.getLeaveTypes().then(setLeaveTypes).catch(() => setLeaveTypes([]));
@@ -65,14 +87,17 @@ export function TeamLeaveBalances() {
     }
   };
 
-  const scopeHint =
-    role === 'manager'
-      ? 'Direct reports'
-      : role === 'hod'
-        ? 'Same department (excluding you)'
-        : role === 'hr' || role === 'admin'
-          ? 'Active employees (preview, up to 250)'
-          : '';
+  const scopeHint = (() => {
+    if (payload?.list_scope === 'direct_reports') {
+      return 'People who report to you (supervisor in HR records)';
+    }
+    if (payload?.list_scope === 'department') {
+      return 'Everyone in your department (wide view)';
+    }
+    if (role === 'manager') return 'Direct reports';
+    if (role === 'hr' || role === 'admin') return 'Active employees (preview, up to 250)';
+    return '';
+  })();
 
   if (loading && !payload) {
     return (
@@ -85,27 +110,90 @@ export function TeamLeaveBalances() {
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
+        <div className="min-w-0">
+          <LeaveBackLink className="mb-3" />
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Team leave balances</h1>
           <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
             {scopeHint} · Your role: {ROLE_LABELS[role] || role}
           </p>
+          <div className="mt-4">
+            <LeaveHubNav role={role} />
+          </div>
         </div>
-        <div className="flex items-center gap-3">
-          <label className="text-sm text-gray-600 dark:text-gray-400 flex items-center gap-2">
-            Year
-            <input
-              type="number"
-              min={2020}
-              max={2035}
-              value={year}
-              onChange={(e) => setYear(Number(e.target.value) || new Date().getFullYear())}
-              className="w-24 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-gray-900 dark:text-white"
-            />
-          </label>
-          <Link to={ROUTES.HR.LEAVE} className="text-sm text-primary-600 dark:text-primary-400 hover:underline">
-            Approvals
-          </Link>
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4">
+          {showTeamScopeToggle && role === 'hod' && (
+            <div
+              className="inline-flex rounded-lg border border-gray-300 dark:border-gray-600 p-0.5 bg-gray-50 dark:bg-gray-900/40"
+              role="group"
+              aria-label="Whose leave balances to show"
+            >
+              <button
+                type="button"
+                onClick={() => setTeamListMode(MODE_DIRECT)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  teamListMode === MODE_DIRECT
+                    ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm'
+                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                }`}
+              >
+                My direct reports
+              </button>
+              <button
+                type="button"
+                onClick={() => setTeamListMode(MODE_DEPT)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  teamListMode === MODE_DEPT
+                    ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm'
+                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                }`}
+              >
+                Whole department
+              </button>
+            </div>
+          )}
+          {showTeamScopeToggle && (role === 'admin' || role === 'hr') && (
+            <div
+              className="inline-flex rounded-lg border border-gray-300 dark:border-gray-600 p-0.5 bg-gray-50 dark:bg-gray-900/40"
+              role="group"
+              aria-label="Whose leave balances to show"
+            >
+              <button
+                type="button"
+                onClick={() => setTeamListMode(MODE_WIDE)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  teamListMode === MODE_WIDE
+                    ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm'
+                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                }`}
+              >
+                All staff (preview)
+              </button>
+              <button
+                type="button"
+                onClick={() => setTeamListMode(MODE_DIRECT)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  teamListMode === MODE_DIRECT
+                    ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm'
+                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                }`}
+              >
+                My direct reports
+              </button>
+            </div>
+          )}
+          <div className="flex items-center gap-3">
+            <label className="text-sm text-gray-600 dark:text-gray-400 flex items-center gap-2">
+              Year
+              <input
+                type="number"
+                min={2020}
+                max={2035}
+                value={year}
+                onChange={(e) => setYear(Number(e.target.value) || new Date().getFullYear())}
+                className="w-24 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-gray-900 dark:text-white"
+              />
+            </label>
+          </div>
         </div>
       </div>
 

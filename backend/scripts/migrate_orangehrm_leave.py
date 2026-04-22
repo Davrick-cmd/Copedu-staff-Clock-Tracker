@@ -2,24 +2,43 @@
 """
 Import leave history from an OrangeHRM / MySQL dump (e.g. hr_leave.sql) into the HR Suite SQLite DB.
 
-Usage (from backend folder):
-  python scripts/migrate_orangehrm_leave.py --sql "../old hrms/hr_leave.sql" --dry-run
-  python scripts/migrate_orangehrm_leave.py --sql "../old hrms/hr_leave.sql" --apply --import-users
+Usage (from the `backend` folder):
+
+  Linux / macOS, or Windows if `python` is on PATH:
+    python scripts/migrate_orangehrm_leave.py --sql "../old hrms/hr_leave.sql" --dry-run
+
+  Windows (recommended when `python` is not found — uses the Store / py launcher):
+    py -3 scripts/migrate_orangehrm_leave.py --sql "C:\\path\\to\\hr_leave.sql" --dry-run
+    py -3 scripts/migrate_orangehrm_leave.py --sql "C:\\path\\to\\hr_leave.sql" --apply --import-users
   # Optional: also overwrite passwords when merging into existing emails (default: keep HR Suite password):
   #   ... --apply --import-users --apply-ohrm-passwords-to-merged
 
-Balances (28.5 days in Orange vs 21 in HR Suite defaults):
+Balances (e.g. 28.5 annual days, 2.0 day-off-in-lieu in Orange):
   The dump's `ohrm_leave_entitlement` rows are imported into `leave_balances` so each employee keeps
-  OrangeHRM allocated/used/remaining (not the seeded default_days). This runs automatically on --apply
-  unless you pass --skip-entitlements.
+  OrangeHRM `no_of_days`, `days_used`, and remaining = `no_of_days - days_used` (not the seeded default_days).
 
-  If your Orange dump is for calendar year 2025 but the app uses 2026, map last year's entitlements
-  into the new year, e.g.:
-    python scripts/migrate_orangehrm_leave.py --sql "../old hrms/hr_leave.sql" --apply --only-entitlements \\
+  Orange often has several entitlement rows per employee per leave type (carry-over, adjustments). The default
+  merge mode `--entitlement-merge latest` keeps the row with the **highest entitlement id** for each pair
+  (matches what employees usually see on Apply Leave). Use `--entitlement-merge sum` only if you intentionally
+  want to add up all matching rows (old behaviour; can over-state annual if overlapping periods exist).
+
+  After import, the new app's Leave page reads those SQLite rows directly (no statutory overwrite on
+  each page load). Re-run entitlement-only any time you refresh the MySQL dump.
+
+  If the app year is 2026 but Orange has both 2025- and 2026-dated entitlement rows, use e.g.
+    py -3 scripts/migrate_orangehrm_leave.py --sql "C:\\path\\to\\hr_leave.sql" --apply --only-entitlements \\
       --sqlite-year 2026 --ohrm-entitlement-from-year 2025
+  Rows with from_date in **either** 2025 or 2026 are included; `--entitlement-merge latest` picks the
+  highest entitlement id per employee+leave type (so a 2026 annual row like 28.5 days is not skipped).
 
-  Re-run entitlement-only any time after refreshing the MySQL dump:
-    ... --apply --only-entitlements --sqlite-year 2026 --ohrm-entitlement-from-year 2025
+  Re-run entitlement-only any time after refreshing the MySQL dump (same `py -3` prefix on Windows).
+
+  Shortcut: from `backend`, run `.\migrate-entitlements.ps1 -SqlPath "C:\\path\\to\\hr_leave.sql"` (see that script).
+
+  Supervisor / approver chain (`users.manager_id`), from Orange `hs_hr_emp_reportto` (same dump):
+    py -3 scripts/migrate_orangehrm_leave.py --sql "C:\\path\\to\\hr_leave.sql" --apply --apply-reporting
+  Uses Direct (mode 1) before ESS-Supervisor (3), Indirect (2), HR Head (4) when multiple rows exist per subordinate.
+  Re-run overwrites `manager_id` whenever Orange supplies a resolvable supervisor (for everyone in the dump, not one team).
 
 Without --import-users, leave rows only attach to users that already exist in SQLite (email /
 employee_id / AD username must match). With --import-users, staff are created from hs_hr_employee
@@ -33,11 +52,11 @@ Login for imported users:
   pass --apply-ohrm-passwords-to-merged.
 
 Matching staff to app users (first match wins):
-  0) users.id == mig-user-ohrm-{emp_number} (stable id from --import-users)
-  1) hs_hr_employee.emp_work_email -> users.email (case-insensitive)
-  2) hs_hr_employee.emp_oth_email -> users.email
-  3) hs_hr_employee.employee_id -> users.employee_id
-  4) ohrm_user.user_name -> users.ad_username (case-insensitive)
+  1) hs_hr_employee work email -> users.email (case-insensitive)
+  2) hs_hr_employee other email -> users.email
+  3) ohrm_user.user_name -> users.ad_username (before employee_id: Orange may omit email while AD matches login)
+  4) hs_hr_employee.employee_id -> users.employee_id
+  5) users.id == mig-user-ohrm-{emp_number} (from --import-users) if no merge match
 
 OrangeHRM ohrm_leave.status (day rows):
   -1 REJECTED, 0 CANCELLED, 1 PENDING, 2 SCHEDULED, 3 TAKEN, 4 WEEKEND, 5 HOLIDAY
@@ -242,13 +261,13 @@ def pick_unique_email(
         if candidate and candidate not in reserved:
             reserved.add(candidate)
             return candidate
-    base = f"ohrm.emp{emp_no}@migrated.{SYNTH_EMAIL_DOMAIN}"
+    base = f"ohrm.emp{emp_no}@imported.{SYNTH_EMAIL_DOMAIN}"
     if base not in reserved:
         reserved.add(base)
         return base
     i = 1
     while True:
-        alt = f"ohrm.emp{emp_no}.{i}@migrated.{SYNTH_EMAIL_DOMAIN}"
+        alt = f"ohrm.emp{emp_no}.{i}@imported.{SYNTH_EMAIL_DOMAIN}"
         if alt not in reserved:
             reserved.add(alt)
             return alt
@@ -439,6 +458,12 @@ def ensure_leave_type(cur, name: str, oh_lt_id: int) -> str:
         "circumstantial leave": "COMPASSIONATE",
         "compassionate leave": "COMPASSIONATE",
         "unpaid leave": "UNPAID",
+        "day off in lieu": "DAY_OFF_IN_LIEU",
+        "day-off in lieu": "DAY_OFF_IN_LIEU",
+        "day off in-lieu": "DAY_OFF_IN_LIEU",
+        "lieu day": "DAY_OFF_IN_LIEU",
+        "time off in lieu": "DAY_OFF_IN_LIEU",
+        "off in lieu": "DAY_OFF_IN_LIEU",
     }
     code = aliases.get(key)
     if code:
@@ -465,6 +490,12 @@ def ensure_leave_type(cur, name: str, oh_lt_id: int) -> str:
     return cur.fetchone()[0]
 
 
+def _round_leave_float(x: float, places: int = 4) -> float:
+    if x is None:
+        return 0.0
+    return round(float(x), places)
+
+
 def apply_orange_entitlements(
     cur,
     entitlement_rows: list,
@@ -472,48 +503,78 @@ def apply_orange_entitlements(
     resolve_user: Callable[[int], str | None],
     sqlite_year: int,
     ohrm_from_year: int | None,
+    entitlement_merge: str = "latest",
 ) -> tuple[int, int]:
     """
-    Import ohrm_leave_entitlement into leave_balances (OrangeHRM is source of truth for allocated/used).
+    Import ohrm_leave_entitlement into leave_balances (OrangeHRM is source of truth).
 
-    ohrm_from_year: if set, only rows whose from_date calendar year equals this (e.g. 2025 live dump);
-    balances are stored under sqlite_year (e.g. 2026) for cutover to the new system year.
+    ohrm_from_year: if set, rows whose from_date year is either this value or sqlite_year are considered
+    (e.g. 2025 + 2026 Orange rows when importing into sqlite_year 2026); newest id wins for "latest".
     If None, only rows whose from_date year equals sqlite_year are imported.
+
+    entitlement_merge:
+      - "latest": one row per (emp_number, leave_type_id) — the entitlement with max id (newest).
+      - "sum": add no_of_days and days_used across all matching rows (legacy; can inflate totals).
     """
-    agg: dict[tuple[int, int], dict[str, float]] = defaultdict(lambda: {"no": 0.0, "used": 0.0})
+    match_year = ohrm_from_year if ohrm_from_year is not None else sqlite_year
+
+    # latest: key -> (entitlement_id, no, used) best row only
+    # sum: key -> accumulated no, used
+    latest: dict[tuple[int, int], tuple[int, float, float]] = {}
+    summed: dict[tuple[int, int], dict[str, float]] = defaultdict(lambda: {"no": 0.0, "used": 0.0})
+
     for r in entitlement_rows:
         if len(r) < 11:
             continue
         if parse_int(r[10]) == 1:
             continue
+        eid = parse_int(r[0])
         emp = parse_int(r[1])
         no = parse_float(r[2])
         du = parse_float(r[3])
         oh_lt = parse_int(r[4])
         fd = mysql_str(r[5]) if r[5] else ""
         fd_y = int(fd[:4]) if len(fd) >= 4 and fd[:4].isdigit() else None
-        match_year = ohrm_from_year if ohrm_from_year is not None else sqlite_year
-        if fd_y is None or fd_y != match_year:
+        if fd_y is None:
+            continue
+        if ohrm_from_year is not None and ohrm_from_year != sqlite_year:
+            if fd_y not in (ohrm_from_year, sqlite_year):
+                continue
+        elif fd_y != match_year:
             continue
         if emp is None or oh_lt is None:
             continue
         key = (emp, oh_lt)
-        agg[key]["no"] += no
-        agg[key]["used"] += du
+        if entitlement_merge == "sum":
+            summed[key]["no"] += no
+            summed[key]["used"] += du
+        else:
+            rid = eid if eid is not None else -1
+            prev = latest.get(key)
+            if prev is None or rid >= prev[0]:
+                latest[key] = (rid, no, du)
+
+    agg_items: list[tuple[tuple[int, int], float, float]] = []
+    if entitlement_merge == "sum":
+        for key, v in sorted(summed.items()):
+            agg_items.append((key, float(v["no"]), float(v["used"])))
+    else:
+        for key, (_rid, no, du) in sorted(latest.items()):
+            agg_items.append((key, float(no), float(du)))
 
     updated = 0
     unmatched = 0
     now = datetime.utcnow().isoformat()
-    for (emp, oh_lt), v in sorted(agg.items()):
+    for (emp, oh_lt), no, du in agg_items:
         uid = resolve_user(emp)
         if not uid:
             unmatched += 1
             continue
         lt_name = leave_types_oh.get(oh_lt, f"Type {oh_lt}")
         new_lt_id = ensure_leave_type(cur, lt_name, oh_lt)
-        alloc = float(v["no"])
-        used = float(v["used"])
-        rem = max(alloc - used, 0.0)
+        alloc = _round_leave_float(no)
+        used = _round_leave_float(du)
+        rem = _round_leave_float(max(alloc - used, 0.0))
         cur.execute(
             "SELECT id FROM leave_balances WHERE user_id = ? AND leave_type_id = ? AND year = ?",
             (uid, new_lt_id, sqlite_year),
@@ -535,6 +596,88 @@ def apply_orange_entitlements(
             )
         updated += 1
     return updated, unmatched
+
+
+def purge_stale_mig_leave_balances(
+    cur,
+    mig_uid_by_emp: dict[int, str],
+    resolve_user: Callable[[int], str | None],
+    sqlite_year: int,
+) -> int:
+    """Drop leave_balances on mig-user-ohrm-* when the same emp_number resolves to a merged (non-mig) user."""
+    total = 0
+    for emp_no, mig_uid in mig_uid_by_emp.items():
+        resolved = resolve_user(emp_no)
+        if not resolved or resolved == mig_uid:
+            continue
+        cur.execute("DELETE FROM leave_balances WHERE user_id = ? AND year = ?", (mig_uid, sqlite_year))
+        total += cur.rowcount
+    return total
+
+
+# Orange ohrm_emp_reporting_method: 1=Direct, 2=Indirect, 3=ESS-Supervisor, 4=HR Head
+_REPORTING_MODE_PRIORITY = {1: 0, 3: 1, 2: 2, 4: 3}
+
+
+def build_subordinate_supervisor_map(report_rows: list) -> dict[int, int]:
+    """Map Orange emp_number (subordinate) -> chosen supervisor emp_number from hs_hr_emp_reportto."""
+    by_sub: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for r in report_rows:
+        if len(r) < 3:
+            continue
+        sup = parse_int(r[0])
+        sub = parse_int(r[1])
+        mode = parse_int(r[2])
+        if sup is None or sub is None or mode is None:
+            continue
+        if sup == sub:
+            continue
+        by_sub[sub].append((sup, mode))
+    out: dict[int, int] = {}
+    for sub, pairs in by_sub.items():
+
+        def _sort_key(item: tuple[int, int]) -> tuple[int, int]:
+            sup_emp, m = item
+            pri = _REPORTING_MODE_PRIORITY.get(m, 50)
+            return (pri, sup_emp)
+
+        best_sup, _best_mode = min(pairs, key=_sort_key)
+        out[sub] = best_sup
+    return out
+
+
+def apply_orange_reporting(
+    cur,
+    sub_to_sup: dict[int, int],
+    resolve_user: Callable[[int], str | None],
+    now_iso: str,
+) -> tuple[int, int, int, int]:
+    """
+    Set users.manager_id from Orange report-to rows (subordinate -> supervisor app user id).
+    Returns (updated_rows, skipped_no_sub_uid, skipped_no_sup_uid, skipped_self_ref).
+    """
+    updated = 0
+    no_sub = 0
+    no_sup = 0
+    self_ref = 0
+    for sub_emp, sup_emp in sorted(sub_to_sup.items()):
+        sub_uid = resolve_user(sub_emp)
+        sup_uid = resolve_user(sup_emp)
+        if not sub_uid:
+            no_sub += 1
+            continue
+        if not sup_uid:
+            no_sup += 1
+            continue
+        if sub_uid == sup_uid:
+            self_ref += 1
+            continue
+        cur.execute(
+            "UPDATE users SET manager_id = ?, updated_at = ? WHERE id = ? AND is_active = 1",
+            (sup_uid, now_iso, sub_uid),
+        )
+        updated += cur.rowcount
+    return updated, no_sub, no_sup, self_ref
 
 
 def main():
@@ -574,10 +717,28 @@ def main():
         "--ohrm-entitlement-from-year",
         type=int,
         default=None,
-        help="Read OrangeHRM entitlement rows whose from_date falls in this year (e.g. 2025). "
-        "Use with --sqlite-year 2026 to copy last year's live balances into the new app year.",
+        help="Include entitlement rows whose from_date year is this year or equals --sqlite-year "
+        "(e.g. 2025 with --sqlite-year 2026 loads both 2025 and 2026 from_date rows; merge mode picks one per type). "
+        "If omitted, only rows whose from_date year matches --sqlite-year are used.",
+    )
+    ap.add_argument(
+        "--entitlement-merge",
+        choices=("latest", "sum"),
+        default="latest",
+        help="Multiple ohrm_leave_entitlement rows per employee+leave_type after the from_date year filter: "
+        "'latest' (default) = keep only the row with highest id (matches typical Orange apply-leave balance). "
+        "'sum' = add no_of_days and days_used (legacy; can over-count annual).",
+    )
+    ap.add_argument(
+        "--apply-reporting",
+        action="store_true",
+        help="Set users.manager_id from hs_hr_emp_reportto (Orange supervisor -> subordinate). "
+        "Prefer Direct reporting mode, then ESS-Supervisor, Indirect, HR Head. Requires --apply.",
     )
     args = ap.parse_args()
+    if args.apply_reporting and not args.apply:
+        print("--apply-reporting requires --apply")
+        sys.exit(1)
     if args.only_entitlements and not args.apply:
         print("--only-entitlements requires --apply")
         sys.exit(1)
@@ -596,13 +757,15 @@ def main():
         sys.exit(1)
 
     print(f"Reading {sql_path} (this may take a minute)...")
-    leave_requests: dict[int, tuple[int, str, int]] = {}
+    # (leave_type_id, date_applied_yyyy_mm_dd, emp_number, optional_comment_from_dump)
+    leave_requests: dict[int, tuple[int, str, int, str]] = {}
     leave_rows: list[tuple] = []
     leave_types_oh: dict[int, str] = {}
     employees: dict[int, dict] = {}
     ohrm_users: dict[int, str] = {}
     ohrm_password_hashes: dict[int, str] = {}
     entitlement_rows: list = []
+    reporting_rows: list = []
 
     insert_tables = (
         "ohrm_leave_type",
@@ -611,6 +774,7 @@ def main():
         "ohrm_leave_entitlement",
         "hs_hr_employee",
         "ohrm_user",
+        "hs_hr_emp_reportto",
     )
     counts = defaultdict(int)
 
@@ -626,6 +790,7 @@ def main():
                         leave_requests,
                         leave_rows,
                         entitlement_rows,
+                        reporting_rows,
                         employees,
                         ohrm_users,
                         ohrm_password_hashes,
@@ -642,6 +807,7 @@ def main():
                     leave_requests,
                     leave_rows,
                     entitlement_rows,
+                    reporting_rows,
                     employees,
                     ohrm_users,
                     ohrm_password_hashes,
@@ -657,6 +823,7 @@ def main():
             leave_requests,
             leave_rows,
             entitlement_rows,
+            reporting_rows,
             employees,
             ohrm_users,
             ohrm_password_hashes,
@@ -686,7 +853,7 @@ def main():
     print(
         f"Parsed: leave_types={len(leave_types_oh)}, requests={len(leave_requests)}, "
         f"leave_days={len(leave_rows)}, entitlements={len(entitlement_rows)}, "
-        f"employees={len(employees)}, ohrm_users={len(ohrm_users)}"
+        f"reporting_rows={len(reporting_rows)}, employees={len(employees)}, ohrm_users={len(ohrm_users)}"
     )
 
     if args.dry_run:
@@ -726,15 +893,15 @@ def main():
                     return user_by_email[we]
                 if oe and oe in user_by_email:
                     return user_by_email[oe]
-                if eid and str(eid).strip().lower() in user_by_emp_id:
-                    return user_by_emp_id[str(eid).strip().lower()]
                 ad = ohrm_users.get(emp_number)
                 if ad and ad in user_by_ad:
                     return user_by_ad[ad]
+                if eid and str(eid).strip().lower() in user_by_emp_id:
+                    return user_by_emp_id[str(eid).strip().lower()]
                 return None
 
             matchable = 0
-            for _rid, (_lt, _da, emp_no) in leave_requests.items():
+            for _rid, (_lt, _da, emp_no, _cm) in leave_requests.items():
                 if resolve_user_dr(emp_no):
                     matchable += 1
             print(f"Leave requests whose employee maps to an app user (estimate): {matchable} / {len(leave_requests)}")
@@ -751,7 +918,7 @@ def main():
                     f"--import-users (dry-run): merge into existing emails={m}, new mig accounts={c}, already have mig id={s}; "
                     f"Orange bcrypt on new={pn}, on merged={pm} (merged only with --apply-ohrm-passwords-to-merged)"
                 )
-                matchable2 = sum(1 for _rid, (_lt, _da, emp_no) in leave_requests.items() if emp_no in employees)
+                matchable2 = sum(1 for _rid, (_lt, _da, emp_no, _cm) in leave_requests.items() if emp_no in employees)
                 print(
                     f"Leave requests with employee row in Orange dump: {matchable2} / {len(leave_requests)} "
                     f"(after --apply --import-users, almost all should import if day rows exist)"
@@ -782,14 +949,65 @@ def main():
         )
         fb = cr - pn
         if fb > 0:
-            print(f"New accounts without Orange bcrypt hash (fallback password): {fb} → {MIGRATION_DEFAULT_PASSWORD}")
+            print(f"New accounts without Orange bcrypt hash (fallback password): {fb} -> {MIGRATION_DEFAULT_PASSWORD}")
         print("Users should change password after first login if policy requires (Admin can reset from Users).")
+
+    # Copy Orange employee_id from mig-* rows onto merged accounts (same work email) so entitlement resolution matches HR.
+    cur.execute(
+        "SELECT id, employee_id FROM users WHERE id LIKE ? AND employee_id IS NOT NULL AND TRIM(employee_id) != ''",
+        (f"{MIG_USER_PREFIX}%",),
+    )
+    for mig_uid, mig_eid in cur.fetchall():
+        try:
+            emp_no = int(str(mig_uid).split("-")[-1])
+        except ValueError:
+            continue
+        emp = employees.get(emp_no)
+        if not emp:
+            continue
+        we = norm_email(emp.get("work_email"))
+        if not we:
+            continue
+        eid = str(mig_eid).strip()
+        cur.execute(
+            """
+            UPDATE users SET employee_id = ?, updated_at = ?
+            WHERE is_active = 1 AND LOWER(TRIM(email)) = ? AND id NOT LIKE ?
+              AND (employee_id IS NULL OR TRIM(employee_id) = '')
+            """,
+            (eid, datetime.utcnow().isoformat(), we, f"{MIG_USER_PREFIX}%"),
+        )
+        oe = norm_email(emp.get("oth_email"))
+        if oe and oe != we:
+            cur.execute(
+                """
+                UPDATE users SET employee_id = ?, updated_at = ?
+                WHERE is_active = 1 AND LOWER(TRIM(email)) = ? AND id NOT LIKE ?
+                  AND (employee_id IS NULL OR TRIM(employee_id) = '')
+                """,
+                (eid, datetime.utcnow().isoformat(), oe, f"{MIG_USER_PREFIX}%"),
+            )
+    conn.commit()
 
     user_by_email: dict[str, str] = {}
     user_by_emp_id: dict[str, str] = {}
     user_by_ad: dict[str, str] = {}
-    cur.execute("SELECT id, email, employee_id, ad_username FROM users WHERE is_active = 1")
-    for r in cur.fetchall():
+    cur.execute("SELECT id, email, employee_id, ad_username FROM users WHERE is_active = 1 ORDER BY CASE WHEN id LIKE ? THEN 1 ELSE 0 END", (f"{MIG_USER_PREFIX}%",))
+    # Non-mig users first so employee_id / email maps prefer real accounts over mig stubs.
+    rows = cur.fetchall()
+    for r in rows:
+        if str(r["id"]).startswith(MIG_USER_PREFIX):
+            continue
+        e = norm_email(r["email"])
+        if e:
+            user_by_email[e] = r["id"]
+        if r["employee_id"]:
+            user_by_emp_id[str(r["employee_id"]).strip().lower()] = r["id"]
+        if r["ad_username"]:
+            user_by_ad[str(r["ad_username"]).strip().lower()] = r["id"]
+    for r in rows:
+        if not str(r["id"]).startswith(MIG_USER_PREFIX):
+            continue
         e = norm_email(r["email"])
         if e:
             user_by_email.setdefault(e, r["id"])
@@ -807,25 +1025,25 @@ def main():
             pass
 
     def resolve_user(emp_number: int) -> str | None:
+        """Prefer an existing app user merged by email, AD username, or employee_id; otherwise the mig-user-ohrm-* stub."""
+        emp = employees.get(emp_number)
+        if emp:
+            we = norm_email(emp.get("work_email"))
+            oe = norm_email(emp.get("oth_email"))
+            eid = emp.get("employee_id")
+            if isinstance(eid, str):
+                eid = eid.strip()
+            if we and we in user_by_email:
+                return user_by_email[we]
+            if oe and oe in user_by_email:
+                return user_by_email[oe]
+            ad = ohrm_users.get(emp_number)
+            if ad and ad in user_by_ad:
+                return user_by_ad[ad]
+            if eid and str(eid).strip().lower() in user_by_emp_id:
+                return user_by_emp_id[str(eid).strip().lower()]
         if emp_number in mig_uid_by_emp:
             return mig_uid_by_emp[emp_number]
-        emp = employees.get(emp_number)
-        if not emp:
-            return None
-        we = norm_email(emp.get("work_email"))
-        oe = norm_email(emp.get("oth_email"))
-        eid = emp.get("employee_id")
-        if isinstance(eid, str):
-            eid = eid.strip()
-        if we and we in user_by_email:
-            return user_by_email[we]
-        if oe and oe in user_by_email:
-            return user_by_email[oe]
-        if eid and str(eid).strip().lower() in user_by_emp_id:
-            return user_by_emp_id[str(eid).strip().lower()]
-        ad = ohrm_users.get(emp_number)
-        if ad and ad in user_by_ad:
-            return user_by_ad[ad]
         return None
 
     sqlite_year = args.sqlite_year if args.sqlite_year is not None else datetime.utcnow().year
@@ -837,7 +1055,7 @@ def main():
     now = datetime.utcnow().isoformat()
 
     if not args.only_entitlements:
-        for req_id, (oh_lt_id, date_applied, emp_number) in sorted(leave_requests.items()):
+        for req_id, (oh_lt_id, date_applied, emp_number, oh_comment) in sorted(leave_requests.items()):
             days = by_request.get(req_id, [])
             if not days:
                 skipped += 1
@@ -893,6 +1111,12 @@ def main():
                 final_by = None
                 final_at = None
 
+            reason_body = (oh_comment or "").strip()
+            reason = (
+                (reason_body + "\n\n" if reason_body else "")
+                + f"Imported from OrangeHRM leave_request_id={req_id}"
+            )[:3000]
+
             cur.execute(
                 """
                 INSERT INTO leave_requests (
@@ -907,7 +1131,7 @@ def main():
                     start_date,
                     end_date,
                     days_requested,
-                    f"Migrated from OrangeHRM leave_request_id={req_id}",
+                    reason,
                     status,
                     current_approver,
                     final_by,
@@ -921,7 +1145,7 @@ def main():
                 INSERT INTO leave_workflow_logs (id, leave_request_id, action, from_user_id, from_role, to_user_id, to_role, comment, created_at)
                 VALUES (?, ?, ?, NULL, 'system', NULL, NULL, ?, ?)
                 """,
-                (new_id(), mig_id, "migrated", f"OrangeHRM aggregate_status={overall}", now),
+                (new_id(), mig_id, "imported", f"OrangeHRM aggregate_status={overall}", now),
             )
 
             if status == "approved":
@@ -963,24 +1187,55 @@ def main():
     if not args.skip_entitlements:
         if entitlement_rows:
             eu, eu_un = apply_orange_entitlements(
-                cur, entitlement_rows, leave_types_oh, resolve_user, sqlite_year, ohrm_from
+                cur,
+                entitlement_rows,
+                leave_types_oh,
+                resolve_user,
+                sqlite_year,
+                ohrm_from,
+                args.entitlement_merge,
             )
             if eu == 0 and ohrm_from is None and sqlite_year > 2020:
                 eu2, eu_un2 = apply_orange_entitlements(
-                    cur, entitlement_rows, leave_types_oh, resolve_user, sqlite_year, sqlite_year - 1
+                    cur,
+                    entitlement_rows,
+                    leave_types_oh,
+                    resolve_user,
+                    sqlite_year,
+                    sqlite_year - 1,
+                    args.entitlement_merge,
                 )
                 if eu2 > 0:
                     print(
                         f"Entitlements: no rows matched Orange from_date year {sqlite_year}; "
-                        f"retried with from_date year {sqlite_year - 1} → wrote {eu2} balance row(s), unmatched={eu_un2}"
+                        f"retried with from_date year {sqlite_year - 1} -> wrote {eu2} balance row(s), unmatched={eu_un2}"
                     )
                     eu, eu_un = eu2, eu_un2
             print(
-                f"OrangeHRM entitlements → leave_balances: rows_written={eu}, unmatched_employee={eu_un} "
-                f"(sqlite year={sqlite_year}; filter Orange from_date year={ohrm_from if ohrm_from is not None else sqlite_year})"
+                f"OrangeHRM entitlements -> leave_balances: rows_written={eu}, unmatched_employee={eu_un} "
+                f"(sqlite year={sqlite_year}; filter Orange from_date year={ohrm_from if ohrm_from is not None else sqlite_year}; "
+                f"merge={args.entitlement_merge})"
             )
+            purged = purge_stale_mig_leave_balances(cur, mig_uid_by_emp, resolve_user, sqlite_year)
+            if purged:
+                print(
+                    f"Removed {purged} leave_balance row(s) on mig-user-ohrm-* accounts for year {sqlite_year} "
+                    f"(same employee now maps to a merged app user)."
+                )
         else:
             print("No ohrm_leave_entitlement rows in dump; entitlement import skipped.")
+
+    if args.apply_reporting:
+        if not reporting_rows:
+            print("--apply-reporting: no hs_hr_emp_reportto rows in dump; skipped.")
+        else:
+            sub_to_sup = build_subordinate_supervisor_map(reporting_rows)
+            ru, ns, nsp, sr = apply_orange_reporting(cur, sub_to_sup, resolve_user, now)
+            print(
+                f"Orange hs_hr_emp_reportto -> users.manager_id: unique_subordinates={len(sub_to_sup)}, "
+                f"rows_updated={ru}, no_app_user_for_subordinate={ns}, no_app_user_for_supervisor={nsp}, "
+                f"skipped_self_reference={sr}"
+            )
 
     conn.commit()
     conn.close()
@@ -997,6 +1252,7 @@ def _process_buffer(
     leave_requests,
     leave_rows,
     entitlement_rows,
+    reporting_rows,
     employees,
     ohrm_users,
     ohrm_password_hashes,
@@ -1024,8 +1280,24 @@ def _process_buffer(
                     lt = parse_int(r[1])
                     d_applied = r[2]
                     emp = parse_int(r[3])
+                    comment_text = ""
+                    for idx in range(4, min(len(r), 24)):
+                        cell = r[idx]
+                        if cell is None:
+                            continue
+                        cs = mysql_str(cell).strip()
+                        if not cs or len(cs) < 3:
+                            continue
+                        if re.match(r"^\d{4}-\d{2}-\d{2}", cs):
+                            continue
+                        if re.match(r"^-?\d+(\.\d+)?$", cs):
+                            continue
+                        if cs.lower() in ("0", "1", "true", "false", "null"):
+                            continue
+                        comment_text = cs[:2000]
+                        break
                     if rid is not None and lt is not None and emp is not None and d_applied:
-                        leave_requests[rid] = (lt, str(d_applied).strip("'\"")[:10], emp)
+                        leave_requests[rid] = (lt, str(d_applied).strip("'\"")[:10], emp, comment_text)
         elif t == "ohrm_leave":
             for r in rows:
                 if len(r) >= 11:
@@ -1066,6 +1338,10 @@ def _process_buffer(
                 pv = mysql_str(pwd_raw) if pwd_raw else ""
                 if pv.strip():
                     ohrm_password_hashes[emp_no] = pv.strip()
+        elif t == "hs_hr_emp_reportto":
+            for r in rows:
+                if len(r) >= 3:
+                    reporting_rows.append(tuple(r[:3]))
         return
 
 

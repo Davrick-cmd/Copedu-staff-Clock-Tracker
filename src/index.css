@@ -27,3 +27,21 @@ body {
 ::selection {
   @apply bg-primary-200/80 dark:bg-primary-900/80 text-slate-900 dark:text-white;
 }
+
+@media print {
+  .print-hidden {
+    display: none !important;
+  }
+  #hr-reports-print-area {
+    background: white !important;
+    color: #111 !important;
+  }
+  #hr-reports-print-area .dark\:bg-gray-800,
+  #hr-reports-print-area .dark\:bg-slate-900 {
+    background: #fff !important;
+  }
+  #hr-reports-print-area .dark\:text-white,
+  #hr-reports-print-area .dark\:text-gray-300 {
+    color: #111 !important;
+  }
+}

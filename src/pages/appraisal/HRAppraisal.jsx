@@ -358,12 +358,22 @@ export function HRAppraisal() {
                 <span className="text-gray-700 dark:text-gray-300">
                   {c.type === 'quarterly' ? `${c.year} ${c.quarter || ''}` : c.year} - {c.status}
                 </span>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   {c.status !== 'active' && (
                     <button type="button" onClick={() => handleStatusChange(c.id, 'active')} className="text-sm text-primary-600 dark:text-primary-400 hover:underline">Set Active</button>
                   )}
                   {c.status !== 'closed' && (
-                    <button type="button" onClick={() => handleStatusChange(c.id, 'closed')} className="text-sm text-gray-600 dark:text-gray-400 hover:underline">Close</button>
+                    <button type="button" onClick={() => handleStatusChange(c.id, 'closed')} className="text-sm text-gray-600 dark:text-gray-400 hover:underline">Close year / cycle</button>
+                  )}
+                  {c.status === 'closed' && (
+                    <button
+                      type="button"
+                      onClick={() => handleStatusChange(c.id, 'draft')}
+                      className="text-sm text-amber-700 dark:text-amber-400 hover:underline"
+                      title="Allows staff to add or edit cycle KPIs for this year again (if no other closed cycle remains for the same year)"
+                    >
+                      Reopen (draft)
+                    </button>
                   )}
                 </div>
               </li>
@@ -407,12 +417,65 @@ export function HRAppraisal() {
         </div>
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
           <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Final / approved Appraisals</h2>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">Download the agreed summary (HTML, print to PDF). If the employee uploaded a signed scan, open Signed file.</p>
           {appraisals.length === 0 ? <EmptyState title="None" /> : (
-            <ul className="space-y-2 text-sm">
-              {appraisals.slice(0, 15).map((a) => (
-                <li key={a.id} className="flex justify-between">
-                  <span className="text-gray-700 dark:text-gray-300">{a.user_name}</span>
-                  <span className="px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-600">{STATUS_LABELS[a.status]}</span>
+            <ul className="space-y-3 text-sm">
+              {appraisals.slice(0, 40).map((a) => (
+                <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 dark:border-gray-700 pb-2">
+                  <div>
+                    <span className="text-gray-700 dark:text-gray-300 font-medium">{a.user_name}</span>
+                    <span className="text-gray-500 dark:text-gray-400 ml-2">{a.cycle_type === 'quarterly' ? `${a.year} ${a.quarter || ''}` : a.year}</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-600">{STATUS_LABELS[a.status]}</span>
+                    {a.employee_agreed_scores_at && (
+                      <span className="text-xs text-green-700 dark:text-green-400" title="Employee confirmed agreed scores">Agreed ✓</span>
+                    )}
+                    {a.signed_document_id && (
+                      <span className="text-xs text-primary-700 dark:text-primary-400">Signed on file</span>
+                    )}
+                    <button
+                      type="button"
+                      className="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded text-xs text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      onClick={async () => {
+                        try {
+                          const blob = await api.fetchAppraisalAgreedSummaryBlob(a.id);
+                          const url = URL.createObjectURL(blob);
+                          const el = document.createElement('a');
+                          el.href = url;
+                          el.download = `appraisal-${a.user_name || 'staff'}-${a.year}-${a.quarter || 'annual'}.html`;
+                          el.click();
+                          URL.revokeObjectURL(url);
+                          toast('Download started', 'success');
+                        } catch (e) {
+                          toast(e.response?.data?.detail || e.message || 'Failed', 'error');
+                        }
+                      }}
+                    >
+                      Summary
+                    </button>
+                    {a.signed_document_id ? (
+                      <button
+                        type="button"
+                        className="px-2 py-1 bg-primary-600 text-white rounded text-xs hover:bg-primary-700"
+                        onClick={async () => {
+                          try {
+                            const blob = await api.getStaffDocumentFileBlob(a.signed_document_id);
+                            const url = URL.createObjectURL(blob);
+                            const el = document.createElement('a');
+                            el.href = url;
+                            el.download = `signed-appraisal-${a.user_name || 'staff'}`;
+                            el.click();
+                            URL.revokeObjectURL(url);
+                          } catch (e) {
+                            toast(e.message || 'Failed', 'error');
+                          }
+                        }}
+                      >
+                        Signed file
+                      </button>
+                    ) : null}
+                  </div>
                 </li>
               ))}
             </ul>

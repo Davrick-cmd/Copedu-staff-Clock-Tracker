@@ -8,7 +8,6 @@ import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
 import { ROLE_LABELS, ROLES, DEPARTMENTS, ROUTES } from '../../utils/constants';
-import { isImportedStaffRecord, ImportedUserBadge } from '../../components/MigratedUserBadge';
 import { Link } from 'react-router-dom';
 import { EmployeeRecordEditModal } from '../../components/EmployeeRecordEditModal';
 
@@ -125,6 +124,8 @@ export function AdminUsers() {
     return (u.full_name && u.full_name.toLowerCase().includes(q)) || (u.email && u.email.toLowerCase().includes(q));
   });
 
+  const displayEmail = (email) => String(email || '').replace(/@migrated\./gi, '@imported.');
+
   const setRole = (userId, role) => {
     api.setUserRole(userId, role)
       .then(() => {
@@ -190,10 +191,8 @@ export function AdminUsers() {
       <div>
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Employee records</h1>
         <p className="text-sm text-gray-500 dark:text-gray-400 mt-1 max-w-3xl">
-          All staff appear in this list. Records created from a prior bulk import show an{' '}
-          <span className="font-medium text-amber-800 dark:text-amber-300">Imported</span> badge; accounts merged by email do
-          not. Use <strong className="text-gray-700 dark:text-gray-300">Edit record</strong> on any row to update job title,
-          department, branch, supervisor, hire date, and other details when someone moves role or location. Imported leave stays
+          All staff appear in this list. Use <strong className="text-gray-700 dark:text-gray-300">Edit record</strong> on any row to update job title,
+          department, branch, supervisor, hire date, and other details when someone moves role or location. Leave history stays
           on that account - browse under{' '}
           <Link to={ROUTES.HR.LEAVE_ORGANIZATION} className="text-primary-600 dark:text-primary-400 hover:underline">
             Leave → Organization
@@ -411,11 +410,8 @@ export function AdminUsers() {
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {filtered.map((u) => (
                   <tr key={u.id} className="text-gray-700 dark:text-gray-300">
-                    <td className="px-4 py-2">
-                      <span className="font-medium">{u.full_name}</span>
-                      {isImportedStaffRecord(u.id) && <ImportedUserBadge />}
-                    </td>
-                    <td className="px-4 py-2">{u.email}</td>
+                    <td className="px-4 py-2"><span className="font-medium">{u.full_name}</span></td>
+                    <td className="px-4 py-2">{displayEmail(u.email)}</td>
                     <td className="px-4 py-2">{u.branches?.name || '-'}</td>
                     <td className="px-4 py-2">{u.department || '-'}</td>
                     <td className="px-4 py-2">

@@ -1,16 +1,28 @@
-import { useEffect, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import * as api from '../../services/api';
-import { formatDate, formatTime, formatDuration } from '../../utils/formatters';
+import { formatDate, formatDateTime, formatTime, formatDuration } from '../../utils/formatters';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
 import { DashboardPageHeader } from '../../components/dashboard/DashboardWidgets';
+import { OrganizationOverview } from '../../components/dashboard/OrganizationOverview';
 import { ROUTES } from '../../utils/constants';
+import { downloadOrganizationDemographicsCsv } from '../../utils/organizationDemographicsCsv';
+import * as XLSX from 'xlsx';
 
-const REPORT_MODE = { DAILY: 'daily', MONTHLY: 'monthly', RAW: 'raw', RECOGNITION: 'recognition', LEAVE: 'leave' };
+const REPORT_MODE = {
+  DAILY: 'daily',
+  MONTHLY: 'monthly',
+  RAW: 'raw',
+  RECOGNITION: 'recognition',
+  LEAVE: 'leave',
+  PERFORMANCE: 'performance',
+  /** Workforce demographics (organization-wide report view). */
+  ORG_REPORT: 'org_report',
+};
 
 function escapeCsvCell(v) {
   const s = String(v ?? '');
@@ -26,6 +38,20 @@ function downloadCsv(filename, csvContent) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** @param {{ name: string, aoa?: unknown[][], json?: Record<string, unknown>[] }[]} sheets */
+function downloadXlsx(filename, sheets) {
+  const wb = XLSX.utils.book_new();
+  sheets.forEach((sh) => {
+    const safeName = (sh.name || 'Sheet').slice(0, 31);
+    let ws;
+    if (sh.aoa && sh.aoa.length) ws = XLSX.utils.aoa_to_sheet(sh.aoa);
+    else if (sh.json && sh.json.length) ws = XLSX.utils.json_to_sheet(sh.json);
+    else ws = XLSX.utils.aoa_to_sheet([['(No rows)']]);
+    XLSX.utils.book_append_sheet(wb, ws, safeName);
+  });
+  XLSX.writeFile(wb, filename);
 }
 
 function UserListModal({ title, users, onClose }) {
@@ -65,10 +91,18 @@ function UserListModal({ title, users, onClose }) {
   );
 }
 
-export function HRReports() {
+function initialReportModeForScope(reportScope) {
+  if (reportScope === 'leave') return REPORT_MODE.LEAVE;
+  if (reportScope === 'recognition') return REPORT_MODE.RECOGNITION;
+  if (reportScope === 'performance') return REPORT_MODE.PERFORMANCE;
+  if (reportScope === 'organization') return REPORT_MODE.ORG_REPORT;
+  return REPORT_MODE.DAILY;
+}
+
+/** @param {{ reportScope?: 'all' | 'attendance' | 'leave' | 'recognition' | 'performance' | 'organization' }} props */
+export function HRReports({ reportScope = 'all' }) {
   const toast = useToast();
-  const [searchParams] = useSearchParams();
-  const [reportMode, setReportMode] = useState(REPORT_MODE.DAILY);
+  const [reportMode, setReportMode] = useState(() => initialReportModeForScope(reportScope));
   const [dailyDate, setDailyDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [monthYear, setMonthYear] = useState(() => {
     const d = new Date();
@@ -85,20 +119,41 @@ export function HRReports() {
   const [reportType, setReportType] = useState('all');
   const [modal, setModal] = useState(null);
   const [recognitionReport, setRecognitionReport] = useState(null);
+  const [recognitionReportSection, setRecognitionReportSection] = useState('recent');
+  const [recognitionExportType, setRecognitionExportType] = useState('csv');
+  const [performanceReport, setPerformanceReport] = useState(null);
+  const [performanceReportSection, setPerformanceReportSection] = useState('kpi_status');
+  const [performanceExportType, setPerformanceExportType] = useState('xlsx');
+  const [performanceCycleId, setPerformanceCycleId] = useState('');
   const [leaveReport, setLeaveReport] = useState(null);
+  const [leaveReportSection, setLeaveReportSection] = useState('balances');
+  const [leaveExportType, setLeaveExportType] = useState('excel');
+  const [leaveTypeFilter, setLeaveTypeFilter] = useState('');
   const [leaveAsOf, setLeaveAsOf] = useState(() => new Date().toISOString().slice(0, 10));
+  const [leaveBalanceYear, setLeaveBalanceYear] = useState(() => parseInt(new Date().toISOString().slice(0, 4), 10));
   const [leaveDeptFilter, setLeaveDeptFilter] = useState('');
   const [leaveDepartments, setLeaveDepartments] = useState([]);
+  const [organizationOverview, setOrganizationOverview] = useState(null);
+  const [organizationOverviewLoading, setOrganizationOverviewLoading] = useState(false);
+  const [orgFetchKey, setOrgFetchKey] = useState(0);
 
   useEffect(() => {
     api.getBranches().then(setBranches).catch(() => setBranches([]));
   }, []);
 
   useEffect(() => {
-    if (searchParams.get('mode') === 'leave') {
-      setReportMode(REPORT_MODE.LEAVE);
-    }
-  }, [searchParams]);
+    if (reportMode !== REPORT_MODE.ORG_REPORT) return;
+    setOrganizationOverviewLoading(true);
+    api
+      .getOrganizationOverview()
+      .then(setOrganizationOverview)
+      .catch(() => setOrganizationOverview(null))
+      .finally(() => setOrganizationOverviewLoading(false));
+  }, [reportMode, orgFetchKey]);
+
+  useEffect(() => {
+    setReportMode(initialReportModeForScope(reportScope));
+  }, [reportScope]);
 
   useEffect(() => {
     if (reportMode !== REPORT_MODE.LEAVE) return;
@@ -108,8 +163,26 @@ export function HRReports() {
   useEffect(() => {
     if (reportMode !== REPORT_MODE.RECOGNITION) return;
     setLoading(true);
-    api.getRecognitionReport().then(setRecognitionReport).catch(() => setRecognitionReport(null)).finally(() => setLoading(false));
-  }, [reportMode]);
+    api
+      .getRecognitionReport({ fromDate, toDate, limit: 200 })
+      .then(setRecognitionReport)
+      .catch(() => setRecognitionReport(null))
+      .finally(() => setLoading(false));
+  }, [reportMode, fromDate, toDate]);
+
+  useEffect(() => {
+    if (reportMode !== REPORT_MODE.PERFORMANCE) return;
+    setLoading(true);
+    const params = {};
+    if (performanceCycleId.trim()) params.cycle_id = performanceCycleId.trim();
+    params.from_date = fromDate;
+    params.to_date = toDate;
+    api
+      .getAppraisalPerformanceReport(params)
+      .then(setPerformanceReport)
+      .catch(() => setPerformanceReport(null))
+      .finally(() => setLoading(false));
+  }, [reportMode, performanceCycleId, fromDate, toDate]);
 
   useEffect(() => {
     if (reportMode !== REPORT_MODE.LEAVE) return;
@@ -118,6 +191,7 @@ export function HRReports() {
       from_date: fromDate,
       to_date: toDate,
       as_of: leaveAsOf,
+      balance_year: leaveBalanceYear,
       ...(leaveDeptFilter.trim() ? { department: leaveDeptFilter.trim() } : {}),
     };
     api
@@ -125,7 +199,7 @@ export function HRReports() {
       .then(setLeaveReport)
       .catch(() => setLeaveReport(null))
       .finally(() => setLoading(false));
-  }, [reportMode, fromDate, toDate, leaveAsOf, leaveDeptFilter]);
+  }, [reportMode, fromDate, toDate, leaveAsOf, leaveBalanceYear, leaveDeptFilter]);
 
   useEffect(() => {
     if (reportMode !== REPORT_MODE.DAILY) return;
@@ -174,7 +248,22 @@ export function HRReports() {
     toast('Report downloaded', 'success');
   };
 
-  const exportDailyReport = () => {
+  const exportRawAttendanceXlsx = () => {
+    const json = logs.map((l) => ({
+      date: formatDate(l.clock_in_at),
+      employee: l.users?.full_name || '',
+      email: l.users?.email || '',
+      clock_in: formatTime(l.clock_in_at),
+      clock_out: l.clock_out_at ? formatTime(l.clock_out_at) : '',
+      minutes: l.total_minutes ?? '',
+      status: l.status || 'present',
+      ip: l.client_ip || '',
+    }));
+    downloadXlsx(`attendance-${fromDate}-${toDate}.xlsx`, [{ name: 'Attendance', json }]);
+    toast('Attendance XLSX downloaded', 'success');
+  };
+
+  const exportDailyReportCsv = () => {
     if (!dailySummary) return;
     const sum = dailySummary.summary || {};
     const lines = [
@@ -195,14 +284,69 @@ export function HRReports() {
       ].map(escapeCsvCell).join(',')),
     ];
     downloadCsv(`daily-report-${dailySummary.date}.csv`, lines.join('\n'));
-    toast('Report exported to Excel', 'success');
+    toast('Daily report CSV downloaded', 'success');
+  };
+
+  const exportDailyReportXlsx = () => {
+    if (!dailySummary) return;
+    const sum = dailySummary.summary || {};
+    const summaryAoa = [
+      ['Daily attendance report', dailySummary.date],
+      [],
+      ['Total employees', 'Present', 'Present %', 'Absent', 'Absent %', 'Late', 'Late %'],
+      [
+        sum.total_employees ?? dailySummary.total_staff,
+        sum.present_count ?? dailySummary.present,
+        sum.present_pct ?? dailySummary.pct_present,
+        sum.absent_count ?? dailySummary.absent,
+        sum.absent_pct ?? dailySummary.pct_absent,
+        sum.late_count ?? dailySummary.late,
+        sum.late_pct ?? dailySummary.pct_late,
+      ],
+    ];
+    const tableJson = (dailySummary.daily_table || []).map((r) => ({
+      employee_name: r.employee_name ?? '',
+      department: r.department ?? '',
+      check_in: r.check_in ?? '',
+      check_out: r.check_out ?? '',
+      status: r.status ?? '',
+      late_minutes: r.late_minutes ?? 0,
+    }));
+    downloadXlsx(`daily-report-${dailySummary.date}.xlsx`, [
+      { name: 'Summary', aoa: summaryAoa },
+      { name: 'Attendance', json: tableJson },
+    ]);
+    toast('Daily report XLSX downloaded', 'success');
   };
 
   const printReportSafe = () => {
+    const prev = document.title;
+    const stamp = new Date().toISOString().slice(0, 10);
+    if (reportMode === REPORT_MODE.LEAVE) {
+      document.title = `Leave-report-${fromDate}-to-${toDate}-asof-${leaveAsOf}`;
+    } else if (reportMode === REPORT_MODE.RECOGNITION) {
+      document.title = `Recognition-report-${fromDate}-to-${toDate}`;
+    } else if (reportMode === REPORT_MODE.RAW) {
+      document.title = `Attendance-raw-${fromDate}-to-${toDate}`;
+    } else if (reportMode === REPORT_MODE.DAILY && dailySummary?.date) {
+      document.title = `Daily-attendance-${dailySummary.date}`;
+    } else if (reportMode === REPORT_MODE.MONTHLY && monthlySummary) {
+      document.title = `Monthly-attendance-${monthlySummary.year}-${String(monthlySummary.month).padStart(2, '0')}`;
+    } else if (reportMode === REPORT_MODE.PERFORMANCE && performanceReport?.cycle) {
+      const cy = performanceReport.cycle;
+      document.title = `Performance-appraisal-${cy.year ?? ''}-${cy.quarter || cy.type || 'cycle'}`;
+    } else if (reportMode === REPORT_MODE.ORG_REPORT) {
+      document.title = `Organization-report-${stamp}`;
+    } else {
+      document.title = `HR-reports-${stamp}`;
+    }
     window.print();
+    setTimeout(() => {
+      document.title = prev;
+    }, 800);
   };
 
-  const exportMonthlyReport = () => {
+  const exportMonthlyReportCsv = () => {
     if (!monthlySummary) return;
     const ex = monthlySummary.executive_summary || {};
     const lines = [
@@ -238,7 +382,56 @@ export function HRReports() {
       ].map(escapeCsvCell).join(',')),
     ];
     downloadCsv(`monthly-report-${monthlySummary.year}-${String(monthlySummary.month).padStart(2, '0')}.csv`, lines.join('\n'));
-    toast('Report exported to Excel', 'success');
+    toast('Monthly report CSV downloaded', 'success');
+  };
+
+  const exportMonthlyReportXlsx = () => {
+    if (!monthlySummary) return;
+    const ex = monthlySummary.executive_summary || {};
+    const ym = `${monthlySummary.year}-${String(monthlySummary.month).padStart(2, '0')}`;
+    const execAoa = [
+      ['Monthly attendance report', ym],
+      [],
+      ['Overall attendance %', 'Overall absence %', 'Overall late %', 'Trend attendance', 'Trend absence', 'Trend late'],
+      [ex.overall_attendance_pct, ex.overall_absence_pct, ex.overall_late_pct, ex.trend_attendance, ex.trend_absence, ex.trend_late],
+    ];
+    const deptJson = (monthlySummary.department_summary || []).map((r) => ({
+      department: r.department,
+      employee_count: r.employee_count,
+      avg_attendance_pct: r.avg_attendance_pct,
+      absence_pct: r.absence_pct,
+      late_pct: r.late_pct,
+    }));
+    const staffJson = (monthlySummary.staff_monthly || []).map((r) => ({
+      employee_name: r.employee_name ?? r.full_name ?? '',
+      department: r.department ?? '',
+      work_days: r.work_days ?? 0,
+      present_days: r.present_days ?? 0,
+      absent_days: r.days_absent ?? 0,
+      late_days: r.days_late ?? 0,
+      attendance_pct: r.attendance_pct ?? 0,
+      late_pct: r.pct_late ?? 0,
+    }));
+    const daysJson = (monthlySummary.days || []).map((d) => ({
+      date: d.date,
+      total_staff: d.total_staff,
+      present: d.present,
+      absent: d.absent,
+      late: d.late,
+      on_time: d.on_time,
+      no_clock_out: d.no_clock_out,
+      pct_late: d.pct_late,
+      pct_on_time: d.pct_on_time,
+      pct_absent: d.pct_absent,
+      pct_no_clock_out: d.pct_no_clock_out ?? '',
+    }));
+    downloadXlsx(`monthly-report-${ym}.xlsx`, [
+      { name: 'Executive', aoa: execAoa },
+      { name: 'Departments', json: deptJson },
+      { name: 'Staff', json: staffJson },
+      { name: 'By day', json: daysJson },
+    ]);
+    toast('Monthly report XLSX downloaded', 'success');
   };
 
   const exportLeaveReport = () => {
@@ -246,8 +439,6 @@ export function HRReports() {
     const p = leaveReport.period || {};
     const lines = [
       `Leave report (HR), period ${p.from_date ?? fromDate} to ${p.to_date ?? toDate}, on-leave snapshot as of ${p.as_of ?? leaveAsOf}`,
-      leaveReport.note || '',
-      '',
       'Headline metrics',
       'Staff in scope (active non-admin),On leave as of snapshot (distinct staff),No approved leave in period (distinct staff),Total requests (overlap period),Approved requests,Rejected requests,Approved days in period (taken),Pending days in period,Pending requests in period',
       [
@@ -287,12 +478,14 @@ export function HRReports() {
       ),
       '',
       'On leave as of snapshot (detail)',
-      'Employee,Email,Department,Leave type,Start,End,Days',
+      'Employee,Email,Department,Branch,Phone,Leave type,Start,End,Days',
       ...(leaveReport.on_leave_as_of || []).map((r) =>
         [
           r.full_name ?? '',
           r.email ?? '',
           r.department ?? '',
+          r.branch_name ?? '',
+          r.phone ?? '',
           r.leave_type_name ?? '',
           r.start_date ?? '',
           r.end_date ?? '',
@@ -301,18 +494,20 @@ export function HRReports() {
       ),
       '',
       'No approved leave overlapping period (sample up to 400)',
-      'Employee,Email,Department,Role',
+      'Employee,Email,Department,Branch,Phone,Role',
       ...(leaveReport.no_approved_leave_in_period || []).map((r) =>
-        [r.full_name ?? '', r.email ?? '', r.department ?? '', r.role ?? ''].map(escapeCsvCell).join(','),
+        [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.role ?? ''].map(escapeCsvCell).join(','),
       ),
       '',
       'By person: taken vs pending (overlap period)',
-      'Employee,Email,Department,Taken days,Taken requests,Pending days,Pending requests,Total days',
+      'Employee,Email,Department,Branch,Phone,Taken days,Taken requests,Pending days,Pending requests,Total days',
       ...(leaveReport.staff_leave_activity || []).map((r) =>
         [
           r.full_name ?? '',
           r.email ?? '',
           r.department ?? '',
+          r.branch_name ?? '',
+          r.phone ?? '',
           r.approved_days ?? 0,
           r.approved_requests ?? 0,
           r.pending_days ?? 0,
@@ -322,11 +517,443 @@ export function HRReports() {
       ),
       '',
       'Top requesters by request count (overlap period)',
-      'Employee,Email,Requests,Days',
-      ...(leaveReport.top_requesters || []).map((r) => [r.full_name ?? '', r.email ?? '', r.total_requests ?? 0, r.total_days ?? 0].map(escapeCsvCell).join(',')),
+      'Employee,Email,Department,Branch,Phone,Requests,Days',
+      ...(leaveReport.top_requesters || []).map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.total_requests ?? 0, r.total_days ?? 0].map(escapeCsvCell).join(',')),
+      '',
+      `Leave balances by type (year ${leaveReport.period?.balance_year ?? leaveBalanceYear})`,
+      'Employee,Email,Department,Branch,Phone,Leave type,Allocated,Used,Remaining',
+      ...((leaveReport.staff_leave_balance_rows || []).map((r) =>
+        [
+          r.full_name ?? '',
+          r.email ?? '',
+          r.department ?? '',
+          r.branch_name ?? '',
+          r.phone ?? '',
+          r.leave_type_name ?? '',
+          r.allocated_days ?? '',
+          r.used_days ?? '',
+          r.remaining_days ?? '',
+        ].map(escapeCsvCell).join(','),
+      )),
+      '',
+      'Total remaining leave days per employee (sum of types)',
+      'Employee,Email,Department,Branch,Phone,Total remaining',
+      ...((leaveReport.staff_leave_balance_totals || []).map((r) =>
+        [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.total_remaining_days ?? 0].map(escapeCsvCell).join(','),
+      )),
     ];
     downloadCsv(`leave-report-${fromDate}-to-${toDate}.csv`, lines.join('\n'));
     toast('Leave report CSV exported', 'success');
+  };
+
+  const exportLeaveReportXlsx = () => {
+    if (!leaveReport) return;
+    const p = leaveReport.period || {};
+    const summaryAoa = [
+      ['Leave report (HR)'],
+      ['Period', `${p.from_date ?? fromDate} → ${p.to_date ?? toDate}`],
+      ['On-leave snapshot as of', p.as_of ?? leaveAsOf],
+      ['Balance year', p.balance_year ?? leaveBalanceYear],
+      [],
+      ['Staff in scope', 'On leave (snapshot)', 'No approved leave in period', 'Total requests', 'Approved', 'Rejected'],
+      [
+        leaveReport.staff_in_scope ?? '',
+        leaveReport.on_leave_as_of_count ?? '',
+        leaveReport.no_approved_leave_in_period_count ?? '',
+        leaveReport.total_requests ?? 0,
+        leaveReport.approved_count ?? 0,
+        leaveReport.rejected_count ?? 0,
+      ],
+    ];
+    const onLeaveJson = (leaveReport.on_leave_as_of || []).map((r) => ({
+      employee: r.full_name ?? '',
+      email: r.email ?? '',
+      department: r.department ?? '',
+      branch: r.branch_name ?? '',
+      phone: r.phone ?? '',
+      leave_type: r.leave_type_name ?? '',
+      start: r.start_date ?? '',
+      end: r.end_date ?? '',
+      days: r.days_requested ?? '',
+    }));
+    const balanceJson = (leaveReport.staff_leave_balance_rows || []).map((r) => ({
+      employee: r.full_name ?? '',
+      email: r.email ?? '',
+      department: r.department ?? '',
+      branch: r.branch_name ?? '',
+      phone: r.phone ?? '',
+      leave_type: r.leave_type_name ?? '',
+      allocated: r.allocated_days ?? '',
+      used: r.used_days ?? '',
+      remaining: r.remaining_days ?? '',
+    }));
+    const totalsJson = (leaveReport.staff_leave_balance_totals || []).map((r) => ({
+      employee: r.full_name ?? '',
+      email: r.email ?? '',
+      department: r.department ?? '',
+      branch: r.branch_name ?? '',
+      phone: r.phone ?? '',
+      total_remaining_days: r.total_remaining_days ?? 0,
+    }));
+    const deptJson = (leaveReport.department_breakdown || []).map((r) => ({
+      department: r.department ?? '',
+      active_staff: r.active_staff ?? 0,
+      on_leave_as_of: r.on_leave_as_of ?? 0,
+      requests_in_period: r.requests_in_period ?? 0,
+      approved_days: r.approved_days_in_period ?? 0,
+      pending_days: r.pending_days_in_period ?? 0,
+    }));
+    downloadXlsx(`leave-report-${fromDate}-to-${toDate}.xlsx`, [
+      { name: 'Summary', aoa: summaryAoa },
+      { name: 'On leave', json: onLeaveJson },
+      { name: 'Dept breakdown', json: deptJson },
+      { name: 'Balances', json: balanceJson },
+      { name: 'Balance totals', json: totalsJson },
+    ]);
+    toast('Leave report XLSX downloaded', 'success');
+  };
+
+  const exportLeaveSectionCsv = (name, headers, rows, intro = []) => {
+    if (!leaveReport) return;
+    const p = leaveReport.period || {};
+    const lines = [
+      `HR leave report export: ${name}`,
+      `Period: ${p.from_date ?? fromDate} to ${p.to_date ?? toDate}`,
+      `Snapshot as of: ${p.as_of ?? leaveAsOf}`,
+      ...(intro || []),
+      '',
+      headers.map(escapeCsvCell).join(','),
+      ...(rows || []).map((row) => row.map(escapeCsvCell).join(',')),
+    ];
+    downloadCsv(`leave-${name}-${p.from_date ?? fromDate}-to-${p.to_date ?? toDate}.csv`, lines.join('\n'));
+    toast(`${name} CSV downloaded`, 'success');
+  };
+
+  const exportLeaveDepartmentCsv = () => {
+    exportLeaveSectionCsv(
+      'department-breakdown',
+      ['Department', 'Active staff', 'On leave', 'Requests', 'Days (all)', 'Taken (approved days)', 'Pending days', 'Pending requests', 'No approved in period'],
+      (leaveReport?.department_breakdown || []).map((row) => [
+        row.department ?? '',
+        row.active_staff ?? 0,
+        row.on_leave_as_of ?? 0,
+        row.requests_in_period ?? 0,
+        row.total_days_in_period ?? 0,
+        row.approved_days_in_period ?? 0,
+        row.pending_days_in_period ?? 0,
+        row.pending_requests_in_period ?? 0,
+        row.no_approved_leave_in_period ?? 0,
+      ]),
+    );
+  };
+
+  const exportLeaveNoApprovedCsv = () => {
+    exportLeaveSectionCsv(
+      'no-approved-in-period',
+      ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Role'],
+      (leaveReport?.no_approved_leave_in_period || []).map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.role ?? '']),
+      ['Sample list only. Use Full CSV/XLSX from Exports for complete data when truncated.'],
+    );
+  };
+
+  const exportLeaveActivityCsv = () => {
+    exportLeaveSectionCsv(
+      'staff-activity',
+      ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Taken (days)', 'Taken (requests)', 'Pending (days)', 'Pending (requests)', 'All days'],
+      (leaveReport?.staff_leave_activity || []).map((r) => [
+        r.full_name ?? '',
+        r.email ?? '',
+        r.department ?? '',
+        r.branch_name ?? '',
+        r.phone ?? '',
+        Number(r.approved_days ?? 0).toFixed(1),
+        r.approved_requests ?? 0,
+        Number(r.pending_days ?? 0).toFixed(1),
+        r.pending_requests ?? 0,
+        Number(r.total_days ?? 0).toFixed(1),
+      ]),
+    );
+  };
+
+  const exportLeaveBalanceTotalsCsv = () => {
+    exportLeaveSectionCsv(
+      'remaining-balances',
+      ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Total remaining (days)'],
+      (leaveReport?.staff_leave_balance_totals || []).map((r) => [
+        r.full_name ?? '',
+        r.email ?? '',
+        r.department ?? '',
+        r.branch_name ?? '',
+        r.phone ?? '',
+        Number(r.total_remaining_days ?? 0).toFixed(1),
+      ]),
+      [`Balance year: ${leaveReport?.period?.balance_year ?? leaveBalanceYear}`],
+    );
+  };
+
+  const exportLeaveTopRequestersCsv = () => {
+    exportLeaveSectionCsv(
+      'top-requesters',
+      ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Requests', 'Days'],
+      (leaveReport?.top_requesters || []).map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.total_requests ?? 0, Number(r.total_days ?? 0).toFixed(1)]),
+    );
+  };
+
+  const exportSelectedLeaveCsv = () => {
+    if (!leaveReport) return;
+    const p = leaveReport.period || {};
+    let name = 'leave-report';
+    let headers = [];
+    let rows = [];
+    if (leaveReportSection === 'on_leave') {
+      name = 'employee-on-leave';
+      headers = ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Leave type', 'Start', 'End', 'Days'];
+      rows = filteredOnLeaveRows.map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.leave_type_name ?? '', r.start_date ?? '', r.end_date ?? '', Number(r.days_requested ?? 0).toFixed(1)]);
+    } else if (leaveReportSection === 'approved') {
+      name = 'employee-leave-approved';
+      headers = ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Leave type', 'Start', 'End', 'Days', 'Status', 'Final decision at'];
+      rows = filteredApprovedRows.map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.leave_type_name ?? '', r.start_date ?? '', r.end_date ?? '', Number(r.days_requested ?? 0).toFixed(1), r.status ?? '', r.final_decision_at ?? '']);
+    } else if (leaveReportSection === 'pending') {
+      name = 'employee-leave-pending';
+      headers = ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Leave type', 'Start', 'End', 'Days', 'Status', 'Updated at'];
+      rows = filteredPendingRows.map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.leave_type_name ?? '', r.start_date ?? '', r.end_date ?? '', Number(r.days_requested ?? 0).toFixed(1), r.status ?? '', r.updated_at ?? '']);
+    } else if (leaveReportSection === 'balances') {
+      name = 'employee-leave-balances';
+      headers = ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Leave type', 'Allocated', 'Used', 'Remaining'];
+      rows = filteredBalanceRows.map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.leave_type_name ?? '', Number(r.allocated_days ?? 0).toFixed(1), Number(r.used_days ?? 0).toFixed(1), Number(r.remaining_days ?? 0).toFixed(1)]);
+    } else if (leaveReportSection === 'activity') {
+      name = 'employee-leave-activity';
+      headers = ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Taken (days)', 'Taken (requests)', 'Pending (days)', 'Pending (requests)', 'All days'];
+      rows = (leaveReport?.staff_leave_activity || []).map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', Number(r.approved_days ?? 0).toFixed(1), r.approved_requests ?? 0, Number(r.pending_days ?? 0).toFixed(1), r.pending_requests ?? 0, Number(r.total_days ?? 0).toFixed(1)]);
+    } else if (leaveReportSection === 'top_requesters') {
+      name = 'top-requesters';
+      headers = ['Employee', 'Email', 'Department', 'Branch', 'Phone', 'Requests', 'Days'];
+      rows = (leaveReport?.top_requesters || []).map((r) => [r.full_name ?? '', r.email ?? '', r.department ?? '', r.branch_name ?? '', r.phone ?? '', r.total_requests ?? 0, Number(r.total_days ?? 0).toFixed(1)]);
+    } else {
+      name = 'leave-department-summary';
+      headers = ['Department', 'Active staff', 'On leave', 'Requests', 'Days (all)', 'Taken (approved days)', 'Pending days', 'Pending requests', 'No approved in period'];
+      rows = (leaveReport?.department_breakdown || []).map((row) => [row.department ?? '', row.active_staff ?? 0, row.on_leave_as_of ?? 0, row.requests_in_period ?? 0, row.total_days_in_period ?? 0, row.approved_days_in_period ?? 0, row.pending_days_in_period ?? 0, row.pending_requests_in_period ?? 0, row.no_approved_leave_in_period ?? 0]);
+    }
+    const lines = [
+      `Leave report export: ${name}`,
+      `Period: ${p.from_date ?? fromDate} to ${p.to_date ?? toDate}`,
+      `Snapshot as of: ${p.as_of ?? leaveAsOf}`,
+      `Department: ${leaveDeptFilter || 'All departments'}`,
+      `Leave type: ${leaveTypeFilter || 'All leave types'}`,
+      '',
+      headers.map(escapeCsvCell).join(','),
+      ...rows.map((row) => row.map(escapeCsvCell).join(',')),
+    ];
+    downloadCsv(`leave-${name}-${p.from_date ?? fromDate}-to-${p.to_date ?? toDate}.csv`, lines.join('\n'));
+    toast('Leave CSV downloaded', 'success');
+  };
+
+  const exportSelectedLeaveXlsx = () => {
+    if (!leaveReport) return;
+    const p = leaveReport.period || {};
+    let sheetName = 'Leave';
+    let json = [];
+    if (leaveReportSection === 'on_leave') {
+      sheetName = 'On leave';
+      json = filteredOnLeaveRows.map((r) => ({ employee: r.full_name ?? '', email: r.email ?? '', department: r.department ?? '', branch: r.branch_name ?? '', phone: r.phone ?? '', leave_type: r.leave_type_name ?? '', start: r.start_date ?? '', end: r.end_date ?? '', days: Number(r.days_requested ?? 0).toFixed(1) }));
+    } else if (leaveReportSection === 'approved') {
+      sheetName = 'Approved';
+      json = filteredApprovedRows.map((r) => ({ employee: r.full_name ?? '', email: r.email ?? '', department: r.department ?? '', branch: r.branch_name ?? '', phone: r.phone ?? '', leave_type: r.leave_type_name ?? '', start: r.start_date ?? '', end: r.end_date ?? '', days: Number(r.days_requested ?? 0).toFixed(1), status: r.status ?? '', final_decision_at: r.final_decision_at ?? '' }));
+    } else if (leaveReportSection === 'pending') {
+      sheetName = 'Pending';
+      json = filteredPendingRows.map((r) => ({ employee: r.full_name ?? '', email: r.email ?? '', department: r.department ?? '', branch: r.branch_name ?? '', phone: r.phone ?? '', leave_type: r.leave_type_name ?? '', start: r.start_date ?? '', end: r.end_date ?? '', days: Number(r.days_requested ?? 0).toFixed(1), status: r.status ?? '', updated_at: r.updated_at ?? '' }));
+    } else if (leaveReportSection === 'balances') {
+      sheetName = 'Balances';
+      json = filteredBalanceRows.map((r) => ({ employee: r.full_name ?? '', email: r.email ?? '', department: r.department ?? '', branch: r.branch_name ?? '', phone: r.phone ?? '', leave_type: r.leave_type_name ?? '', allocated: Number(r.allocated_days ?? 0).toFixed(1), used: Number(r.used_days ?? 0).toFixed(1), remaining: Number(r.remaining_days ?? 0).toFixed(1) }));
+    } else if (leaveReportSection === 'activity') {
+      sheetName = 'Activity';
+      json = (leaveReport?.staff_leave_activity || []).map((r) => ({ employee: r.full_name ?? '', email: r.email ?? '', department: r.department ?? '', branch: r.branch_name ?? '', phone: r.phone ?? '', taken_days: Number(r.approved_days ?? 0).toFixed(1), taken_requests: r.approved_requests ?? 0, pending_days: Number(r.pending_days ?? 0).toFixed(1), pending_requests: r.pending_requests ?? 0, all_days: Number(r.total_days ?? 0).toFixed(1) }));
+    } else if (leaveReportSection === 'top_requesters') {
+      sheetName = 'Top requesters';
+      json = (leaveReport?.top_requesters || []).map((r) => ({ employee: r.full_name ?? '', email: r.email ?? '', department: r.department ?? '', branch: r.branch_name ?? '', phone: r.phone ?? '', requests: r.total_requests ?? 0, days: Number(r.total_days ?? 0).toFixed(1) }));
+    } else {
+      sheetName = 'Department';
+      json = (leaveReport?.department_breakdown || []).map((row) => ({ department: row.department ?? '', active_staff: row.active_staff ?? 0, on_leave: row.on_leave_as_of ?? 0, requests: row.requests_in_period ?? 0, days_all: row.total_days_in_period ?? 0, taken_days: row.approved_days_in_period ?? 0, pending_days: row.pending_days_in_period ?? 0, pending_requests: row.pending_requests_in_period ?? 0, no_approved_in_period: row.no_approved_leave_in_period ?? 0 }));
+    }
+    const infoAoa = [
+      ['Leave report export'],
+      ['Section', sheetName],
+      ['Period', `${p.from_date ?? fromDate} → ${p.to_date ?? toDate}`],
+      ['Snapshot as of', p.as_of ?? leaveAsOf],
+      ['Department', leaveDeptFilter || 'All departments'],
+      ['Leave type', leaveTypeFilter || 'All leave types'],
+    ];
+    downloadXlsx(`leave-${sheetName.toLowerCase().replace(/\s+/g, '-')}-${p.from_date ?? fromDate}-to-${p.to_date ?? toDate}.xlsx`, [
+      { name: 'Info', aoa: infoAoa },
+      { name: sheetName, json },
+    ]);
+    toast('Leave XLSX downloaded', 'success');
+  };
+
+  const runLeaveExport = () => {
+    if (!leaveReport) return;
+    if (leaveExportType === 'excel') return exportSelectedLeaveXlsx();
+    if (leaveExportType === 'csv') return exportSelectedLeaveCsv();
+    if (leaveExportType === 'pdf') return printReportSafe();
+  };
+
+  const exportOrganizationCsv = () => {
+    if (!organizationOverview) return;
+    downloadOrganizationDemographicsCsv(organizationOverview);
+    toast('Demographics CSV downloaded', 'success');
+  };
+
+  const exportPerformanceReportCsv = () => {
+    if (!performanceReport?.cycle) return;
+    const cy = performanceReport.cycle;
+    const label = `y${cy.year ?? ''}-${cy.quarter || cy.type || 'cycle'}`;
+    const kpiHead = ['Employee', 'Email', 'Department', 'Role', 'KPI count', 'Draft', 'Pending supervisor', 'Returned', 'Verified', 'Approved', 'Received', 'Acknowledged'];
+    const apHead = ['Employee', 'Email', 'Department', 'Role', 'Appraisal count', 'Draft', 'Pending supervisor', 'Returned', 'Verified', 'Approved', 'Received', 'Acknowledged'];
+    const lines = [
+      `Performance & appraisal report, cycle ${label}, id ${cy.id}`,
+      performanceReport.note || '',
+      '',
+      'KPI rows by status (all KPIs in cycle)',
+      'Status,Count',
+      ...(performanceReport.kpi_by_status || []).map((r) => [r.status ?? '', r.count ?? 0].map(escapeCsvCell).join(',')),
+      '',
+      'Appraisal rows by status',
+      'Status,Count',
+      ...(performanceReport.appraisal_by_status || []).map((r) => [r.status ?? '', r.count ?? 0].map(escapeCsvCell).join(',')),
+      '',
+      'KPI by employee',
+      kpiHead.join(','),
+      ...(performanceReport.kpi_by_staff || []).map((r) =>
+        [
+          r.full_name ?? '',
+          r.email ?? '',
+          r.department ?? '',
+          r.role ?? '',
+          r.kpi_count ?? 0,
+          r.kpi_draft ?? 0,
+          r.kpi_pending_supervisor ?? 0,
+          r.kpi_returned ?? 0,
+          r.kpi_verified ?? 0,
+          r.kpi_approved ?? 0,
+          r.kpi_received ?? 0,
+          r.kpi_acknowledged ?? 0,
+        ].map(escapeCsvCell).join(','),
+      ),
+      '',
+      'Appraisal by employee',
+      apHead.join(','),
+      ...(performanceReport.appraisal_by_staff || []).map((r) =>
+        [
+          r.full_name ?? '',
+          r.email ?? '',
+          r.department ?? '',
+          r.role ?? '',
+          r.appraisal_count ?? 0,
+          r.ap_draft ?? 0,
+          r.ap_pending_supervisor ?? 0,
+          r.ap_returned ?? 0,
+          r.ap_verified ?? 0,
+          r.ap_approved ?? 0,
+          r.ap_received ?? 0,
+          r.ap_acknowledged ?? 0,
+        ].map(escapeCsvCell).join(','),
+      ),
+    ];
+    downloadCsv(`appraisal-performance-${label}.csv`, lines.join('\n'));
+    toast('Performance report CSV downloaded', 'success');
+  };
+
+  const exportPerformanceReportXlsx = () => {
+    if (!performanceReport?.cycle) return;
+    const cy = performanceReport.cycle;
+    const label = `y${cy.year ?? ''}-${cy.quarter || cy.type || 'cycle'}`;
+    const summaryAoa = [
+      ['Performance & appraisal'],
+      ['Cycle', `${cy.year ?? ''} ${cy.quarter || ''} (${cy.type})`, cy.status],
+      ['Cycle id', cy.id],
+      ['Staff in scope (active non-admin)', performanceReport.staff_in_scope ?? ''],
+      [performanceReport.note || ''],
+    ];
+    const kpiStatusJson = (performanceReport.kpi_by_status || []).map((r) => ({ status: r.status, count: r.count }));
+    const apStatusJson = (performanceReport.appraisal_by_status || []).map((r) => ({ status: r.status, count: r.count }));
+    const kpiStaffJson = (performanceReport.kpi_by_staff || []).map((r) => ({
+      employee: r.full_name,
+      email: r.email,
+      department: r.department,
+      role: r.role,
+      kpi_count: r.kpi_count,
+      draft: r.kpi_draft,
+      pending_supervisor: r.kpi_pending_supervisor,
+      returned: r.kpi_returned,
+      verified: r.kpi_verified,
+      approved: r.kpi_approved,
+      received: r.kpi_received,
+      acknowledged: r.kpi_acknowledged,
+    }));
+    const apStaffJson = (performanceReport.appraisal_by_staff || []).map((r) => ({
+      employee: r.full_name,
+      email: r.email,
+      department: r.department,
+      role: r.role,
+      appraisal_count: r.appraisal_count,
+      draft: r.ap_draft,
+      pending_supervisor: r.ap_pending_supervisor,
+      returned: r.ap_returned,
+      verified: r.ap_verified,
+      approved: r.ap_approved,
+      received: r.ap_received,
+      acknowledged: r.ap_acknowledged,
+    }));
+    downloadXlsx(`appraisal-performance-${label}.xlsx`, [
+      { name: 'Summary', aoa: summaryAoa },
+      { name: 'KPI by status', json: kpiStatusJson },
+      { name: 'Appraisal by status', json: apStatusJson },
+      { name: 'KPI by staff', json: kpiStaffJson },
+      { name: 'Appraisal by staff', json: apStaffJson },
+    ]);
+    toast('Performance report XLSX downloaded', 'success');
+  };
+
+  const exportRecognitionReportCsv = () => {
+    if (!recognitionReport) return;
+    const lines = [
+      `Recognition report, period ${fromDate} to ${toDate}`,
+      '',
+      'Summary',
+      'Total recognitions',
+      `${recognitionReport.total_count ?? 0}`,
+      '',
+      'By type',
+      'Type,Count',
+      ...((recognitionReport.by_type || []).map((r) => [r.recognition_type ?? '', r.count ?? 0].map(escapeCsvCell).join(','))),
+      '',
+      'Recent recognitions',
+      'Date,From,Type,Message,Likes,Comments',
+      ...((recognitionReport.recent || []).map((r) =>
+        [
+          r.created_at ?? '',
+          r.from_name ?? '',
+          r.recognition_type ?? '',
+          r.message ?? '',
+          r.like_count ?? 0,
+          r.comment_count ?? 0,
+        ].map(escapeCsvCell).join(','))),
+    ];
+    downloadCsv(`recognition-report-${fromDate}-to-${toDate}.csv`, lines.join('\n'));
+    toast('Recognition report CSV downloaded', 'success');
+  };
+
+  const runRecognitionExport = () => {
+    if (!recognitionReport) return;
+    if (recognitionExportType === 'csv') return exportRecognitionReportCsv();
+    if (recognitionExportType === 'print_pdf') return printReportSafe();
+  };
+
+  const runPerformanceExport = () => {
+    if (!performanceReport?.cycle) return;
+    if (performanceExportType === 'xlsx') return exportPerformanceReportXlsx();
+    if (performanceExportType === 'csv') return exportPerformanceReportCsv();
+    if (performanceExportType === 'print_pdf') return printReportSafe();
   };
 
   const byDate = logs.reduce((acc, l) => {
@@ -341,99 +968,185 @@ export function HRReports() {
     if (list?.length) setModal({ title, list });
   };
 
-  const reportTabs = [
-    { id: REPORT_MODE.DAILY, label: 'Daily', hint: 'Snapshot for one day' },
-    { id: REPORT_MODE.MONTHLY, label: 'Monthly', hint: 'Trends & departments' },
-    { id: REPORT_MODE.RAW, label: 'Raw attendance', hint: 'Date range & CSV' },
-    { id: REPORT_MODE.RECOGNITION, label: 'Recognition', hint: 'Peer recognition stats' },
-    { id: REPORT_MODE.LEAVE, label: 'Leave', hint: 'Dept analytics, on leave, CSV' },
-  ];
+  const allReportTabs = useMemo(
+    () => [
+      { id: REPORT_MODE.DAILY, label: 'Daily', hint: 'Snapshot for one day' },
+      { id: REPORT_MODE.MONTHLY, label: 'Monthly', hint: 'Trends & departments' },
+      { id: REPORT_MODE.RAW, label: 'Raw attendance', hint: 'Date range, XLSX, CSV, print' },
+      { id: REPORT_MODE.RECOGNITION, label: 'Recognition', hint: 'Peer recognition stats' },
+      { id: REPORT_MODE.LEAVE, label: 'Leave', hint: 'Period dates, balances, XLSX / CSV / PDF' },
+      { id: REPORT_MODE.PERFORMANCE, label: 'Performance', hint: 'KPI & appraisal cycle status' },
+      { id: REPORT_MODE.ORG_REPORT, label: 'Organization', hint: 'Workforce demographics & structure' },
+    ],
+    [],
+  );
+
+  const reportTabs = useMemo(() => {
+    if (reportScope === 'attendance') {
+      return allReportTabs.filter((t) =>
+        [REPORT_MODE.DAILY, REPORT_MODE.MONTHLY, REPORT_MODE.RAW].includes(t.id),
+      );
+    }
+    if (reportScope === 'leave') return allReportTabs.filter((t) => t.id === REPORT_MODE.LEAVE);
+    if (reportScope === 'recognition') return allReportTabs.filter((t) => t.id === REPORT_MODE.RECOGNITION);
+    if (reportScope === 'performance') return allReportTabs.filter((t) => t.id === REPORT_MODE.PERFORMANCE);
+    if (reportScope === 'organization') return allReportTabs.filter((t) => t.id === REPORT_MODE.ORG_REPORT);
+    return allReportTabs;
+  }, [allReportTabs, reportScope]);
+
+  const leaveTypeOptions = useMemo(() => {
+    const set = new Set();
+    (leaveReport?.on_leave_as_of || []).forEach((r) => {
+      if ((r.leave_type_name || '').trim()) set.add(r.leave_type_name.trim());
+    });
+    (leaveReport?.approved_requests_rows || []).forEach((r) => {
+      if ((r.leave_type_name || '').trim()) set.add(r.leave_type_name.trim());
+    });
+    (leaveReport?.pending_requests_rows || []).forEach((r) => {
+      if ((r.leave_type_name || '').trim()) set.add(r.leave_type_name.trim());
+    });
+    (leaveReport?.staff_leave_balance_rows || []).forEach((r) => {
+      if ((r.leave_type_name || '').trim()) set.add(r.leave_type_name.trim());
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [leaveReport]);
+
+  const filteredOnLeaveRows = useMemo(
+    () => (leaveReport?.on_leave_as_of || []).filter((r) => !leaveTypeFilter || (r.leave_type_name || '') === leaveTypeFilter),
+    [leaveReport, leaveTypeFilter],
+  );
+  const filteredApprovedRows = useMemo(
+    () => (leaveReport?.approved_requests_rows || []).filter((r) => !leaveTypeFilter || (r.leave_type_name || '') === leaveTypeFilter),
+    [leaveReport, leaveTypeFilter],
+  );
+  const filteredPendingRows = useMemo(
+    () => (leaveReport?.pending_requests_rows || []).filter((r) => !leaveTypeFilter || (r.leave_type_name || '') === leaveTypeFilter),
+    [leaveReport, leaveTypeFilter],
+  );
+  const filteredBalanceRows = useMemo(
+    () => (leaveReport?.staff_leave_balance_rows || []).filter((r) => !leaveTypeFilter || (r.leave_type_name || '') === leaveTypeFilter),
+    [leaveReport, leaveTypeFilter],
+  );
+
+  const scopeTitle =
+    reportScope === 'attendance'
+      ? 'Attendance reports'
+      : reportScope === 'leave'
+        ? 'Leave reports'
+        : reportScope === 'recognition'
+          ? 'Recognition reports'
+          : reportScope === 'performance'
+            ? 'Performance & appraisal reports'
+            : reportScope === 'organization'
+              ? 'Organization report'
+              : 'HR reports';
+
+  const scopeSubtitle =
+    reportScope === 'attendance'
+      ? 'Daily, monthly, and raw attendance with branch filters, CSV, XLSX, and print.'
+      : reportScope === 'leave'
+        ? 'Leave period analytics, on-leave snapshot, balances by year, and exports.'
+        : reportScope === 'recognition'
+          ? 'Peer recognition counts and recent entries.'
+          : reportScope === 'performance'
+            ? 'KPI submissions and evaluations, plus appraisal self-assessment workflow, by appraisal cycle.'
+            : reportScope === 'organization'
+              ? 'Whole-organization headcount, gender, age bands, departments, branches, and demographics CSV — same data as the organization dashboard, in a report-first layout.'
+              : 'Pick a module tab below, or use the Reports section in the sidebar for a focused view.';
 
   return (
-    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-6 pb-8">
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.2 }}
+      className="space-y-6 pb-8"
+    >
+      <div className="print-hidden space-y-6">
+      {reportScope !== 'all' && (
+        <Link
+          to={ROUTES.HR.REPORTS}
+          className="inline-flex items-center gap-2 text-sm font-medium text-primary-600 dark:text-primary-400 hover:underline"
+        >
+          ← All reports
+        </Link>
+      )}
       <DashboardPageHeader
-        badge="Reports hub"
-        title="HR reports"
-        subtitle="Pick a report type below. Attendance reports support branch filters; raw and leave modes include CSV export. For headcount, gender, age, and active vs former staff, use the organization workspace - then return here for day-to-day attendance and leave."
+        badge="Reports"
+        title={scopeTitle}
+        subtitle={scopeSubtitle}
       />
 
-      <div className="grid gap-4 md:grid-cols-2">
-        <Link
-          to={ROUTES.HR.ORGANIZATION}
-          className="group rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-gradient-to-br from-violet-50/95 to-white dark:from-violet-950/35 dark:to-slate-900/80 p-5 shadow-soft hover:border-violet-300/80 dark:hover:border-violet-600/50 transition-all"
-        >
-          <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-violet-700 dark:text-violet-300">Workforce</p>
-          <p className="text-lg font-bold text-slate-900 dark:text-white mt-1 group-hover:text-violet-900 dark:group-hover:text-violet-100">
-            Organization dashboard
-          </p>
-          <p className="text-sm text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
-            Women and men, age bands, active vs no-longer-active, departments and branches, plus a demographics CSV export.
-          </p>
-          <span className="inline-block mt-3 text-sm font-semibold text-primary-600 dark:text-primary-400">Open overview →</span>
-        </Link>
-        <Link
-          to={ROUTES.HR.EMPLOYEES}
-          className="group rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft hover:border-primary-300/80 dark:hover:border-primary-600/50 transition-all"
-        >
-          <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-slate-500 dark:text-slate-400">Data quality</p>
-          <p className="text-lg font-bold text-slate-900 dark:text-white mt-1">Employee records</p>
-          <p className="text-sm text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
-            Keep gender, date of birth, hire dates, and departments current so every report reflects reality.
-          </p>
-          <span className="inline-block mt-3 text-sm font-semibold text-primary-600 dark:text-primary-400">Edit records →</span>
-        </Link>
-      </div>
+      {reportScope === 'organization' && (
+        <div className="flex flex-wrap gap-4 text-sm print-hidden">
+          <Link to={ROUTES.HR.ORGANIZATION} className="font-medium text-primary-600 dark:text-primary-400 hover:underline">
+            Open full organization dashboard (charts & switcher)
+          </Link>
+          <span className="text-slate-300 dark:text-slate-600" aria-hidden>
+            ·
+          </span>
+          <Link to={ROUTES.HR.EMPLOYEES} className="font-medium text-primary-600 dark:text-primary-400 hover:underline">
+            Edit employee records
+          </Link>
+        </div>
+      )}
 
-      <div
-        className="flex flex-wrap gap-2 p-1.5 rounded-2xl bg-slate-100/90 dark:bg-slate-800/90 border border-slate-200/90 dark:border-slate-700/90 shadow-inner"
-        role="tablist"
-        aria-label="Report type"
-      >
-        {reportTabs.map((tab) => {
-          const active = reportMode === tab.id;
-          return (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              aria-selected={active}
-              title={tab.hint}
-              onClick={() => setReportMode(tab.id)}
-              className={`px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                active
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-soft ring-1 ring-slate-200/90 dark:ring-slate-600'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              {tab.label}
-            </button>
-          );
-        })}
-      </div>
+      {reportTabs.length > 1 && (
+        <div
+          className="flex flex-wrap gap-2 p-1.5 rounded-2xl bg-slate-100/90 dark:bg-slate-800/90 border border-slate-200/90 dark:border-slate-700/90 shadow-inner"
+          role="tablist"
+          aria-label="Report type"
+        >
+          {reportTabs.map((tab) => {
+            const active = reportMode === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                title={tab.hint}
+                onClick={() => setReportMode(tab.id)}
+                className={`px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+                  active
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-soft ring-1 ring-slate-200/90 dark:ring-slate-600'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       <div className="sticky top-0 z-20 -mx-1 px-1 py-3 md:py-4 bg-slate-50/95 dark:bg-slate-950/90 backdrop-blur-md border-b border-slate-200/80 dark:border-slate-800/80 mb-2 rounded-b-xl">
         <div className="flex flex-wrap gap-3 items-center">
-        <label className="sr-only" htmlFor="reports-branch">
-          Branch
-        </label>
-        <select
-          id="reports-branch"
-          value={branchId}
-          onChange={(e) => setBranchId(e.target.value)}
-          className="rounded-xl border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 text-sm text-slate-900 dark:text-white shadow-sm"
-        >
-          <option value="">All branches</option>
-          {branches.map((b) => (
-            <option key={b.id} value={b.id}>
-              {b.name}
-            </option>
-          ))}
-        </select>
+        {[REPORT_MODE.DAILY, REPORT_MODE.MONTHLY, REPORT_MODE.RAW].includes(reportMode) && (
+          <>
+            <label className="sr-only" htmlFor="reports-branch">
+              Branch
+            </label>
+            <select
+              id="reports-branch"
+              value={branchId}
+              onChange={(e) => setBranchId(e.target.value)}
+              className="rounded-xl border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 text-sm text-slate-900 dark:text-white shadow-sm"
+            >
+              <option value="">All branches</option>
+              {branches.map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
 
         {reportMode === REPORT_MODE.DAILY && (
           <>
             <input type="date" value={dailyDate} onChange={(e) => setDailyDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white" />
-            <button type="button" onClick={exportDailyReport} disabled={!dailySummary} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed">Export to Excel</button>
+            <button type="button" onClick={exportDailyReportXlsx} disabled={!dailySummary} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed">Download XLSX</button>
+            <button type="button" onClick={exportDailyReportCsv} disabled={!dailySummary} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">CSV</button>
             <button type="button" onClick={printReportSafe} disabled={!dailySummary} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
           </>
         )}
@@ -445,19 +1158,26 @@ export function HRReports() {
                 <option key={m} value={m}>{new Date(2000, m - 1).toLocaleString('default', { month: 'long' })}</option>
               ))}
             </select>
-            <button type="button" onClick={exportMonthlyReport} disabled={!monthlySummary} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed">Export to Excel</button>
+            <button type="button" onClick={exportMonthlyReportXlsx} disabled={!monthlySummary} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed">Download XLSX</button>
+            <button type="button" onClick={exportMonthlyReportCsv} disabled={!monthlySummary} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">CSV</button>
             <button type="button" onClick={printReportSafe} disabled={!monthlySummary} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
           </>
         )}
         {reportMode === REPORT_MODE.RAW && (
           <>
-            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white" />
-            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white" />
+            <span className="text-xs font-medium text-slate-500 dark:text-slate-400 self-center">From / to</span>
+            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white" title="Range start (inclusive)" />
+            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white" title="Range end (inclusive)" />
+            <button type="button" onClick={() => setToDate(fromDate)} className="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800" title="Set end date equal to start for a single-day report">
+              Single day
+            </button>
             <select value={reportType} onChange={(e) => setReportType(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white">
               <option value="all">All attendance</option>
               <option value="late">Late only</option>
             </select>
-            <button type="button" onClick={exportCSV} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700">Export CSV</button>
+            <button type="button" onClick={exportRawAttendanceXlsx} disabled={!logs.length} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50">Download XLSX</button>
+            <button type="button" onClick={exportCSV} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">CSV</button>
+            <button type="button" onClick={printReportSafe} disabled={!logs.length} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
           </>
         )}
         {reportMode === REPORT_MODE.LEAVE && (
@@ -465,27 +1185,215 @@ export function HRReports() {
             <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Period</span>
             <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Period start" />
             <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Period end" />
+            <button type="button" onClick={() => { setToDate(fromDate); setLeaveAsOf(fromDate); }} className="px-3 py-2 text-xs font-medium border border-slate-300 dark:border-slate-600 rounded-xl text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800" title="Use one calendar day for period end and on-leave snapshot">
+              Single day
+            </button>
             <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">On leave</span>
             <input type="date" value={leaveAsOf} onChange={(e) => setLeaveAsOf(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Snapshot date: who is on approved leave this day" />
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Balances</span>
+            <input
+              type="number"
+              min={1990}
+              max={2100}
+              value={leaveBalanceYear}
+              onChange={(e) => setLeaveBalanceYear(Number(e.target.value) || leaveBalanceYear)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm w-[5.5rem]"
+              title="Calendar year for remaining leave columns in exports and the table below"
+            />
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Target users</span>
             <select
               value={leaveDeptFilter}
               onChange={(e) => setLeaveDeptFilter(e.target.value)}
               className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[12rem]"
               title="Filter by user department"
             >
-              <option value="">All departments</option>
+              <option value="">All target users</option>
               {leaveDepartments.map((d) => (
                 <option key={d} value={d}>{d}</option>
               ))}
             </select>
-            <button type="button" onClick={exportLeaveReport} disabled={!leaveReport} className="px-4 py-2 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium shadow-sm">Export CSV</button>
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Report type</span>
+            <select
+              value={leaveReportSection}
+              onChange={(e) => setLeaveReportSection(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[14rem]"
+              title="Select which leave report table to display"
+            >
+              <option value="on_leave">Employee on leave</option>
+              <option value="approved">Employee leave approved</option>
+              <option value="pending">Employee leave pending for approval</option>
+              <option value="balances">Employee leave balances</option>
+              <option value="department">Department summary</option>
+              <option value="activity">Employee leave activity</option>
+              <option value="top_requesters">Top requesters</option>
+            </select>
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Leave type</span>
+            <select
+              value={leaveTypeFilter}
+              onChange={(e) => setLeaveTypeFilter(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[14rem]"
+              title="Filter by leave type for balance rows"
+            >
+              <option value="">All leave types</option>
+              {leaveTypeOptions.map((lt) => (
+                <option key={lt} value={lt}>{lt}</option>
+              ))}
+            </select>
+            <div className="w-full flex flex-wrap items-center gap-2 pt-3 mt-1 border-t border-slate-200/90 dark:border-slate-700/90">
+              <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400 mr-1">Exports</span>
+              <select
+                value={leaveExportType}
+                onChange={(e) => setLeaveExportType(e.target.value)}
+                className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2 text-sm text-gray-900 dark:text-white shadow-sm min-w-[12rem]"
+                title="Choose extension"
+                disabled={!leaveReport}
+              >
+                <option value="excel">Excel (.xlsx)</option>
+                <option value="csv">CSV (.csv)</option>
+                <option value="pdf">PDF (.pdf)</option>
+              </select>
+              <button
+                type="button"
+                onClick={runLeaveExport}
+                disabled={!leaveReport}
+                className="px-4 py-2 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium shadow-sm"
+              >
+                Download
+              </button>
+            </div>
+          </>
+        )}
+        {reportMode === REPORT_MODE.RECOGNITION && (
+          <>
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Period</span>
+            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Range start" />
+            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Range end" />
+            <button type="button" onClick={() => setToDate(fromDate)} className="px-3 py-2 text-xs font-medium border border-slate-300 dark:border-slate-600 rounded-xl text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800" title="Set end date equal to start">
+              Single day
+            </button>
+            <select
+              value={recognitionReportSection}
+              onChange={(e) => setRecognitionReportSection(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[13rem]"
+              title="Select recognition report table"
+            >
+              <option value="by_type">By type</option>
+              <option value="recent">Recent recognitions</option>
+            </select>
+            <select
+              value={recognitionExportType}
+              onChange={(e) => setRecognitionExportType(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[11rem]"
+              title="Choose export format"
+              disabled={!recognitionReport}
+            >
+              <option value="csv">CSV</option>
+              <option value="print_pdf">Print / PDF</option>
+            </select>
+            <button type="button" onClick={runRecognitionExport} disabled={!recognitionReport} className="px-4 py-2 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 text-sm font-medium shadow-sm">
+              Download
+            </button>
+          </>
+        )}
+        {reportMode === REPORT_MODE.PERFORMANCE && (
+          <>
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center">Period</span>
+            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Range start for KPI/appraisal activity dates" />
+            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm" title="Range end for KPI/appraisal activity dates" />
+            <label className="text-xs font-medium text-gray-500 dark:text-gray-400 self-center" htmlFor="perf-cycle">
+              Cycle
+            </label>
+            <select
+              id="perf-cycle"
+              value={performanceCycleId.trim() ? performanceCycleId : '__auto'}
+              onChange={(e) => setPerformanceCycleId(e.target.value === '__auto' ? '' : e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[14rem]"
+              title="Appraisal cycle for KPI and appraisal counts"
+            >
+              <option value="__auto">Active or latest (automatic)</option>
+              {(performanceReport?.cycles || []).map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.year}
+                  {c.quarter ? ` ${c.quarter}` : ''} · {c.type} · {c.status}
+                </option>
+              ))}
+            </select>
+            <select
+              value={performanceReportSection}
+              onChange={(e) => setPerformanceReportSection(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[15rem]"
+              title="Select performance report table"
+            >
+              <option value="kpi_status">KPI pipeline</option>
+              <option value="appraisal_status">Appraisal pipeline</option>
+              <option value="kpi_staff">KPIs by employee</option>
+              <option value="appraisal_staff">Appraisals by employee</option>
+            </select>
+            <select
+              value={performanceExportType}
+              onChange={(e) => setPerformanceExportType(e.target.value)}
+              className="rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-3 py-2.5 text-sm text-gray-900 dark:text-white shadow-sm max-w-[11rem]"
+              title="Choose export format"
+              disabled={!performanceReport?.cycle}
+            >
+              <option value="xlsx">XLSX</option>
+              <option value="csv">CSV</option>
+              <option value="print_pdf">Print / PDF</option>
+            </select>
+            <button type="button" onClick={runPerformanceExport} disabled={!performanceReport?.cycle} className="px-4 py-2 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 text-sm font-medium shadow-sm">Download</button>
+          </>
+        )}
+        {reportMode === REPORT_MODE.ORG_REPORT && (
+          <>
+            <button
+              type="button"
+              onClick={exportOrganizationCsv}
+              disabled={organizationOverviewLoading || !organizationOverview}
+              className="px-4 py-2 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium shadow-sm"
+            >
+              Demographics CSV
+            </button>
+            <button
+              type="button"
+              onClick={printReportSafe}
+              disabled={organizationOverviewLoading || !organizationOverview}
+              className="px-4 py-2 bg-gray-600 text-white rounded-xl hover:bg-gray-700 disabled:opacity-50 text-sm font-medium shadow-sm"
+            >
+              Print / PDF
+            </button>
           </>
         )}
         </div>
       </div>
+      </div>
 
       {modal && <UserListModal title={modal.title} users={modal.list} onClose={() => setModal(null)} />}
 
+      <div id="hr-reports-print-area" className="space-y-6">
+      {reportMode === REPORT_MODE.ORG_REPORT && (
+        <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 p-6 shadow-soft print:border-slate-300">
+          <h2 className="text-base font-bold text-slate-900 dark:text-white print:text-black mb-4">Organization demographics &amp; structure</h2>
+          {organizationOverviewLoading ? (
+            <OrganizationOverview data={null} loading compactTitle />
+          ) : !organizationOverview ? (
+            <div className="text-center py-6">
+              <EmptyState
+                title="Could not load organization data"
+                message="Check your connection and permissions, then try again. Demographics CSV is available after the overview loads."
+              />
+              <button
+                type="button"
+                onClick={() => setOrgFetchKey((k) => k + 1)}
+                className="mt-4 px-4 py-2 rounded-xl bg-primary-600 text-white text-sm font-semibold hover:bg-primary-700"
+              >
+                Try again
+              </button>
+            </div>
+          ) : (
+            <OrganizationOverview data={organizationOverview} loading={false} compactTitle />
+          )}
+        </section>
+      )}
       {/* Daily report */}
       {reportMode === REPORT_MODE.DAILY && (
         <>
@@ -573,7 +1481,7 @@ export function HRReports() {
               </div>
               {/* Main content: Summary of each staff */}
               <h2 className="font-semibold text-gray-800 dark:text-white">Summary of each staff</h2>
-              <p className="text-sm text-gray-500 dark:text-gray-400">One row per employee for the selected month. Attendance % = (Present days ÷ Work days) × 100. Late % = (Late days ÷ Work days) × 100.</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">One row per employee for the selected month. Work days are Monday–Saturday (Sundays excluded). Attendance % = (Present days ÷ Work days) × 100. Late % = (Late days ÷ Work days) × 100.</p>
               <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                   <thead className="bg-gray-50 dark:bg-gray-700">
@@ -636,6 +1544,7 @@ export function HRReports() {
                 <SummaryCard label="No clock-out (any day)" value={monthlySummary.aggregate?.unique_no_clock_out?.length ?? 0} onClick={() => openUserModal('no_clock_out', 'No clock-out at least one day', monthlySummary.aggregate?.unique_no_clock_out)} list={monthlySummary.aggregate?.unique_no_clock_out} />
               </div>
               <h2 className="font-semibold text-gray-800 dark:text-white mt-6">By day</h2>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">Sundays are omitted (non-working days).</p>
               <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                   <thead className="bg-gray-50 dark:bg-gray-700">
@@ -734,12 +1643,17 @@ export function HRReports() {
           ) : (
             <div className="space-y-6">
               <h2 className="font-semibold text-gray-800 dark:text-white">Recognition summary</h2>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Period: <span className="font-medium">{fromDate}</span> to <span className="font-medium">{toDate}</span>
+              </p>
               <div className="grid gap-4 grid-cols-1 md:grid-cols-3">
                 <div className="bg-white dark:bg-gray-800 rounded-xl shadow-md border border-gray-100 dark:border-gray-700 p-4">
                   <p className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase">Total recognitions</p>
                   <p className="text-2xl font-bold text-primary-600 dark:text-primary-400">{recognitionReport.total_count ?? 0}</p>
                 </div>
               </div>
+              {recognitionReportSection === 'by_type' && (
+              <>
               <h2 className="font-semibold text-gray-800 dark:text-white mt-6">By type</h2>
               <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
@@ -759,6 +1673,10 @@ export function HRReports() {
                   </tbody>
                 </table>
               </div>
+              </>
+              )}
+              {recognitionReportSection === 'recent' && (
+              <>
               <h2 className="font-semibold text-gray-800 dark:text-white mt-6">Recent recognitions</h2>
               <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
@@ -786,6 +1704,195 @@ export function HRReports() {
                   </tbody>
                 </table>
               </div>
+              </>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Performance & appraisal (KPI + appraisal cycle) */}
+      {reportMode === REPORT_MODE.PERFORMANCE && (
+        <>
+          {loading ? (
+            <div className="flex justify-center py-8"><LoadingSpinner /></div>
+          ) : !performanceReport?.cycle ? (
+            <EmptyState
+              title="No appraisal cycles"
+              message={performanceReport?.note || 'Create an appraisal cycle under HR → Appraisal to track KPIs and appraisals.'}
+            />
+          ) : (
+            <div className="space-y-8">
+              <p className="text-sm text-gray-600 dark:text-gray-400 max-w-4xl leading-relaxed">
+                {performanceReport.note}{' '}
+                <Link to={ROUTES.HR.APPRAISAL} className="text-primary-600 dark:text-primary-400 font-medium hover:underline">
+                  Open Appraisal workspace
+                </Link>{' '}
+                to manage cycles, approvals, and scoring.
+              </p>
+              <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft">
+                <p className="text-xs font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Selected cycle</p>
+                <p className="text-lg font-bold text-slate-900 dark:text-white mt-1">
+                  {performanceReport.cycle.year}
+                  {performanceReport.cycle.quarter ? ` · ${performanceReport.cycle.quarter}` : ''} · {performanceReport.cycle.type} ·{' '}
+                  <span className="text-primary-600 dark:text-primary-400">{performanceReport.cycle.status}</span>
+                </p>
+                <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 tabular-nums">
+                  {performanceReport.cycle.start_date} → {performanceReport.cycle.end_date}
+                </p>
+                <p className="text-sm text-slate-600 dark:text-slate-300 mt-3">
+                  Staff in scope: <strong className="tabular-nums">{performanceReport.staff_in_scope ?? 0}</strong> (active, non-admin)
+                </p>
+                <p className="text-sm text-slate-600 dark:text-slate-300 mt-1">
+                  Activity period: <strong className="tabular-nums">{performanceReport.period?.from_date || fromDate}</strong> to{' '}
+                  <strong className="tabular-nums">{performanceReport.period?.to_date || toDate}</strong>
+                </p>
+              </div>
+
+              <div className="grid gap-6 lg:grid-cols-2">
+                {performanceReportSection === 'kpi_status' && (
+                <div>
+                  <h2 className="font-semibold text-gray-800 dark:text-white mb-2">KPI pipeline (counts in cycle)</h2>
+                  <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                      <thead className="bg-gray-50 dark:bg-gray-700/80">
+                        <tr>
+                          <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                          <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">KPIs</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                        {(performanceReport.kpi_by_status || []).map((row) => (
+                          <tr key={row.status} className="text-gray-700 dark:text-gray-300">
+                            <td className="px-4 py-2 font-medium">{row.status?.replace(/_/g, ' ')}</td>
+                            <td className="px-4 py-2 text-right tabular-nums">{row.count ?? 0}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {!(performanceReport.kpi_by_status || []).length && (
+                      <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No KPI rows for this cycle yet.</p>
+                    )}
+                  </div>
+                </div>
+                )}
+                {performanceReportSection === 'appraisal_status' && (
+                <div>
+                  <h2 className="font-semibold text-gray-800 dark:text-white mb-2">Appraisal pipeline (counts in cycle)</h2>
+                  <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                      <thead className="bg-gray-50 dark:bg-gray-700/80">
+                        <tr>
+                          <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                          <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Appraisals</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                        {(performanceReport.appraisal_by_status || []).map((row) => (
+                          <tr key={row.status} className="text-gray-700 dark:text-gray-300">
+                            <td className="px-4 py-2 font-medium">{row.status?.replace(/_/g, ' ')}</td>
+                            <td className="px-4 py-2 text-right tabular-nums">{row.count ?? 0}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {!(performanceReport.appraisal_by_status || []).length && (
+                      <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No appraisal records for this cycle yet.</p>
+                    )}
+                  </div>
+                </div>
+                )}
+              </div>
+
+              {performanceReportSection === 'kpi_staff' && (
+              <div>
+                <h2 className="font-semibold text-gray-800 dark:text-white mb-2">KPIs by employee</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                  Counts of KPI <em>objectives</em> per person in this cycle (not submitted = draft; evaluated through supervisor chain = pending / verified / etc.).
+                </p>
+                <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[24rem] overflow-y-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-xs sm:text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0 z-10">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-semibold text-gray-500 dark:text-gray-300">Employee</th>
+                        <th className="px-3 py-2 text-left font-semibold text-gray-500 dark:text-gray-300">Dept</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Total</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Draft</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Pending</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Returned</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Verified</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Approved</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Received</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Ack</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {(performanceReport.kpi_by_staff || []).map((r) => (
+                        <tr key={r.user_id} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-3 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-gray-500 dark:text-gray-400 truncate max-w-[10rem]">{r.email}</div>
+                          </td>
+                          <td className="px-3 py-2">{r.department}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.kpi_count ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.kpi_draft ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-amber-700 dark:text-amber-300">{r.kpi_pending_supervisor ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.kpi_returned ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-violet-700 dark:text-violet-300">{r.kpi_verified ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.kpi_approved ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.kpi_received ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-green-700 dark:text-green-300">{r.kpi_acknowledged ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              )}
+
+              {performanceReportSection === 'appraisal_staff' && (
+              <div>
+                <h2 className="font-semibold text-gray-800 dark:text-white mb-2">Appraisals by employee</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">Self-assessment forms in this cycle (usually one appraisal per person per cycle).</p>
+                <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[24rem] overflow-y-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-xs sm:text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0 z-10">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-semibold text-gray-500 dark:text-gray-300">Employee</th>
+                        <th className="px-3 py-2 text-left font-semibold text-gray-500 dark:text-gray-300">Dept</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Count</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Draft</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Pending</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Returned</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Verified</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Approved</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Received</th>
+                        <th className="px-3 py-2 text-right font-semibold text-gray-500 dark:text-gray-300">Ack</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {(performanceReport.appraisal_by_staff || []).map((r) => (
+                        <tr key={r.user_id} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-3 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-gray-500 dark:text-gray-400 truncate max-w-[10rem]">{r.email}</div>
+                          </td>
+                          <td className="px-3 py-2">{r.department}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.appraisal_count ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.ap_draft ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-amber-700 dark:text-amber-300">{r.ap_pending_supervisor ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.ap_returned ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-violet-700 dark:text-violet-300">{r.ap_verified ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.ap_approved ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{r.ap_received ?? 0}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-green-700 dark:text-green-300">{r.ap_acknowledged ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              )}
             </div>
           )}
         </>
@@ -800,16 +1907,29 @@ export function HRReports() {
             <EmptyState title="No data" message="Could not load leave report." />
           ) : (
             <div className="space-y-8">
-              <p className="text-sm text-gray-600 dark:text-gray-400 max-w-4xl leading-relaxed">
-                {leaveReport.note}{' '}
-                <strong className="text-gray-800 dark:text-gray-200">Period</strong> counts any request whose dates overlap the range.{' '}
-                <strong className="text-gray-800 dark:text-gray-200">Taken</strong> is approved leave days in that range.{' '}
-                <strong className="text-gray-800 dark:text-gray-200">Pending</strong> is days in submitted / in-approval / returned requests (not draft).{' '}
-                <strong className="text-gray-800 dark:text-gray-200">No leave in period</strong> means no <em>approved</em> leave overlaps that range (per person).{' '}
-                Set <Link to={ROUTES.HR.EMPLOYEES} className="text-primary-600 dark:text-primary-400 font-medium hover:underline">People</Link> department on each user - until then, staff appear under <span className="font-medium">Unassigned</span>.
-              </p>
+              <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/80 dark:bg-slate-900/60 p-4">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">Report context</h2>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-sm">
+                  <div className="rounded-xl bg-slate-50 dark:bg-slate-800/80 px-3 py-2">
+                    <p className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Period</p>
+                    <p className="font-semibold text-slate-900 dark:text-slate-100">{leaveReport.period?.from_date ?? fromDate} to {leaveReport.period?.to_date ?? toDate}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 dark:bg-slate-800/80 px-3 py-2">
+                    <p className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">On-leave snapshot</p>
+                    <p className="font-semibold text-slate-900 dark:text-slate-100">{leaveReport.period?.as_of ?? leaveAsOf}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 dark:bg-slate-800/80 px-3 py-2">
+                    <p className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Balance year</p>
+                    <p className="font-semibold text-slate-900 dark:text-slate-100">{leaveReport.period?.balance_year ?? leaveBalanceYear}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 dark:bg-slate-800/80 px-3 py-2">
+                    <p className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Department filter</p>
+                    <p className="font-semibold text-slate-900 dark:text-slate-100">{leaveDeptFilter || 'All departments'}</p>
+                  </div>
+                </div>
+              </div>
 
-              <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
+              <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4">
                 <SummaryCard label="Staff in scope" sub="Active, non-admin" value={leaveReport.staff_in_scope ?? 0} />
                 <SummaryCard
                   label="On leave (snapshot)"
@@ -818,22 +1938,10 @@ export function HRReports() {
                   color="text-sky-600 dark:text-sky-400"
                 />
                 <SummaryCard
-                  label="No approved leave in period"
-                  sub="May still have pending/draft"
-                  value={leaveReport.no_approved_leave_in_period_count ?? 0}
-                  color="text-amber-700 dark:text-amber-400"
-                />
-                <SummaryCard
                   label="Leave taken (days)"
                   sub="Approved, in period"
                   value={Number(leaveReport.leave_totals_in_period?.approved_days ?? 0).toFixed(1)}
                   color="text-green-600 dark:text-green-400"
-                />
-                <SummaryCard
-                  label="Pending (days)"
-                  sub="In workflow, in period"
-                  value={Number(leaveReport.leave_totals_in_period?.pending_days ?? 0).toFixed(1)}
-                  color="text-violet-600 dark:text-violet-400"
                 />
                 <SummaryCard
                   label="Pending (requests)"
@@ -841,15 +1949,144 @@ export function HRReports() {
                   value={leaveReport.leave_totals_in_period?.pending_requests ?? 0}
                   color="text-violet-700 dark:text-violet-300"
                 />
-                <SummaryCard label="Requests (overlap)" value={leaveReport.total_requests ?? 0} />
-                <SummaryCard label="Approval rate" value={`${leaveReport.approval_rate_pct ?? 0}%`} color="text-primary-600 dark:text-primary-400" />
               </div>
 
+              {leaveReportSection === 'on_leave' && (
               <div>
-                <h2 className="font-semibold text-gray-800 dark:text-white mb-1">By department</h2>
-                <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
-                  Headcount, snapshot on leave, approved vs pending days in the period (overlap), and staff with no approved leave touching the period.
-                </p>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-semibold text-gray-800 dark:text-white mb-1">Employee on leave</h2>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">Approved leave overlapping snapshot date {leaveReport.period?.as_of ?? leaveAsOf}.</p>
+                  </div>
+                </div>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[28rem] overflow-y-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Branch</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Tel</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Leave type</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dates</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {filteredOnLeaveRows.map((r) => (
+                        <tr key={r.id || `${r.user_id}-${r.start_date}-${r.end_date}`} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                          </td>
+                          <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2">{r.branch_name || '-'}</td>
+                          <td className="px-4 py-2">{r.phone || '-'}</td>
+                          <td className="px-4 py-2">{r.leave_type_name || '-'}</td>
+                          <td className="px-4 py-2 whitespace-nowrap tabular-nums text-xs">{formatDate(r.start_date)} - {formatDate(r.end_date)} ({Number(r.days_requested ?? 0).toFixed(1)} d)</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!filteredOnLeaveRows.length && (
+                    <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No employees on leave for selected filters.</p>
+                  )}
+                </div>
+              </div>
+              )}
+
+              {leaveReportSection === 'approved' && (
+              <div>
+                <div className="mb-3">
+                  <h2 className="font-semibold text-gray-800 dark:text-white mb-1">Employee leave approved</h2>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Approved leave requests overlapping selected period.</p>
+                </div>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[28rem] overflow-y-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Leave type</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dates</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Days</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {filteredApprovedRows.map((r) => (
+                        <tr key={r.id} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                          </td>
+                          <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2">{r.leave_type_name ?? '-'}</td>
+                          <td className="px-4 py-2 whitespace-nowrap tabular-nums">{formatDate(r.start_date)} - {formatDate(r.end_date)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{Number(r.days_requested ?? 0).toFixed(1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!filteredApprovedRows.length && (
+                    <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No approved leave rows for selected filters.</p>
+                  )}
+                </div>
+              </div>
+              )}
+
+              {leaveReportSection === 'pending' && (
+              <div>
+                <div className="mb-3">
+                  <h2 className="font-semibold text-gray-800 dark:text-white mb-1">Employee leave pending for approval</h2>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Pending/returned requests overlapping selected period.</p>
+                </div>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[28rem] overflow-y-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Leave type</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dates</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Status</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Days</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {filteredPendingRows.map((r) => (
+                        <tr key={r.id} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                          </td>
+                          <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2">{r.leave_type_name ?? '-'}</td>
+                          <td className="px-4 py-2 whitespace-nowrap tabular-nums">{formatDate(r.start_date)} - {formatDate(r.end_date)}</td>
+                          <td className="px-4 py-2">{r.status ?? '-'}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{Number(r.days_requested ?? 0).toFixed(1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!filteredPendingRows.length && (
+                    <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No pending leave rows for selected filters.</p>
+                  )}
+                </div>
+              </div>
+              )}
+
+              {leaveReportSection === 'department' && (
+              <div>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-semibold text-gray-800 dark:text-white mb-1">By department</h2>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">
+                      Headcount, snapshot on leave, approved vs pending days in the period (overlap), and staff with no approved leave touching the period.
+                    </p>
+                  </div>
+                  <button type="button" onClick={exportLeaveDepartmentCsv} disabled={!leaveReport} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-xl text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
+                    Download table CSV
+                  </button>
+                </div>
                 <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto">
                   <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
                     <thead className="bg-gray-50 dark:bg-gray-700/80">
@@ -886,91 +2123,83 @@ export function HRReports() {
                   )}
                 </div>
               </div>
+              )}
 
-              <div className="grid gap-6 lg:grid-cols-2">
-                <div>
-                  <h2 className="font-semibold text-gray-800 dark:text-white mb-1">On approved leave (snapshot)</h2>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">Up to 200 rows · date {leaveReport.period?.as_of ?? leaveAsOf}</p>
-                  <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[22rem] overflow-y-auto">
-                    <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
-                      <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
-                        <tr>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Type</th>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dates</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                        {(leaveReport.on_leave_as_of || []).map((r) => (
-                          <tr key={r.id || `${r.email}-${r.start_date}-${r.end_date}`} className="text-gray-700 dark:text-gray-300">
-                            <td className="px-3 py-2">
-                              <div className="font-medium">{r.full_name}</div>
-                              <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
-                            </td>
-                            <td className="px-3 py-2">{r.department}</td>
-                            <td className="px-3 py-2">{r.leave_type_name}</td>
-                            <td className="px-3 py-2 whitespace-nowrap tabular-nums text-xs">
-                              {formatDate(r.start_date)} – {formatDate(r.end_date)}
-                              <span className="block text-gray-500">{r.days_requested} d</span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    {!(leaveReport.on_leave_as_of || []).length && (
-                      <p className="px-4 py-8 text-sm text-gray-500 dark:text-gray-400 text-center">No one on approved leave on this date.</p>
-                    )}
+              {leaveReportSection === 'balances' && (
+              <div>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-semibold text-gray-800 dark:text-white mb-1">Employee leave balances (by type)</h2>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">
+                      Filter by leave type to quickly audit who has this entitlement and the remaining days for calendar year{' '}
+                      <span className="font-mono tabular-nums">{leaveReport.period?.balance_year ?? leaveBalanceYear}</span>
+                      .
+                    </p>
                   </div>
+                  <button type="button" onClick={exportLeaveReportXlsx} disabled={!leaveReport} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-xl text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
+                    Download XLSX
+                  </button>
                 </div>
-                <div>
-                  <h2 className="font-semibold text-gray-800 dark:text-white mb-1">No approved leave in period</h2>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">Staff with no approved request overlapping the period (sample up to 400)</p>
-                  <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[22rem] overflow-y-auto">
-                    <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
-                      <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
-                        <tr>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
-                          <th className="px-3 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Role</th>
+                <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[28rem] overflow-y-auto mb-6">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+                    <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Branch</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Tel</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Leave type</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Allocated</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Used</th>
+                        <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Remaining</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                      {filteredBalanceRows.map((r, i) => (
+                        <tr key={`${r.user_id}-${r.leave_type_name}-${i}`} className="text-gray-700 dark:text-gray-300">
+                          <td className="px-4 py-2">
+                            <div className="font-medium">{r.full_name}</div>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
+                          </td>
+                          <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2">{r.branch_name || '-'}</td>
+                          <td className="px-4 py-2">{r.phone || '-'}</td>
+                          <td className="px-4 py-2">{r.leave_type_name ?? '-'}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{Number(r.allocated_days ?? 0).toFixed(1)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums">{Number(r.used_days ?? 0).toFixed(1)}</td>
+                          <td className="px-4 py-2 text-right tabular-nums font-medium text-emerald-700 dark:text-emerald-300">{Number(r.remaining_days ?? 0).toFixed(1)}</td>
                         </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                        {(leaveReport.no_approved_leave_in_period || []).map((r, i) => (
-                          <tr key={`${r.email}-${i}`} className="text-gray-700 dark:text-gray-300">
-                            <td className="px-3 py-2">
-                              <div className="font-medium">{r.full_name}</div>
-                              <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
-                            </td>
-                            <td className="px-3 py-2">{r.department}</td>
-                            <td className="px-3 py-2">{r.role}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    {(leaveReport.no_approved_leave_in_period_count ?? 0) > (leaveReport.no_approved_leave_in_period || []).length && (
-                      <p className="px-4 py-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border-t border-amber-100 dark:border-amber-900/40">
-                        Showing {(leaveReport.no_approved_leave_in_period || []).length} of {leaveReport.no_approved_leave_in_period_count} - export CSV for full lists.
-                      </p>
-                    )}
-                    {!(leaveReport.no_approved_leave_in_period || []).length && (leaveReport.no_approved_leave_in_period_count ?? 0) === 0 && (
-                      <p className="px-4 py-8 text-sm text-gray-500 dark:text-gray-400 text-center">Everyone in scope had at least one approved leave day in this period.</p>
-                    )}
-                  </div>
+                      ))}
+                    </tbody>
+                  </table>
+                  {!(leaveReport.staff_leave_balance_rows || []).length && (
+                    <p className="px-4 py-6 text-sm text-gray-500 dark:text-gray-400 text-center">No balance rows in scope — check leave types and entitlements.</p>
+                  )}
                 </div>
               </div>
+              )}
 
+              {leaveReportSection === 'activity' && (
               <div>
-                <h2 className="font-semibold text-gray-800 dark:text-white mb-1">By person: leave taken vs pending</h2>
-                <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
-                  Same period overlap. <strong className="text-gray-700 dark:text-gray-300">Taken</strong> = approved days; <strong className="text-gray-700 dark:text-gray-300">Pending</strong> = days in workflow. Up to 400 rows.
-                </p>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-semibold text-gray-800 dark:text-white mb-1">By person: leave taken vs pending</h2>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">
+                      Same period overlap. <strong className="text-gray-700 dark:text-gray-300">Taken</strong> = approved days; <strong className="text-gray-700 dark:text-gray-300">Pending</strong> = days in workflow. Up to 400 rows.
+                    </p>
+                  </div>
+                  <button type="button" onClick={exportLeaveActivityCsv} disabled={!leaveReport} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-xl text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
+                    Download table CSV
+                  </button>
+                </div>
                 <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto max-h-[28rem] overflow-y-auto">
                   <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
                     <thead className="bg-gray-50 dark:bg-gray-700/80 sticky top-0 z-10">
                       <tr>
                         <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
                         <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Branch</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Tel</th>
                         <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Taken (days)</th>
                         <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Taken (reqs)</th>
                         <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Pending (days)</th>
@@ -986,6 +2215,8 @@ export function HRReports() {
                             <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
                           </td>
                           <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2">{r.branch_name || '-'}</td>
+                          <td className="px-4 py-2">{r.phone || '-'}</td>
                           <td className="px-4 py-2 text-right tabular-nums text-green-700 dark:text-green-300">{Number(r.approved_days ?? 0).toFixed(1)}</td>
                           <td className="px-4 py-2 text-right tabular-nums">{r.approved_requests ?? 0}</td>
                           <td className="px-4 py-2 text-right tabular-nums text-violet-700 dark:text-violet-300">{Number(r.pending_days ?? 0).toFixed(1)}</td>
@@ -1000,15 +2231,27 @@ export function HRReports() {
                   )}
                 </div>
               </div>
+              )}
 
+              {leaveReportSection === 'top_requesters' && (
               <div>
-                <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Top requesters by volume (period)</h2>
-                <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">Most requests overlapping the range (any status), up to 30.</p>
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-semibold text-gray-800 dark:text-white mb-1">Top requesters by volume (period)</h2>
+                    <p className="text-sm text-gray-500 dark:text-gray-400">Most requests overlapping the range (any status), up to 30.</p>
+                  </div>
+                  <button type="button" onClick={exportLeaveTopRequestersCsv} disabled={!leaveReport} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-xl text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">
+                    Download table CSV
+                  </button>
+                </div>
                 <div className="bg-white dark:bg-gray-800 rounded-2xl shadow border border-gray-100 dark:border-gray-700 overflow-x-auto">
                   <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
                     <thead className="bg-gray-50 dark:bg-gray-700/80">
                       <tr>
                         <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Dept</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Branch</th>
+                        <th className="px-4 py-2 text-left text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Tel</th>
                         <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Requests</th>
                         <th className="px-4 py-2 text-right text-xs font-semibold text-gray-500 dark:text-gray-300 uppercase">Days</th>
                       </tr>
@@ -1020,6 +2263,9 @@ export function HRReports() {
                             <div className="font-medium">{r.full_name}</div>
                             <div className="text-xs text-gray-500 dark:text-gray-400">{r.email}</div>
                           </td>
+                          <td className="px-4 py-2">{r.department ?? '-'}</td>
+                          <td className="px-4 py-2">{r.branch_name || '-'}</td>
+                          <td className="px-4 py-2">{r.phone || '-'}</td>
                           <td className="px-4 py-2 text-right tabular-nums">{r.total_requests ?? 0}</td>
                           <td className="px-4 py-2 text-right tabular-nums">{r.total_days ?? 0}</td>
                         </tr>
@@ -1028,10 +2274,12 @@ export function HRReports() {
                   </table>
                 </div>
               </div>
+              )}
             </div>
           )}
         </>
       )}
+      </div>
     </motion.div>
   );
 }

@@ -1,3 +1,9 @@
+/**
+ * Auth slice: current user + profile from JWT session.
+ *
+ * Thunks call `services/api` (token in runtime memory). On 401 the axios interceptor clears the token;
+ * `loadSession` then resolves to null and the UI should treat the user as logged out.
+ */
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import * as api from '../../services/api';
 import { getSession } from '../../services/api';

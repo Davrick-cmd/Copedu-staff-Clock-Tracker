@@ -15,13 +15,43 @@ export function HRLeaveOverview() {
   const toast = useToast();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [fromDate, setFromDate] = useState(() => new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
+  const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [onDate, setOnDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [department, setDepartment] = useState('');
+  const [departments, setDepartments] = useState([]);
 
-  useEffect(() => {
+  const applyRangePreset = (days) => {
+    const end = new Date();
+    const start = new Date(end);
+    start.setDate(end.getDate() - (days - 1));
+    const endIso = end.toISOString().slice(0, 10);
+    const startIso = start.toISOString().slice(0, 10);
+    setFromDate(startIso);
+    setToDate(endIso);
+    setOnDate(endIso);
+  };
+
+  const load = () => {
+    setLoading(true);
     api
-      .getLeaveOverview()
+      .getLeaveOverview({
+        from_date: fromDate,
+        to_date: toDate,
+        on_date: onDate,
+        ...(department ? { department } : {}),
+      })
       .then(setData)
       .catch(() => toast('Failed to load leave overview', 'error'))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    load();
+  }, [fromDate, toDate, onDate, department]);
+
+  useEffect(() => {
+    api.getLeaveHrFilters().then((d) => setDepartments(d?.departments || [])).catch(() => setDepartments([]));
   }, []);
 
   if (loading && !data) {
@@ -45,8 +75,8 @@ export function HRLeaveOverview() {
             All balances
           </Link>
           <span className="text-gray-300 dark:text-gray-600">·</span>
-          <Link to={ROUTES.HR.REPORTS} className="text-primary-600 dark:text-primary-400 hover:underline">
-            Reports
+          <Link to={ROUTES.HR.REPORTS_LEAVE} className="text-primary-600 dark:text-primary-400 hover:underline">
+            Leave reports
           </Link>
           <span className="text-gray-300 dark:text-gray-600">·</span>
           <Link to={ROUTES.HR.LEAVE_ORGANIZATION} className="text-primary-600 dark:text-primary-400 font-medium hover:underline">
@@ -58,16 +88,57 @@ export function HRLeaveOverview() {
       <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
         <Card label="Pending (all stages)" value={data?.pending_total ?? 0} />
         <Card label="On leave today" value={data?.staff_on_leave_today ?? 0} />
-        <Card label="Approved this month" value={data?.approved_this_month ?? 0} />
-        <Card label="Rejected this month" value={data?.rejected_this_month ?? 0} />
+        <Card label="Approved in range" value={data?.approved_this_month ?? 0} />
+        <Card label="Rejected in range" value={data?.rejected_this_month ?? 0} />
+      </div>
+
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <label className="block text-xs uppercase text-gray-500 dark:text-gray-400 mb-1">From</label>
+            <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white" />
+          </div>
+          <div>
+            <label className="block text-xs uppercase text-gray-500 dark:text-gray-400 mb-1">To</label>
+            <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white" />
+          </div>
+          <div>
+            <label className="block text-xs uppercase text-gray-500 dark:text-gray-400 mb-1">On-leave snapshot date</label>
+            <input type="date" value={onDate} onChange={(e) => setOnDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white" />
+          </div>
+          <div>
+            <label className="block text-xs uppercase text-gray-500 dark:text-gray-400 mb-1">Department</label>
+            <select value={department} onChange={(e) => setDepartment(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white min-w-[13rem]">
+              <option value="">All departments</option>
+              {departments.map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+          </div>
+          <button type="button" onClick={load} className="px-4 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700">
+            Refresh
+          </button>
+          <div className="w-full flex flex-wrap items-center gap-2 pt-2 mt-1 border-t border-slate-200 dark:border-slate-700">
+            <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400 mr-1">Quick range</span>
+            <button type="button" onClick={() => applyRangePreset(7)} className="px-2.5 py-1.5 text-xs border border-slate-300 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+              Last 7 days
+            </button>
+            <button type="button" onClick={() => applyRangePreset(30)} className="px-2.5 py-1.5 text-xs border border-slate-300 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+              Last 30 days
+            </button>
+            <button type="button" onClick={() => applyRangePreset(90)} className="px-2.5 py-1.5 text-xs border border-slate-300 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">
+              Last 90 days
+            </button>
+          </div>
+        </div>
       </div>
 
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div>
-            <h2 className="font-semibold text-gray-800 dark:text-white">Staff on leave today</h2>
+            <h2 className="font-semibold text-gray-800 dark:text-white">Staff on leave (snapshot date)</h2>
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-              Approved absences overlapping today ({data?.on_leave_today_detail?.length ?? 0} shown, max 80)
+              Approved absences overlapping {data?.period?.on_date || onDate} ({data?.on_leave_today_detail?.length ?? 0} shown, max 80)
             </p>
           </div>
           <Link
@@ -104,7 +175,7 @@ export function HRLeaveOverview() {
               {!(data?.on_leave_today_detail || []).length && (
                 <tr>
                   <td colSpan={4} className="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
-                    No one is on approved leave today.
+                    No one is on approved leave for this snapshot date.
                   </td>
                 </tr>
               )}

@@ -23,7 +23,7 @@ function fieldLabel(className, text) {
  * Full employee profile editor for HR/Admin - updates via PATCH /users/:id/record.
  * Use for promotions, transfers, contact changes, hire dates, etc.
  */
-export function EmployeeRecordEditModal({ user, users, branches, onClose, onSaved, title = 'Edit employee record' }) {
+export function EmployeeRecordEditModal({ user, users, branches, departments = DEPARTMENTS, onClose, onSaved, title = 'Edit employee record' }) {
   const toast = useToast();
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState(() => ({
@@ -42,6 +42,7 @@ export function EmployeeRecordEditModal({ user, users, branches, onClose, onSave
     hr_notes: user.hr_notes || '',
     net_salary: user.net_salary != null && user.net_salary !== '' ? String(user.net_salary) : '',
     is_married: user.is_married === 1 || user.is_married === true ? 'yes' : user.is_married === 0 || user.is_married === false ? 'no' : '',
+    is_active: user.is_active === 1 || user.is_active === true,
   }));
 
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
@@ -80,6 +81,11 @@ export function EmployeeRecordEditModal({ user, users, branches, onClose, onSave
       else if (form.is_married === 'no') payload.is_married = false;
       else payload.is_married = null;
       await api.updateEmployeeRecord(user.id, payload);
+      const nextActive = !!form.is_active;
+      const currentActive = user.is_active === 1 || user.is_active === true;
+      if (nextActive !== currentActive) {
+        await api.setUserActive(user.id, nextActive);
+      }
       toast('Employee record saved', 'success');
       onSaved();
       onClose();
@@ -185,10 +191,10 @@ export function EmployeeRecordEditModal({ user, users, branches, onClose, onSave
               className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             >
               <option value="">(Unassigned)</option>
-              {form.department && !DEPARTMENTS.includes(form.department) && (
+              {form.department && !departments.includes(form.department) && (
                 <option value={form.department}>{form.department} (current)</option>
               )}
-              {DEPARTMENTS.map((d) => (
+              {departments.map((d) => (
                 <option key={d} value={d}>
                   {d}
                 </option>
@@ -280,6 +286,21 @@ export function EmployeeRecordEditModal({ user, users, branches, onClose, onSave
                 </select>
               </div>
             </div>
+          </div>
+          <div className="rounded-xl border border-rose-200 dark:border-rose-900/50 bg-rose-50/60 dark:bg-rose-950/25 p-3 space-y-2">
+            <p className="text-xs font-semibold text-rose-900 dark:text-rose-100">Access status</p>
+            <label className="inline-flex items-center gap-2 text-sm text-rose-900 dark:text-rose-100 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!form.is_active}
+                onChange={(e) => set('is_active', e.target.checked)}
+                className="rounded border-gray-300"
+              />
+              Employee is active (can sign in)
+            </label>
+            <p className="text-[11px] text-rose-900/80 dark:text-rose-200/90">
+              Turn this off to deactivate the employee account without deleting their records.
+            </p>
           </div>
           <EmployeeRecordStaffDocs userId={user.id} />
           <div>

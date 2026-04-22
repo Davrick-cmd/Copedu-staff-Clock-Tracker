@@ -11,6 +11,7 @@ export function AdminLeaveTypes() {
   const [types, setTypes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState('');
   const [form, setForm] = useState({ code: '', name: '', default_days: '0' });
 
   const load = () => {
@@ -49,6 +50,21 @@ export function AdminLeaveTypes() {
       toast(err?.response?.data?.detail || 'Could not create leave type', 'error');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onDelete = async (type) => {
+    const ok = window.confirm(`Delete leave type "${type?.name || ''}"? This hides it from new requests.`);
+    if (!ok) return;
+    setDeletingId(type.id);
+    try {
+      await api.deleteLeaveType(type.id);
+      toast('Leave type deleted', 'success');
+      load();
+    } catch (err) {
+      toast(err?.response?.data?.detail || 'Could not delete leave type', 'error');
+    } finally {
+      setDeletingId('');
     }
   };
 
@@ -118,11 +134,21 @@ export function AdminLeaveTypes() {
           <ul className="divide-y divide-slate-100 dark:divide-slate-800">
             {types.map((t) => (
               <li key={t.id} className="py-3 flex flex-wrap justify-between gap-2 text-sm">
-                <span className="font-medium text-slate-900 dark:text-white">{t.name}</span>
-                <span className="text-slate-500 dark:text-slate-400 tabular-nums">
-                  <span className="font-mono text-xs mr-2">{t.code}</span>
-                  {t.default_days ?? 0} days default
-                </span>
+                <div>
+                  <span className="font-medium text-slate-900 dark:text-white">{t.name}</span>
+                  <span className="text-slate-500 dark:text-slate-400 tabular-nums ml-3">
+                    <span className="font-mono text-xs mr-2">{t.code}</span>
+                    {t.default_days ?? 0} days default
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  disabled={deletingId === t.id}
+                  onClick={() => onDelete(t)}
+                  className="px-2.5 py-1 rounded-lg border border-red-300 text-red-700 dark:text-red-300 text-xs font-semibold hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
+                >
+                  {deletingId === t.id ? 'Deleting…' : 'Delete'}
+                </button>
               </li>
             ))}
           </ul>

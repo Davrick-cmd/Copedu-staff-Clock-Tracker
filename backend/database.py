@@ -1,5 +1,8 @@
 """
-SQLite database setup and helpers. Creates tables on first run.
+SQLite database setup and helpers.
+
+`init_db()` runs migrations idempotently (CREATE IF NOT EXISTS, pragma checks, selective ALTER).
+Application code should use `cursor()` / `get_conn()` from this module rather than opening ad-hoc connections.
 """
 import os
 import sqlite3
@@ -40,6 +43,7 @@ RW_LEAVE_TYPE_DEFAULTS = [
     ("HAJJ", "Hajj leave (where applicable)", 0),
     ("SPECIAL", "Special leave (discretionary / ministerial)", 0),
     ("UNPAID", "Unpaid leave", 0),
+    ("DAY_OFF_IN_LIEU", "Day off in lieu (balance usually from HR or OrangeHRM import)", 0),
 ]
 
 
@@ -393,6 +397,10 @@ def init_db():
             c.execute("ALTER TABLE appraisals ADD COLUMN total_score REAL")
         if "rating" not in app_cols:
             c.execute("ALTER TABLE appraisals ADD COLUMN rating TEXT")
+        if "employee_agreed_scores_at" not in app_cols:
+            c.execute("ALTER TABLE appraisals ADD COLUMN employee_agreed_scores_at TEXT")
+        if "signed_document_id" not in app_cols:
+            c.execute("ALTER TABLE appraisals ADD COLUMN signed_document_id TEXT")
 
         # KPI / quarterly appraisal: supervisor chain (like leave) instead of role-only verify
         c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='kpis'")
@@ -614,10 +622,39 @@ def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS leave_balance_adjustments (
+                id TEXT PRIMARY KEY,
+                target_user_id TEXT NOT NULL REFERENCES users(id),
+                leave_type_id TEXT NOT NULL REFERENCES leave_types(id),
+                year INTEGER NOT NULL,
+                requested_allocated_days REAL NOT NULL DEFAULT 0,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','cancelled')),
+                requested_by_user_id TEXT NOT NULL REFERENCES users(id),
+                current_approver_id TEXT REFERENCES users(id),
+                approved_by_user_id TEXT REFERENCES users(id),
+                approved_at TEXT,
+                rejection_comment TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("PRAGMA table_info(leave_balance_adjustments)")
+        _adj_cols = [row[1] for row in c.fetchall()]
+        if "current_approver_id" not in _adj_cols:
+            try:
+                c.execute("ALTER TABLE leave_balance_adjustments ADD COLUMN current_approver_id TEXT REFERENCES users(id)")
+            except sqlite3.OperationalError:
+                pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_user ON leave_requests(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_status ON leave_requests(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_approver ON leave_requests(current_approver_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_logs_request ON leave_workflow_logs(leave_request_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_status ON leave_balance_adjustments(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_target ON leave_balance_adjustments(target_user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_requested_by ON leave_balance_adjustments(requested_by_user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_approver ON leave_balance_adjustments(current_approver_id)")
         # Seed leave types (Rwanda-oriented catalogue; INSERT OR IGNORE preserves existing codes on upgrade)
         for code, name, days in RW_LEAVE_TYPE_DEFAULTS:
             c.execute(

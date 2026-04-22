@@ -8,6 +8,16 @@ import { EmptyState } from '../../components/EmptyState';
 import { useToast } from '../../hooks/useToast';
 import { ROUTES } from '../../utils/constants';
 
+function formatCycleContext(row) {
+  if (!row) return '';
+  const y = row.year;
+  const q = row.quarter;
+  const t = (row.cycle_type || 'cycle').replace(/^\w/, (c) => c.toUpperCase());
+  if ((row.cycle_type || '') === 'quarterly' && q) return `${y} ${q} · ${t}`;
+  if (y != null) return `${y} · ${t}`;
+  return t;
+}
+
 export function ManagerAppraisal() {
   const toast = useToast();
   const [data, setData] = useState(null);
@@ -17,6 +27,11 @@ export function ManagerAppraisal() {
   const [returnComment, setReturnComment] = useState({ id: null, type: null, comment: '' });
   const [showReturn, setShowReturn] = useState(null);
   const [verifyModal, setVerifyModal] = useState(null);
+  /** Prior comments on the item under review (Oracle-style KPI discussion). */
+  const [verifyWorkflow, setVerifyWorkflow] = useState(null);
+  const [verifyAppraisalDetail, setVerifyAppraisalDetail] = useState(null);
+  const [mgrScoreDrafts, setMgrScoreDrafts] = useState({});
+  const [savingMgrScores, setSavingMgrScores] = useState(false);
   const [viewingKpiId, setViewingKpiId] = useState(null);
   const [viewKpiDetail, setViewKpiDetail] = useState(null);
   const [viewKpiTitlesWithItems, setViewKpiTitlesWithItems] = useState([]);
@@ -34,6 +49,45 @@ export function ManagerAppraisal() {
   };
 
   useEffect(() => { load(); }, []);
+
+  useEffect(() => {
+    if (!verifyModal?.id) {
+      setVerifyWorkflow(null);
+      return;
+    }
+    setVerifyWorkflow({ loading: true, comments: [], error: null });
+    const p =
+      verifyModal.type === 'kpi'
+        ? api.getKpiWorkflow(verifyModal.id)
+        : api.getAppraisalWorkflow(verifyModal.id);
+    p.then((w) => setVerifyWorkflow({ loading: false, comments: w?.comments || [], error: null }))
+      .catch(() => setVerifyWorkflow({ loading: false, comments: [], error: 'Could not load prior comments.' }));
+  }, [verifyModal?.id, verifyModal?.type]);
+
+  useEffect(() => {
+    if (!verifyModal?.id || verifyModal.type !== 'appraisal') {
+      setVerifyAppraisalDetail(null);
+      setMgrScoreDrafts({});
+      return;
+    }
+    api.getAppraisal(verifyModal.id)
+      .then((d) => {
+        setVerifyAppraisalDetail(d);
+        const o = {};
+        (d?.scores || []).forEach((s) => {
+          o[s.kpi_item_id] = {
+            supervisor_score: s.supervisor_score ?? '',
+            agreed_score: s.agreed_score ?? '',
+            supervisor_comment: s.supervisor_comment ?? '',
+          };
+        });
+        setMgrScoreDrafts(o);
+      })
+      .catch(() => {
+        setVerifyAppraisalDetail(null);
+        setMgrScoreDrafts({});
+      });
+  }, [verifyModal?.id, verifyModal?.type]);
 
   useEffect(() => {
     if (!viewingKpiId) {
@@ -169,7 +223,7 @@ export function ManagerAppraisal() {
                   <p className="text-sm text-gray-600 dark:text-gray-400">{k.title}</p>
                 </div>
                 <div className="flex gap-2">
-                  <button type="button" disabled={actionId === k.id} onClick={() => setVerifyModal({ type: 'kpi', id: k.id, comment: '' })} className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50">Review</button>
+                  <button type="button" disabled={actionId === k.id} onClick={() => setVerifyModal({ type: 'kpi', id: k.id, comment: '', snapshot: k })} className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50">Review</button>
                   <button type="button" onClick={() => { setShowReturn({ type: 'kpi', id: k.id }); setReturnComment({ id: k.id, type: 'kpi', comment: '' }); }} className="px-3 py-1.5 border border-amber-500 text-amber-700 dark:text-amber-400 rounded-lg text-sm hover:bg-amber-50 dark:hover:bg-amber-900/20">Return</button>
                 </div>
               </li>
@@ -186,7 +240,7 @@ export function ManagerAppraisal() {
               <li key={a.id} className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 dark:border-gray-700 pb-2">
                 <p className="font-medium text-gray-800 dark:text-white">{a.user_name}</p>
                 <div className="flex gap-2">
-                  <button type="button" disabled={actionId === a.id} onClick={() => setVerifyModal({ type: 'appraisal', id: a.id, comment: '' })} className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50">Review</button>
+                  <button type="button" disabled={actionId === a.id} onClick={() => setVerifyModal({ type: 'appraisal', id: a.id, comment: '', snapshot: a })} className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50">Review</button>
                   <button type="button" onClick={() => { setShowReturn({ type: 'appraisal', id: a.id }); setReturnComment({ id: a.id, type: 'appraisal', comment: '' }); }} className="px-3 py-1.5 border border-amber-500 text-amber-700 dark:text-amber-400 rounded-lg text-sm hover:bg-amber-50 dark:hover:bg-amber-900/20">Return</button>
                 </div>
               </li>
@@ -256,11 +310,171 @@ export function ManagerAppraisal() {
 
       {verifyModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-md w-full p-5">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-2">
               {verifyModal.type === 'kpi' ? 'Supervisor review (KPI)' : 'Supervisor review (appraisal)'}
             </h3>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Add a comment (required). If you are not the last approver in the chain, the item moves to the next manager.</p>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Add a comment (required). If you are not the last approver in the chain, the item moves to the next manager.</p>
+
+            {verifyModal.type === 'kpi' && verifyModal.snapshot && (
+              <div className="mb-4 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-900/40 p-4 text-sm space-y-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">KPI definition (context)</p>
+                <p><span className="text-gray-500 dark:text-gray-400">Owner:</span> <span className="text-gray-900 dark:text-white font-medium">{verifyModal.snapshot.user_name || '—'}</span></p>
+                <p><span className="text-gray-500 dark:text-gray-400">Period:</span> <span className="text-gray-900 dark:text-white">{formatCycleContext(verifyModal.snapshot) || '—'}</span></p>
+                {(verifyModal.snapshot.cycle_start_date || verifyModal.snapshot.cycle_end_date) && (
+                  <p className="text-gray-600 dark:text-gray-300 text-xs">Cycle dates: {verifyModal.snapshot.cycle_start_date || '—'} → {verifyModal.snapshot.cycle_end_date || '—'}</p>
+                )}
+                <p><span className="text-gray-500 dark:text-gray-400">Title:</span> <span className="text-gray-900 dark:text-white font-medium">{verifyModal.snapshot.title || '—'}</span></p>
+                {verifyModal.snapshot.description ? (
+                  <p><span className="text-gray-500 dark:text-gray-400">Description:</span> <span className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">{verifyModal.snapshot.description}</span></p>
+                ) : null}
+                {verifyModal.snapshot.target ? (
+                  <p><span className="text-gray-500 dark:text-gray-400">Target / success criteria:</span> <span className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">{verifyModal.snapshot.target}</span></p>
+                ) : null}
+                <p><span className="text-gray-500 dark:text-gray-400">Weight in cycle:</span> <span className="tabular-nums text-gray-900 dark:text-white">{verifyModal.snapshot.weight != null ? `${Number(verifyModal.snapshot.weight)}%` : '—'}</span></p>
+              </div>
+            )}
+
+            {verifyModal.type === 'appraisal' && verifyModal.snapshot && (
+              <div className="mb-4 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-900/40 p-4 text-sm space-y-2">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Self-assessment (context)</p>
+                <p><span className="text-gray-500 dark:text-gray-400">Employee:</span> <span className="text-gray-900 dark:text-white font-medium">{verifyModal.snapshot.user_name || '—'}</span></p>
+                <p><span className="text-gray-500 dark:text-gray-400">Period:</span> <span className="text-gray-900 dark:text-white">{formatCycleContext(verifyModal.snapshot) || '—'}</span></p>
+                {(verifyModal.snapshot.cycle_start_date || verifyModal.snapshot.cycle_end_date) && (
+                  <p className="text-gray-600 dark:text-gray-300 text-xs">Cycle dates: {verifyModal.snapshot.cycle_start_date || '—'} → {verifyModal.snapshot.cycle_end_date || '—'}</p>
+                )}
+                {verifyModal.snapshot.achievements ? (
+                  <p><span className="text-gray-500 dark:text-gray-400">Achievements:</span> <span className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">{verifyModal.snapshot.achievements}</span></p>
+                ) : null}
+                {verifyModal.snapshot.challenges ? (
+                  <p><span className="text-gray-500 dark:text-gray-400">Challenges:</span> <span className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">{verifyModal.snapshot.challenges}</span></p>
+                ) : null}
+                {verifyModal.snapshot.overall_comments ? (
+                  <p><span className="text-gray-500 dark:text-gray-400">Overall comments:</span> <span className="text-gray-800 dark:text-gray-200 whitespace-pre-wrap">{verifyModal.snapshot.overall_comments}</span></p>
+                ) : null}
+              </div>
+            )}
+
+            {verifyModal.type === 'appraisal' && verifyAppraisalDetail?.scores?.length > 0 && (
+              <div className="mb-4 rounded-lg border border-primary-200 dark:border-primary-800 bg-primary-50/50 dark:bg-primary-900/20 p-4 text-sm space-y-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-primary-800 dark:text-primary-200">Quarterly KPI scores — enter supervisor % and agreed % before submitting your review</p>
+                <div className="overflow-x-auto max-h-56 overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-gray-200 dark:border-gray-600">
+                        <th className="text-left py-1 text-gray-700 dark:text-gray-300">Line</th>
+                        <th className="py-1">Sup %</th>
+                        <th className="py-1">Agreed %</th>
+                        <th className="py-1">Note</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {verifyAppraisalDetail.scores.map((s) => {
+                        const kid = s.kpi_item_id;
+                        const dr = mgrScoreDrafts[kid] || {};
+                        return (
+                          <tr key={s.id} className="border-b border-gray-100 dark:border-gray-700">
+                            <td className="py-1 text-gray-800 dark:text-gray-200 max-w-[140px]">{s.description}</td>
+                            <td className="py-1">
+                              <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                step={0.5}
+                                value={dr.supervisor_score}
+                                onChange={(e) => setMgrScoreDrafts((prev) => ({ ...prev, [kid]: { ...dr, supervisor_score: e.target.value } }))}
+                                className="w-16 px-1 py-0.5 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
+                              />
+                            </td>
+                            <td className="py-1">
+                              <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                step={0.5}
+                                value={dr.agreed_score}
+                                onChange={(e) => setMgrScoreDrafts((prev) => ({ ...prev, [kid]: { ...dr, agreed_score: e.target.value } }))}
+                                className="w-16 px-1 py-0.5 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
+                              />
+                            </td>
+                            <td className="py-1">
+                              <input
+                                type="text"
+                                value={dr.supervisor_comment}
+                                onChange={(e) => setMgrScoreDrafts((prev) => ({ ...prev, [kid]: { ...dr, supervisor_comment: e.target.value } }))}
+                                className="w-full min-w-[100px] px-1 py-0.5 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <button
+                  type="button"
+                  disabled={savingMgrScores || !verifyModal.id}
+                  onClick={async () => {
+                    setSavingMgrScores(true);
+                    try {
+                      for (const s of verifyAppraisalDetail.scores) {
+                        const kid = s.kpi_item_id;
+                        const dr = mgrScoreDrafts[kid] || {};
+                        const sup = dr.supervisor_score === '' ? null : Number(dr.supervisor_score);
+                        const ag = dr.agreed_score === '' ? null : Number(dr.agreed_score);
+                        if (sup != null && (Number.isNaN(sup) || sup < 0 || sup > 100)) {
+                          toast('Supervisor % must be 0–100', 'error');
+                          setSavingMgrScores(false);
+                          return;
+                        }
+                        if (ag != null && (Number.isNaN(ag) || ag < 0 || ag > 100)) {
+                          toast('Agreed % must be 0–100', 'error');
+                          setSavingMgrScores(false);
+                          return;
+                        }
+                        await api.updateAppraisalScore(verifyModal.id, kid, {
+                          supervisor_score: sup,
+                          agreed_score: ag,
+                          supervisor_comment: dr.supervisor_comment || null,
+                        });
+                      }
+                      const d = await api.getAppraisal(verifyModal.id);
+                      setVerifyAppraisalDetail(d);
+                      toast('Supervisor scores saved', 'success');
+                    } catch (e) {
+                      toast(e.response?.data?.detail || 'Failed', 'error');
+                    } finally {
+                      setSavingMgrScores(false);
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-xs hover:bg-primary-700 disabled:opacity-50"
+                >
+                  Save supervisor scores
+                </button>
+              </div>
+            )}
+
+            <div className="mb-4">
+              <p className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">Prior discussion</p>
+              {verifyWorkflow?.loading ? (
+                <p className="text-sm text-gray-500">Loading…</p>
+              ) : verifyWorkflow?.error ? (
+                <p className="text-sm text-amber-600 dark:text-amber-400">{verifyWorkflow.error}</p>
+              ) : (verifyWorkflow?.comments || []).length === 0 ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400">No comments yet on this item.</p>
+              ) : (
+                <ul className="max-h-40 overflow-y-auto space-y-2 border border-gray-100 dark:border-gray-700 rounded-lg p-2 bg-white dark:bg-gray-800/80">
+                  {(verifyWorkflow.comments || []).map((c) => (
+                    <li key={c.id} className="text-xs text-gray-700 dark:text-gray-300 border-b border-gray-100 dark:border-gray-700 last:border-0 pb-2 last:pb-0">
+                      <span className="font-medium text-gray-800 dark:text-gray-200">{c.from_role || 'reviewer'}</span>
+                      {c.created_at ? <span className="text-gray-400 ml-1">{c.created_at}</span> : null}
+                      <p className="mt-1 whitespace-pre-wrap text-gray-600 dark:text-gray-400">{c.comment}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
             <textarea
               value={verifyModal.comment}
               onChange={(e) => setVerifyModal((m) => ({ ...m, comment: e.target.value }))}

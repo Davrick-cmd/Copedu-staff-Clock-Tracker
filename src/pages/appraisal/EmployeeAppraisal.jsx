@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useSelector } from 'react-redux';
 import { Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as api from '../../services/api';
@@ -51,6 +52,8 @@ function groupKpisByCycle(kpis) {
 
 export function EmployeeAppraisal() {
   const toast = useToast();
+  const profile = useSelector((s) => s.auth.profile);
+  const myId = profile?.id;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [ackId, setAckId] = useState(null);
@@ -69,6 +72,12 @@ export function EmployeeAppraisal() {
   const [annualTitlesWithItems, setAnnualTitlesWithItems] = useState([]);
   const [newTitleName, setNewTitleName] = useState('');
   const [newItemByTitle, setNewItemByTitle] = useState({});
+  const [scoreRows, setScoreRows] = useState({});
+  const [savingScores, setSavingScores] = useState(false);
+  const [apNarrative, setApNarrative] = useState({ achievements: '', challenges: '', overall_comments: '' });
+  const [confirmAgreeing, setConfirmAgreeing] = useState(false);
+  const [downloadingSummary, setDownloadingSummary] = useState(false);
+  const [signUploading, setSignUploading] = useState(false);
 
   const load = () => {
     api.getAppraisalDashboardStaff()
@@ -103,6 +112,27 @@ export function EmployeeAppraisal() {
     }
     setAppraisalDetail(null);
   }, [selectedAppraisalId]);
+
+  useEffect(() => {
+    if (!appraisalDetail?.id) {
+      setScoreRows({});
+      setApNarrative({ achievements: '', challenges: '', overall_comments: '' });
+      return;
+    }
+    setApNarrative({
+      achievements: appraisalDetail.achievements || '',
+      challenges: appraisalDetail.challenges || '',
+      overall_comments: appraisalDetail.overall_comments || '',
+    });
+    const o = {};
+    (appraisalDetail.scores || []).forEach((s) => {
+      o[s.kpi_item_id] = {
+        self_score: s.self_score ?? '',
+        self_comment: s.self_comment ?? '',
+      };
+    });
+    setScoreRows(o);
+  }, [appraisalDetail?.id]);
 
   useEffect(() => {
     if (!annualDetail?.id) {
@@ -170,7 +200,7 @@ export function EmployeeAppraisal() {
     setModalOpen(false);
     setEditingKpi(null);
     setReturnComment(null);
-    setForm({ title: '', description: '', target: '' });
+    setForm({ title: '', description: '', target: '', weight: '' });
   };
 
   const currentCycleId = active?.id || editingKpi?.cycle_id;
@@ -299,21 +329,32 @@ export function EmployeeAppraisal() {
   const receivedAppraisals = appraisals.filter((a) => (a.status || '') === 'received');
   const cycles = data?.cycles || [];
   const isActive = active && (active.status || '').toLowerCase() === 'active';
+  const activeYearClosed = !!(active && closedYears.includes(Number(active.year)));
+  const editKpiYearClosed = !!(editingKpi && closedYears.includes(Number(editingKpi.year)));
+  const kpiYearBlocked = editKpiYearClosed || (!editingKpi && activeYearClosed);
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Appraisal</h1>
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Performance contract & appraisal</h1>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Your main KPI sheet is <strong className="text-gray-800 dark:text-gray-200">Annual KPIs</strong> below — same idea as the Excel performance contract (categories, lines, weight %, expected results %). Quarterly appraisals score those lines.</p>
+        </div>
         <Link to={ROUTES.EMPLOYEE.DASHBOARD} className="text-primary-600 dark:text-primary-400 hover:underline text-sm">Back to Dashboard</Link>
       </div>
 
-      <p className="text-gray-600 dark:text-gray-400 text-sm">
-        Add <strong>KPI Titles</strong>, then under each title add <strong>subtitles</strong> with <strong>Target %</strong> and <strong>Weight %</strong> (both 0–100). Total weight across all subtitles must equal 100% to submit. After Supervisor → HOD → HR lock, use them for quarterly appraisals.
+      <p className="text-gray-600 dark:text-gray-400 text-sm border-l-4 border-primary-500 pl-3 py-1">
+        <strong>Annual KPIs:</strong> build your contract (total weight 100%), submit for Supervisor → HOD → HR lock.
+        <span className="mx-1.5 text-gray-400">·</span>
+        <strong>Quarterly:</strong> open My Appraisals for self %, narrative, confirm agreed scores, download, sign, upload.
+        <span className="mx-1.5 text-gray-400">·</span>
+        Optional <strong>cycle KPIs</strong> (further down) are separate one-line records per cycle if HR still uses them.
       </p>
 
-      {/* Annual KPIs (once per year, reused for quarterly appraisals) */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-6">
-        <h2 className="text-xl font-semibold text-gray-800 dark:text-white mb-4">Annual KPIs</h2>
+      {/* Annual KPIs = performance contract (Excel-style); drives quarterly appraisal score rows */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg ring-1 ring-primary-200/60 dark:ring-primary-900/40 border border-gray-100 dark:border-gray-700 p-6">
+        <h2 className="text-xl font-semibold text-gray-800 dark:text-white mb-1">Annual KPIs — performance contract</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">Mirror your Excel sheet: each <em>category</em> is a section; each <em>line</em> is a KPI with weighting % and expected results %.</p>
         {selectedAnnualId ? (
           <div>
             <button type="button" onClick={() => { setSelectedAnnualId(null); setAnnualDetail(null); }} className="text-sm text-primary-600 dark:text-primary-400 hover:underline mb-3">← Back to list</button>
@@ -324,125 +365,195 @@ export function EmployeeAppraisal() {
                     Year {annualDetail.year} is closed for appraisal. No new KPIs or edits can be added.
                   </div>
                 )}
-                <p className="text-base text-gray-600 dark:text-gray-400">Year {annualDetail.year} · Total weight: <strong>{annualDetail.total_weight ?? 0}%</strong> · {STATUS_LABELS[annualDetail.status] || annualDetail.status}</p>
-                {annualTitlesWithItems.map((t) => {
-                  const itemForm = newItemByTitle[t.id] || {};
+                <div className="flex flex-wrap justify-between items-start gap-4">
+                  <p className="text-base text-gray-600 dark:text-gray-400">
+                    Contract year <strong className="text-gray-900 dark:text-white">{annualDetail.year}</strong>
+                    {' · '}
+                    Total KPI weighting: <strong>{annualDetail.total_weight ?? 0}%</strong> (target 100%)
+                    {' · '}
+                    {STATUS_LABELS[annualDetail.status] || annualDetail.status}
+                  </p>
+                </div>
+                {profile && (
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-900/40 p-4 mb-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-400 mb-3">Contract header (from your profile)</p>
+                    <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-2 text-sm">
+                      <div>
+                        <dt className="text-gray-500 dark:text-gray-400">Employee name</dt>
+                        <dd className="font-medium text-gray-900 dark:text-white">{profile.full_name || '—'}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-gray-500 dark:text-gray-400">Job title</dt>
+                        <dd className="text-gray-800 dark:text-gray-200">{profile.job_title || '—'}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-gray-500 dark:text-gray-400">Duty station</dt>
+                        <dd className="text-gray-800 dark:text-gray-200">{profile.branches?.name || profile.branches?.code || '—'}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-gray-500 dark:text-gray-400">Department</dt>
+                        <dd className="text-gray-800 dark:text-gray-200">{profile.department || '—'}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-gray-500 dark:text-gray-400">Name of supervisor</dt>
+                        <dd className="text-gray-800 dark:text-gray-200">{profile.supervisor_name || '—'}</dd>
+                      </div>
+                    </dl>
+                  </div>
+                )}
+                {(() => {
                   const yearClosed = closedYears.includes(annualDetail.year);
                   const canEdit = !yearClosed && ((annualDetail.status || '') === 'draft' || (annualDetail.status || '').includes('returned'));
+                  const refreshAnnualItems = async () => {
+                    const updated = await api.getAnnualKpi(annualDetail.id);
+                    setAnnualDetail(updated);
+                    const titles = await api.getAnnualKpiTitles(annualDetail.id);
+                    const withItems = await Promise.all(
+                      (titles || []).map(async (tit) => ({
+                        ...tit,
+                        items: await api.getKpiTitleItems(tit.id),
+                      }))
+                    );
+                    setAnnualTitlesWithItems(withItems);
+                  };
                   return (
-                    <div key={t.id} className="border border-gray-200 dark:border-gray-600 rounded-lg p-5">
-                      <p className="font-semibold text-gray-900 dark:text-white text-lg">{t.name}</p>
-                      <p className="text-sm text-gray-500 dark:text-gray-400 mt-1 mb-3">KPI Title</p>
-                      <ul className="mt-4 space-y-3 text-base">
-                        {(t.items || []).map((i) => {
-                          const targetPct = i.target != null ? (typeof i.target === 'number' ? i.target : parseFloat(i.target)) : null;
+                    <div className="overflow-x-auto rounded-lg border border-slate-300 dark:border-slate-600">
+                      <table className="min-w-full text-sm border-collapse">
+                        <thead>
+                          <tr className="bg-slate-600 text-white dark:bg-slate-700">
+                            <th className="text-left px-4 py-3 font-semibold">KPIs (Key performance indicators)</th>
+                            <th className="text-center px-3 py-3 font-semibold w-28">KPI weighting %</th>
+                            <th className="text-center px-3 py-3 font-semibold w-32">Expected results %</th>
+                            {canEdit ? <th className="w-20 px-2 py-3" aria-label="Actions" /> : null}
+                          </tr>
+                        </thead>
+                        {annualTitlesWithItems.length === 0 ? (
+                          <tbody>
+                            <tr>
+                              <td colSpan={canEdit ? 4 : 3} className="px-4 py-6 text-center text-gray-500 dark:text-gray-400">
+                                No categories yet. Add a category below (e.g. 1. Infrastructure Maintenance and Availability), then add KPI lines with weighting and expected results %.
+                              </td>
+                            </tr>
+                          </tbody>
+                        ) : null}
+                        {annualTitlesWithItems.map((t) => {
+                          const itemForm = newItemByTitle[t.id] || {};
                           return (
-                            <li key={i.id} className="flex justify-between items-center pl-4 border-l-2 border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300">
-                              <span className="font-medium">{i.description}</span>
-                              <span className="text-gray-500 dark:text-gray-400 text-base">
-                                Target: {targetPct != null && !isNaN(targetPct) ? `${targetPct}%` : '-'} · Weight: {i.weight != null ? `${Number(i.weight)}%` : '-'}
-                              </span>
-                              {canEdit && (
-                                <button
-                                  type="button"
-                                  className="text-red-600 dark:text-red-400 text-xs hover:underline"
-                                  onClick={async () => {
-                                    try {
-                                      await api.deleteKpiItem(i.id);
-                                      const updated = await api.getAnnualKpi(annualDetail.id);
-                                      setAnnualDetail(updated);
-                                      const titles = await api.getAnnualKpiTitles(annualDetail.id);
-                                      const withItems = await Promise.all(
-                                        (titles || []).map(async (tit) => ({
-                                          ...tit,
-                                          items: await api.getKpiTitleItems(tit.id),
-                                        }))
-                                      );
-                                      setAnnualTitlesWithItems(withItems);
-                                    } catch (e) {
-                                      toast(e.response?.data?.detail || 'Delete failed', 'error');
-                                    }
-                                  }}
-                                >
-                                  Delete
-                                </button>
-                              )}
-                            </li>
+                            <tbody key={t.id}>
+                              <tr className="bg-slate-200 dark:bg-slate-700/80">
+                                <td colSpan={canEdit ? 4 : 3} className="px-4 py-2 font-semibold text-slate-900 dark:text-slate-100">
+                                  {t.name}
+                                </td>
+                              </tr>
+                              {(t.items || []).length === 0 ? (
+                                <tr>
+                                  <td colSpan={canEdit ? 4 : 3} className="px-4 py-2 text-gray-500 dark:text-gray-400 italic border-b border-slate-200 dark:border-slate-600">
+                                    No KPI lines in this category yet.
+                                  </td>
+                                </tr>
+                              ) : null}
+                              {(t.items || []).map((i) => {
+                                const raw = i.target;
+                                const targetPct = raw != null
+                                  ? (typeof raw === 'number' ? raw : parseFloat(String(raw).replace(/%/g, '')))
+                                  : null;
+                                return (
+                                  <tr key={i.id} className="border-b border-slate-200 dark:border-slate-600 bg-white dark:bg-gray-800">
+                                    <td className="px-4 py-3 text-gray-800 dark:text-gray-200 align-top">{i.description}</td>
+                                    <td className="px-3 py-3 text-center tabular-nums text-gray-700 dark:text-gray-300">{i.weight != null ? `${Number(i.weight)}` : '—'}</td>
+                                    <td className="px-3 py-3 text-center tabular-nums text-gray-700 dark:text-gray-300">{targetPct != null && !Number.isNaN(targetPct) ? `${targetPct}` : '—'}</td>
+                                    {canEdit ? (
+                                      <td className="px-2 py-3 text-right">
+                                        <button
+                                          type="button"
+                                          className="text-red-600 dark:text-red-400 text-xs hover:underline"
+                                          onClick={async () => {
+                                            try {
+                                              await api.deleteKpiItem(i.id);
+                                              await refreshAnnualItems();
+                                            } catch (e) {
+                                              toast(e.response?.data?.detail || 'Delete failed', 'error');
+                                            }
+                                          }}
+                                        >
+                                          Delete
+                                        </button>
+                                      </td>
+                                    ) : null}
+                                  </tr>
+                                );
+                              })}
+                              {canEdit ? (
+                                <tr className="bg-slate-50 dark:bg-slate-800/50 border-b border-slate-200 dark:border-slate-600">
+                                  <td colSpan={4} className="px-4 py-3">
+                                    <form
+                                      className="flex flex-wrap gap-2 items-end"
+                                      onSubmit={async (e) => {
+                                        e.preventDefault();
+                                        if (!(itemForm.description || '').trim()) return;
+                                        const w = parseFloat(itemForm.weight);
+                                        const targetVal = parseFloat(itemForm.target);
+                                        if (Number.isNaN(w) || w < 0 || w > 100) {
+                                          toast('KPI weighting must be 0–100%', 'error');
+                                          return;
+                                        }
+                                        if (Number.isNaN(targetVal) || targetVal < 0 || targetVal > 100) {
+                                          toast('Expected results must be 0–100%', 'error');
+                                          return;
+                                        }
+                                        try {
+                                          await api.createKpiItem(t.id, {
+                                            description: (itemForm.description || '').trim(),
+                                            weight: w,
+                                            target: targetVal,
+                                          });
+                                          setNewItemByTitle((p) => ({ ...p, [t.id]: {} }));
+                                          await refreshAnnualItems();
+                                          toast('KPI line added', 'success');
+                                        } catch (err) {
+                                          toast(err.response?.data?.detail || 'Failed', 'error');
+                                        }
+                                      }}
+                                    >
+                                      <input
+                                        type="text"
+                                        value={itemForm.description || ''}
+                                        onChange={(e) => setNewItemByTitle((p) => ({ ...p, [t.id]: { ...(p[t.id] || {}), description: e.target.value } }))}
+                                        placeholder="KPI wording (key performance indicator)"
+                                        className="flex-1 min-w-[200px] px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                                      />
+                                      <input
+                                        type="number"
+                                        min={0}
+                                        max={100}
+                                        step={0.5}
+                                        value={itemForm.target ?? ''}
+                                        onChange={(e) => setNewItemByTitle((p) => ({ ...p, [t.id]: { ...(p[t.id] || {}), target: e.target.value } }))}
+                                        placeholder="Expected %"
+                                        className="w-28 min-w-[7.5rem] px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                                      />
+                                      <input
+                                        type="number"
+                                        min={0}
+                                        max={100}
+                                        step={0.5}
+                                        value={itemForm.weight ?? ''}
+                                        onChange={(e) => setNewItemByTitle((p) => ({ ...p, [t.id]: { ...(p[t.id] || {}), weight: e.target.value } }))}
+                                        placeholder="Weight %"
+                                        className="w-28 min-w-[7.5rem] px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                                      />
+                                      <button type="submit" className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700">Add KPI line</button>
+                                    </form>
+                                  </td>
+                                </tr>
+                              ) : null}
+                            </tbody>
                           );
                         })}
-                      </ul>
-                      {canEdit && (
-                        <form
-                          className="mt-3 flex flex-wrap gap-2 items-end"
-                          onSubmit={async (e) => {
-                            e.preventDefault();
-                            if (!(itemForm.description || '').trim()) return;
-                            const w = parseFloat(itemForm.weight);
-                            const targetVal = parseFloat(itemForm.target);
-                            if (isNaN(w) || w < 0 || w > 100) {
-                              toast('Weight must be 0–100%', 'error');
-                              return;
-                            }
-                            if (isNaN(targetVal) || targetVal < 0 || targetVal > 100) {
-                              toast('Target must be 0–100%', 'error');
-                              return;
-                            }
-                            try {
-                              await api.createKpiItem(t.id, {
-                                description: (itemForm.description || '').trim(),
-                                weight: w,
-                                target: targetVal,
-                              });
-                              setNewItemByTitle((p) => ({ ...p, [t.id]: {} }));
-                              const updated = await api.getAnnualKpi(annualDetail.id);
-                              setAnnualDetail(updated);
-                              const titles = await api.getAnnualKpiTitles(annualDetail.id);
-                              const withItems = await Promise.all(
-                                (titles || []).map(async (tit) => ({
-                                  ...tit,
-                                  items: await api.getKpiTitleItems(tit.id),
-                                }))
-                              );
-                              setAnnualTitlesWithItems(withItems);
-                              toast('Subtitle added', 'success');
-                            } catch (err) {
-                              toast(err.response?.data?.detail || 'Failed', 'error');
-                            }
-                          }}
-                        >
-                          <input
-                            type="text"
-                            value={itemForm.description || ''}
-                            onChange={(e) => setNewItemByTitle((p) => ({ ...p, [t.id]: { ...(p[t.id] || {}), description: e.target.value } }))}
-                            placeholder="Subtitle"
-                            className="flex-1 min-w-[140px] px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-base"
-                          />
-                          <input
-                            type="number"
-                            min={0}
-                            max={100}
-                            step={0.5}
-                            value={itemForm.target ?? ''}
-                            onChange={(e) => setNewItemByTitle((p) => ({ ...p, [t.id]: { ...(p[t.id] || {}), target: e.target.value } }))}
-                            placeholder="Target %"
-                            className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-base"
-                          />
-                          <input
-                            type="number"
-                            min={0}
-                            max={100}
-                            step={0.5}
-                            value={itemForm.weight ?? ''}
-                            onChange={(e) => setNewItemByTitle((p) => ({ ...p, [t.id]: { ...(p[t.id] || {}), weight: e.target.value } }))}
-                            placeholder="Weight %"
-                            className="w-24 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-base"
-                          />
-                          <button type="submit" className="px-4 py-2 bg-primary-600 text-white rounded-lg text-base hover:bg-primary-700">Add subtitle</button>
-                        </form>
-                      )}
+                      </table>
                     </div>
                   );
-                })}
+                })()}
                 {!closedYears.includes(annualDetail.year) && ((annualDetail.status || '') === 'draft' || (annualDetail.status || '').includes('returned')) && (
                   <form
                     className="flex gap-2 items-end"
@@ -460,39 +571,57 @@ export function EmployeeAppraisal() {
                           }))
                         );
                         setAnnualTitlesWithItems(withItems);
-                        toast('KPI title added', 'success');
+                        toast('Category added', 'success');
                       } catch (err) {
                         toast(err.response?.data?.detail || 'Failed', 'error');
                       }
                     }}
                   >
-                    <input type="text" value={newTitleName} onChange={(e) => setNewTitleName(e.target.value)} placeholder="KPI Title (e.g. Customer Service Performance)" className="flex-1 max-w-md px-4 py-2.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-base" />
-                    <button type="submit" className="px-5 py-2.5 bg-primary-600 text-white rounded-lg text-base hover:bg-primary-700">Add Title</button>
+                    <input type="text" value={newTitleName} onChange={(e) => setNewTitleName(e.target.value)} placeholder="Category / KPI area (e.g. 1. Infrastructure Maintenance and Availability)" className="flex-1 max-w-md px-4 py-2.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-base" />
+                    <button type="submit" className="px-5 py-2.5 bg-primary-600 text-white rounded-lg text-base hover:bg-primary-700">Add category</button>
                   </form>
                 )}
-                {!closedYears.includes(annualDetail.year) && ((annualDetail.status || '') === 'draft' || (annualDetail.status || '').includes('returned')) && Math.abs((annualDetail.total_weight ?? 0) - 100) < 0.01 && (
-                  <button
-                    type="button"
-                    disabled={saving}
-                    className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
-                    onClick={async () => {
-                      setSaving(true);
-                      try {
-                        await api.submitAnnualKpi(annualDetail.id);
-                        toast('Submitted', 'success');
-                        loadAnnualKpis();
-                        const updated = await api.getAnnualKpi(annualDetail.id);
-                        setAnnualDetail(updated);
-                      } catch (err) {
-                        toast(err.response?.data?.detail || 'Failed', 'error');
-                      } finally {
-                        setSaving(false);
-                      }
-                    }}
-                  >
-                    Submit for approval
-                  </button>
-                )}
+                {!closedYears.includes(annualDetail.year) && ((annualDetail.status || '') === 'draft' || (annualDetail.status || '').includes('returned')) && (() => {
+                  const tw = Number(annualDetail.total_weight) || 0;
+                  const readyToSubmit = Math.abs(tw - 100) < 0.01;
+                  const remaining = Math.max(0, Math.round((100 - tw) * 100) / 100);
+                  return (
+                    <div className="mt-6 flex flex-col gap-2 p-4 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-900/30">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          disabled={saving || !readyToSubmit}
+                          title={!readyToSubmit ? 'Add KPI lines until KPI weighting % totals 100%' : ''}
+                          className="px-4 py-2.5 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                          onClick={async () => {
+                            if (!readyToSubmit) return;
+                            setSaving(true);
+                            try {
+                              await api.submitAnnualKpi(annualDetail.id);
+                              toast('Submitted to supervisor', 'success');
+                              loadAnnualKpis();
+                              const updated = await api.getAnnualKpi(annualDetail.id);
+                              setAnnualDetail(updated);
+                            } catch (err) {
+                              toast(err.response?.data?.detail || 'Failed', 'error');
+                            } finally {
+                              setSaving(false);
+                            }
+                          }}
+                        >
+                          {saving ? 'Submitting…' : 'Submit to supervisor'}
+                        </button>
+                        {!readyToSubmit ? (
+                          <p className="text-sm text-gray-600 dark:text-gray-400 max-w-xl">
+                            Total KPI weighting is <strong className="text-gray-800 dark:text-gray-200">{tw}%</strong>; it must be <strong>100%</strong> before submit (same rule as your Excel contract). About <strong>{remaining}%</strong> still to assign across your lines.
+                          </p>
+                        ) : (
+                          <p className="text-sm text-green-700 dark:text-green-400">Weights total 100%. You can submit to your supervisor.</p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
           </div>
@@ -608,21 +737,52 @@ export function EmployeeAppraisal() {
       )}
 
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 overflow-hidden">
-        <h2 className="text-xl font-semibold text-gray-800 dark:text-white p-6 pb-0">My KPIs by cycle</h2>
+        <div className="p-6 pb-0 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-semibold text-gray-800 dark:text-white">Optional: KPI lines by appraisal cycle</h2>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mt-1 max-w-3xl">Separate from your <strong className="text-gray-700 dark:text-gray-300">annual performance contract</strong> above. Use this block only if HR still collects per-cycle KPI records in addition to the annual sheet.</p>
+          </div>
+          {isActive && active?.id && (
+            <button
+              type="button"
+              onClick={() => {
+                if (activeYearClosed) {
+                  toast('This performance year is closed. Ask HR or Admin to reopen the cycle (Draft) before adding KPIs.', 'error');
+                  return;
+                }
+                openCreateModal();
+              }}
+              disabled={activeYearClosed}
+              className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Create KPI
+            </button>
+          )}
+        </div>
+        {activeYearClosed && isActive && (
+          <p className="px-6 pt-2 text-sm text-amber-700 dark:text-amber-300">Year {active.year} is closed for performance KPIs. HR/Admin can reopen a cycle for this year (Appraisal → Cycles → Reopen).</p>
+        )}
         {cyclesGrouped.length === 0 ? (
           <div className="p-6">
-            <EmptyState title="No KPIs" message={isActive ? 'Use "Create KPI" above to add KPIs for the active cycle.' : 'Create KPIs when an appraisal cycle is active.'} />
+            <EmptyState
+              title="No KPIs yet"
+              message={isActive && !activeYearClosed ? 'Use Create KPI to add lines for this cycle, then submit each to your supervisor.' : isActive && activeYearClosed ? 'This year is closed for new KPIs until HR reopens a cycle.' : 'When HR sets an active appraisal cycle, you can create KPIs here.'}
+            />
           </div>
         ) : (
           <div className="p-6 space-y-6">
             {cyclesGrouped.map((group) => {
               const cycleTotal = group.kpis.reduce((s, k) => s + (Number(k.weight) || 0), 0);
               const cycleLabel = group.type === 'quarterly' ? `${group.year} ${group.quarter || ''}` : group.year;
+              const groupYearClosed = closedYears.includes(Number(group.year));
               return (
                 <div key={group.cycle_id} className="border border-gray-200 dark:border-gray-600 rounded-lg overflow-hidden">
                   <div className="bg-gray-50 dark:bg-gray-700/50 px-5 py-3 flex justify-between items-center">
                     <span className="font-semibold text-gray-800 dark:text-white text-base">{cycleLabel}</span>
-                    <span className="text-base text-gray-600 dark:text-gray-400">Total weight: {cycleTotal}%</span>
+                    <span className="text-base text-gray-600 dark:text-gray-400">
+                      Total weight: {cycleTotal}%
+                      {groupYearClosed && <span className="ml-2 text-amber-600 dark:text-amber-400 text-sm">(year closed)</span>}
+                    </span>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-600">
@@ -637,7 +797,8 @@ export function EmployeeAppraisal() {
                       </thead>
                       <tbody className="divide-y divide-gray-200 dark:divide-gray-600">
                         {group.kpis.map((k) => {
-                          const canEdit = (k.status || '') === 'draft' || (k.status || '') === 'returned';
+                          const statusOk = (k.status || '') === 'draft' || (k.status || '') === 'returned';
+                          const canEdit = statusOk && !groupYearClosed;
                           return (
                             <tr key={k.id} className="bg-white dark:bg-gray-800">
                               <td className="px-5 py-4 text-base font-medium text-gray-800 dark:text-gray-200">{k.title}</td>
@@ -649,7 +810,7 @@ export function EmployeeAppraisal() {
                                 </span>
                               </td>
                               <td className="px-5 py-4 text-right">
-                                {canEdit && (
+                                {canEdit ? (
                                   <button
                                     type="button"
                                     onClick={() => openEditModal(k)}
@@ -657,7 +818,11 @@ export function EmployeeAppraisal() {
                                   >
                                     Edit
                                   </button>
-                                )}
+                                ) : statusOk && groupYearClosed ? (
+                                  <span className="text-xs text-gray-500 dark:text-gray-400">Year closed</span>
+                                ) : ['pending_supervisor', 'verified'].includes(k.status || '') ? (
+                                  <span className="text-xs text-gray-500 dark:text-gray-400">With supervisor</span>
+                                ) : null}
                               </td>
                             </tr>
                           );
@@ -675,34 +840,250 @@ export function EmployeeAppraisal() {
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
         <h2 className="font-semibold text-gray-800 dark:text-white mb-3">My Appraisals by cycle</h2>
         {selectedAppraisalId && appraisalDetail ? (
-          <div>
-            <button type="button" onClick={() => { setSelectedAppraisalId(null); setSelectedAppraisalRow(null); }} className="text-sm text-primary-600 dark:text-primary-400 hover:underline mb-3">← Back to list</button>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
+          <div className="space-y-4">
+            <button type="button" onClick={() => { setSelectedAppraisalId(null); setSelectedAppraisalRow(null); }} className="text-sm text-primary-600 dark:text-primary-400 hover:underline">← Back to list</button>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
               {selectedAppraisalRow ? (selectedAppraisalRow.cycle_type === 'quarterly' ? `${selectedAppraisalRow.year} ${selectedAppraisalRow.quarter || ''}` : selectedAppraisalRow.year) : '-'} · {STATUS_LABELS[appraisalDetail.status] || appraisalDetail.status}
             </p>
-            {(appraisalDetail.total_score != null || appraisalDetail.rating) && (
-              <p className="font-medium text-gray-800 dark:text-white mb-3">Total: {appraisalDetail.total_score ?? '-'}% · Rating: {appraisalDetail.rating || '-'}</p>
+            {appraisalDetail.employee_agreed_scores_at && (
+              <p className="text-sm text-green-700 dark:text-green-300">You confirmed agreement with the agreed scores on {appraisalDetail.employee_agreed_scores_at}.</p>
             )}
+            {(appraisalDetail.total_score != null || appraisalDetail.rating) && (
+              <p className="font-medium text-gray-800 dark:text-white">Total: {appraisalDetail.total_score ?? '-'}% · Rating: {appraisalDetail.rating || '-'}</p>
+            )}
+
+            {(() => {
+              const st = appraisalDetail.status || '';
+              const canEditAppraisal = (st === 'draft' || st === 'returned') && isActive;
+              return canEditAppraisal ? (
+                <div className="space-y-3 border border-gray-200 dark:border-gray-600 rounded-lg p-4">
+                  <p className="text-sm font-medium text-gray-800 dark:text-white">Self-assessment (save before submit)</p>
+                  <textarea value={apNarrative.achievements} onChange={(e) => setApNarrative((n) => ({ ...n, achievements: e.target.value }))} rows={3} placeholder="Achievements" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+                  <textarea value={apNarrative.challenges} onChange={(e) => setApNarrative((n) => ({ ...n, challenges: e.target.value }))} rows={3} placeholder="Challenges" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+                  <textarea value={apNarrative.overall_comments} onChange={(e) => setApNarrative((n) => ({ ...n, overall_comments: e.target.value }))} rows={2} placeholder="Overall comments" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm" />
+                  <button
+                    type="button"
+                    disabled={savingScores}
+                    className="px-3 py-1.5 bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-white rounded-lg text-sm"
+                    onClick={async () => {
+                      setSavingScores(true);
+                      try {
+                        await api.updateAppraisal(selectedAppraisalId, {
+                          achievements: apNarrative.achievements,
+                          challenges: apNarrative.challenges,
+                          overall_comments: apNarrative.overall_comments,
+                        });
+                        toast('Narrative saved', 'success');
+                        const d = await api.getAppraisal(selectedAppraisalId);
+                        setAppraisalDetail(d);
+                        load();
+                      } catch (e) {
+                        toast(e.response?.data?.detail || 'Failed', 'error');
+                      } finally {
+                        setSavingScores(false);
+                      }
+                    }}
+                  >
+                    Save narrative
+                  </button>
+                </div>
+              ) : null;
+            })()}
+
             {(appraisalDetail.scores || []).length > 0 ? (
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto space-y-3">
                 <table className="w-full text-sm">
-                  <thead><tr className="border-b border-gray-200 dark:border-gray-600"><th className="text-left py-2 text-gray-700 dark:text-gray-300">KPI</th><th className="py-2 text-gray-700 dark:text-gray-300">Weight</th><th className="py-2 text-gray-700 dark:text-gray-300">Self %</th><th className="py-2 text-gray-700 dark:text-gray-300">Supervisor %</th><th className="py-2 text-gray-700 dark:text-gray-300">Agreed %</th><th className="py-2 text-gray-700 dark:text-gray-300">Weighted</th></tr></thead>
+                  <thead>
+                    <tr className="border-b border-gray-200 dark:border-gray-600">
+                      <th className="text-left py-2 text-gray-700 dark:text-gray-300">KPI (from locked annual contract)</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Weight %</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Self %</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Supervisor %</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Agreed %</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Weighted</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {appraisalDetail.scores.map((s) => (
-                      <tr key={s.id} className="border-b border-gray-100 dark:border-gray-700">
-                        <td className="py-2 text-gray-800 dark:text-gray-200">{s.description} - {s.target}</td>
-                        <td className="py-2 text-gray-600 dark:text-gray-400">{s.weight}%</td>
-                        <td className="py-2">{s.self_score != null ? s.self_score : '-'}</td>
-                        <td className="py-2">{s.supervisor_score != null ? s.supervisor_score : '-'}</td>
-                        <td className="py-2">{s.agreed_score != null ? s.agreed_score : '-'}</td>
-                        <td className="py-2 text-gray-600 dark:text-gray-400">{s.weighted_score != null ? `${s.weighted_score}%` : '-'}</td>
-                      </tr>
-                    ))}
+                    {appraisalDetail.scores.map((s) => {
+                      const kid = s.kpi_item_id;
+                      const row = scoreRows[kid] || { self_score: '', self_comment: '' };
+                      const canEditSelf = ((appraisalDetail.status || '') === 'draft' || (appraisalDetail.status || '') === 'returned') && isActive;
+                      return (
+                        <tr key={s.id} className="border-b border-gray-100 dark:border-gray-700 align-top">
+                          <td className="py-2 text-gray-800 dark:text-gray-200 max-w-[200px]">{s.description} — {s.target}</td>
+                          <td className="py-2 text-center text-gray-600 dark:text-gray-400 tabular-nums">{s.weight}%</td>
+                          <td className="py-2 text-center">
+                            {canEditSelf ? (
+                              <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                step={0.5}
+                                value={row.self_score}
+                                onChange={(e) => setScoreRows((prev) => ({ ...prev, [kid]: { ...row, self_score: e.target.value } }))}
+                                className="w-20 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                              />
+                            ) : (
+                              s.self_score ?? '—'
+                            )}
+                          </td>
+                          <td className="py-2 text-center tabular-nums">{s.supervisor_score != null ? s.supervisor_score : '—'}</td>
+                          <td className="py-2 text-center tabular-nums">{s.agreed_score != null ? s.agreed_score : '—'}</td>
+                          <td className="py-2 text-center text-gray-600 dark:text-gray-400 tabular-nums">{s.weighted_score != null ? `${s.weighted_score}%` : '—'}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
+                {((appraisalDetail.status || '') === 'draft' || (appraisalDetail.status || '') === 'returned') && isActive && (appraisalDetail.scores || []).length > 0 && (
+                  <button
+                    type="button"
+                    disabled={savingScores}
+                    onClick={async () => {
+                      setSavingScores(true);
+                      try {
+                        for (const s of appraisalDetail.scores) {
+                          const kid = s.kpi_item_id;
+                          const r = scoreRows[kid] || {};
+                          const v = r.self_score === '' || r.self_score === null ? null : Number(r.self_score);
+                          if (v != null && (Number.isNaN(v) || v < 0 || v > 100)) {
+                            toast('Self % must be between 0 and 100', 'error');
+                            setSavingScores(false);
+                            return;
+                          }
+                          await api.updateAppraisalScore(selectedAppraisalId, kid, { self_score: v, self_comment: r.self_comment || null });
+                        }
+                        toast('Self scores saved', 'success');
+                        const d = await api.getAppraisal(selectedAppraisalId);
+                        setAppraisalDetail(d);
+                        load();
+                      } catch (e) {
+                        toast(e.response?.data?.detail || 'Failed', 'error');
+                      } finally {
+                        setSavingScores(false);
+                      }
+                    }}
+                    className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50"
+                  >
+                    Save my scores
+                  </button>
+                )}
               </div>
             ) : (
-              <EmptyState title="No scores" message="Scores appear when HR has locked your annual KPIs and this is a quarterly cycle. Enter scores when the cycle is Active." />
+              <EmptyState title="No scored KPI lines" message="After HR locks your annual KPIs for this year, quarterly appraisals get one row per subtitle. Enter self % when the cycle is Active." />
+            )}
+
+            {((appraisalDetail.status || '') === 'draft' || (appraisalDetail.status || '') === 'returned') && (
+              <button
+                type="button"
+                disabled={savingScores}
+                onClick={async () => {
+                  setSavingScores(true);
+                  try {
+                    await api.submitAppraisal(selectedAppraisalId);
+                    toast('Submitted to your supervisor', 'success');
+                    const d = await api.getAppraisal(selectedAppraisalId);
+                    setAppraisalDetail(d);
+                    load();
+                  } catch (e) {
+                    toast(e.response?.data?.detail || 'Failed', 'error');
+                  } finally {
+                    setSavingScores(false);
+                  }
+                }}
+                className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50"
+              >
+                Submit appraisal to supervisor
+              </button>
+            )}
+
+            {(appraisalDetail.status || '') === 'verified' && (appraisalDetail.scores || []).length > 0 && !appraisalDetail.employee_agreed_scores_at && (
+              <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 p-4 space-y-2">
+                <p className="text-sm text-gray-800 dark:text-gray-200">Your manager has completed the review chain. Confirm that you agree with the <strong>Agreed %</strong> on every line (your manager must fill them all first).</p>
+                <button
+                  type="button"
+                  disabled={confirmAgreeing}
+                  onClick={async () => {
+                    setConfirmAgreeing(true);
+                    try {
+                      await api.confirmAppraisalAgreedScores(selectedAppraisalId);
+                      toast('Agreement recorded. HOD/HR can now approve.', 'success');
+                      const d = await api.getAppraisal(selectedAppraisalId);
+                      setAppraisalDetail(d);
+                      load();
+                    } catch (e) {
+                      toast(e.response?.data?.detail || 'Failed', 'error');
+                    } finally {
+                      setConfirmAgreeing(false);
+                    }
+                  }}
+                  className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700 disabled:opacity-50"
+                >
+                  I agree with the agreed scores
+                </button>
+              </div>
+            )}
+
+            {(['verified', 'approved', 'received', 'acknowledged'].includes(appraisalDetail.status || '')) && (
+              <div className="flex flex-wrap gap-2 items-center">
+                <button
+                  type="button"
+                  disabled={downloadingSummary || ((appraisalDetail.scores || []).length > 0 && !appraisalDetail.employee_agreed_scores_at && (appraisalDetail.status || '') === 'verified')}
+                  title={(appraisalDetail.scores || []).length > 0 && !appraisalDetail.employee_agreed_scores_at && (appraisalDetail.status || '') === 'verified' ? 'Confirm agreed scores first' : ''}
+                  onClick={async () => {
+                    setDownloadingSummary(true);
+                    try {
+                      const blob = await api.fetchAppraisalAgreedSummaryBlob(selectedAppraisalId);
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      const q = selectedAppraisalRow?.quarter || 'annual';
+                      a.download = `appraisal-${selectedAppraisalRow?.year || ''}-${q}.html`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                      toast('Download started — open the file and use Print → Save as PDF if needed', 'success');
+                    } catch (e) {
+                      toast(e.response?.data?.detail || e.message || 'Failed', 'error');
+                    } finally {
+                      setDownloadingSummary(false);
+                    }
+                  }}
+                  className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm text-gray-800 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+                >
+                  Download summary (HTML)
+                </button>
+              </div>
+            )}
+
+            {myId && ['approved', 'received', 'acknowledged'].includes(appraisalDetail.status || '') && (
+              <div className="rounded-lg border border-gray-200 dark:border-gray-600 p-4 space-y-2">
+                <p className="text-sm text-gray-700 dark:text-gray-300">Upload a scan or PDF of the <strong>signed</strong> appraisal (HR is notified).</p>
+                {appraisalDetail.signed_document_id && (
+                  <p className="text-xs text-green-700 dark:text-green-400">A signed file is already linked to this appraisal. Upload again to replace.</p>
+                )}
+                <input
+                  type="file"
+                  accept=".pdf,image/*"
+                  disabled={signUploading}
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = '';
+                    if (!file) return;
+                    setSignUploading(true);
+                    try {
+                      await api.uploadStaffDocument(file, `Signed appraisal ${selectedAppraisalRow?.year || ''} ${selectedAppraisalRow?.quarter || ''}`, 'signed_appraisal', myId, selectedAppraisalId);
+                      toast('Signed appraisal uploaded', 'success');
+                      const d = await api.getAppraisal(selectedAppraisalId);
+                      setAppraisalDetail(d);
+                    } catch (err) {
+                      toast(err.response?.data?.detail || 'Upload failed', 'error');
+                    } finally {
+                      setSignUploading(false);
+                    }
+                  }}
+                  className="text-sm"
+                />
+              </div>
             )}
           </div>
         ) : appraisals.length === 0 ? (
@@ -848,30 +1229,35 @@ export function EmployeeAppraisal() {
               </div>
 
               {/* Sticky footer */}
-              <div className="flex-shrink-0 px-5 py-4 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-wrap gap-2 justify-end">
-                <button
-                  type="button"
-                  onClick={closeModal}
-                  className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSaveDraft}
-                  disabled={saving || !(form.title || '').trim() || !(form.description || '').trim() || !(form.target || '').trim() || form.weight === ''}
-                  className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50"
-                >
-                  {saving ? '…' : 'Save as Draft'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSubmitForApproval}
-                  disabled={saving || !formValid || !canSubmitTotal}
-                  className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
-                >
-                  {saving ? '…' : 'Submit for approval'}
-                </button>
+              <div className="flex-shrink-0 px-5 py-4 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col gap-2">
+                {kpiYearBlocked && (
+                  <p className="text-xs text-amber-700 dark:text-amber-300">This performance year is closed — HR/Admin must reopen the cycle before you can save or submit.</p>
+                )}
+                <div className="flex flex-wrap gap-2 justify-end">
+                  <button
+                    type="button"
+                    onClick={closeModal}
+                    className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveDraft}
+                    disabled={saving || kpiYearBlocked || !(form.title || '').trim() || !(form.description || '').trim() || !(form.target || '').trim() || form.weight === ''}
+                    className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50"
+                  >
+                    {saving ? '…' : 'Save as Draft'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSubmitForApproval}
+                    disabled={saving || kpiYearBlocked || !formValid || !canSubmitTotal}
+                    className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
+                  >
+                    {saving ? '…' : 'Submit to supervisor'}
+                  </button>
+                </div>
               </div>
             </motion.div>
           </>

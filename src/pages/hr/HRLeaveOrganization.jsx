@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import * as api from '../../services/api';
 import { ROUTES } from '../../utils/constants';
@@ -49,9 +49,23 @@ export function HRLeaveOrganization() {
   const [orgTo, setOrgTo] = useState('');
   const [orgData, setOrgData] = useState(null);
   const [loadingOrg, setLoadingOrg] = useState(true);
+  const [members, setMembers] = useState([]);
+  const [leaveTypes, setLeaveTypes] = useState([]);
+  const [assigning, setAssigning] = useState(false);
+  const [savingEditId, setSavingEditId] = useState('');
+  const [assignForm, setAssignForm] = useState({
+    staff_user_id: '',
+    leave_type_id: '',
+    start_date: '',
+    end_date: '',
+    reason: '',
+  });
+  const [editForm, setEditForm] = useState(null);
 
   useEffect(() => {
     api.getLeaveHrFilters().then(setFiltersMeta).catch(() => setFiltersMeta({ departments: [] }));
+    api.getLeaveTypes().then(setLeaveTypes).catch(() => setLeaveTypes([]));
+    api.getLeaveTeamBalances().then((d) => setMembers(d?.members || [])).catch(() => setMembers([]));
   }, []);
 
   const loadOnLeave = useCallback(async () => {
@@ -95,15 +109,79 @@ export function HRLeaveOrganization() {
 
   const deptSelectClass =
     'rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white min-w-[12rem]';
+  const activeMembers = useMemo(
+    () => (members || []).filter((m) => (m?.user_id || '').trim() && (m?.full_name || '').trim()),
+    [members],
+  );
+  const canEdit = (status) => !['cancelled', 'rejected'].includes(String(status || '').toLowerCase());
+
+  const submitAssign = async (e) => {
+    e.preventDefault();
+    if (!assignForm.staff_user_id || !assignForm.leave_type_id || !assignForm.start_date || !assignForm.end_date) {
+      toast('Select employee, leave type, and dates', 'error');
+      return;
+    }
+    setAssigning(true);
+    try {
+      await api.assignLeaveToStaff({
+        staff_user_id: assignForm.staff_user_id,
+        leave_type_id: assignForm.leave_type_id,
+        start_date: assignForm.start_date,
+        end_date: assignForm.end_date,
+        reason: assignForm.reason || undefined,
+      });
+      toast('Leave added successfully', 'success');
+      setAssignForm((p) => ({ ...p, start_date: '', end_date: '', reason: '' }));
+      loadOnLeave();
+      loadOrg();
+    } catch (err) {
+      toast(err?.response?.data?.detail || 'Could not add leave', 'error');
+    } finally {
+      setAssigning(false);
+    }
+  };
+
+  const startEdit = (row) => {
+    setEditForm({
+      id: row.id,
+      leave_type_id: row.leave_type_id || '',
+      start_date: row.start_date || '',
+      end_date: row.end_date || '',
+      reason: row.reason || '',
+    });
+  };
+
+  const saveEdit = async () => {
+    if (!editForm) return;
+    if (!editForm.leave_type_id || !editForm.start_date || !editForm.end_date) {
+      toast('Leave type and dates are required', 'error');
+      return;
+    }
+    setSavingEditId(editForm.id);
+    try {
+      await api.updateLeaveRequest(editForm.id, {
+        leave_type_id: editForm.leave_type_id,
+        start_date: editForm.start_date,
+        end_date: editForm.end_date,
+        reason: editForm.reason || undefined,
+      });
+      toast('Leave updated', 'success');
+      setEditForm(null);
+      loadOnLeave();
+      loadOrg();
+    } catch (err) {
+      toast(err?.response?.data?.detail || 'Could not update leave', 'error');
+    } finally {
+      setSavingEditId('');
+    }
+  };
 
   return (
     <div className="space-y-8 max-w-7xl">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Organization leave</h1>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-            HR and Admin: see who is off on a given day, and browse all staff leave with department and date filters.
-          </p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">HR/Admin can add approved leave and edit existing requests.</p>
         </div>
         <div className="flex flex-wrap gap-2 text-sm">
           <Link to={ROUTES.HR.LEAVE_OVERVIEW} className="text-primary-600 dark:text-primary-400 hover:underline">
@@ -119,6 +197,83 @@ export function HRLeaveOrganization() {
           </Link>
         </div>
       </div>
+
+      <section className="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/90 shadow-sm p-5">
+        <h2 className="font-semibold text-gray-900 dark:text-white">Add leave (HR/Admin)</h2>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-4">
+          This saves leave as approved immediately and updates employee leave balances.
+        </p>
+        <form onSubmit={submitAssign} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6 items-end">
+          <div className="sm:col-span-2 lg:col-span-2">
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Employee</label>
+            <select
+              required
+              value={assignForm.staff_user_id}
+              onChange={(e) => setAssignForm((p) => ({ ...p, staff_user_id: e.target.value }))}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+            >
+              <option value="">Select…</option>
+              {activeMembers.map((m) => (
+                <option key={m.user_id} value={m.user_id}>
+                  {m.full_name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Leave type</label>
+            <select
+              required
+              value={assignForm.leave_type_id}
+              onChange={(e) => setAssignForm((p) => ({ ...p, leave_type_id: e.target.value }))}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+            >
+              <option value="">Select…</option>
+              {leaveTypes.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">From</label>
+            <input
+              type="date"
+              required
+              value={assignForm.start_date}
+              onChange={(e) => setAssignForm((p) => ({ ...p, start_date: e.target.value }))}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">To</label>
+            <input
+              type="date"
+              required
+              value={assignForm.end_date}
+              onChange={(e) => setAssignForm((p) => ({ ...p, end_date: e.target.value }))}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+            />
+          </div>
+          <div className="sm:col-span-2 lg:col-span-1">
+            <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reason</label>
+            <input
+              value={assignForm.reason}
+              onChange={(e) => setAssignForm((p) => ({ ...p, reason: e.target.value }))}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+              placeholder="Optional"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={assigning}
+            className="px-4 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+          >
+            {assigning ? 'Saving…' : 'Add leave'}
+          </button>
+        </form>
+      </section>
 
       <section className="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/90 shadow-sm overflow-hidden">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 bg-emerald-50/80 dark:bg-emerald-900/20">
@@ -271,6 +426,7 @@ export function HRLeaveOrganization() {
                   <th className="px-4 py-2 text-left text-xs font-semibold uppercase text-gray-500 dark:text-gray-400">Dates</th>
                   <th className="px-4 py-2 text-left text-xs font-semibold uppercase text-gray-500 dark:text-gray-400">Days</th>
                   <th className="px-4 py-2 text-left text-xs font-semibold uppercase text-gray-500 dark:text-gray-400">Status</th>
+                  <th className="px-4 py-2 text-left text-xs font-semibold uppercase text-gray-500 dark:text-gray-400">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -287,11 +443,22 @@ export function HRLeaveOrganization() {
                     </td>
                     <td className="px-4 py-2 tabular-nums">{r.days_requested}</td>
                     <td className="px-4 py-2">{statusLabel(r.status)}</td>
+                    <td className="px-4 py-2">
+                      {canEdit(r.status) && (
+                        <button
+                          type="button"
+                          onClick={() => startEdit(r)}
+                          className="text-primary-600 dark:text-primary-400 hover:underline text-sm"
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
                 {!loadingOrg && !(orgData?.rows || []).length && (
                   <tr>
-                    <td colSpan={6} className="px-4 py-10 text-center text-gray-500 dark:text-gray-400">
+                    <td colSpan={7} className="px-4 py-10 text-center text-gray-500 dark:text-gray-400">
                       No requests match these filters.
                     </td>
                   </tr>
@@ -306,6 +473,76 @@ export function HRLeaveOrganization() {
           </p>
         )}
       </section>
+      {editForm && (
+        <div className="fixed inset-0 bg-black/40 z-40 flex items-center justify-center p-4" onClick={() => setEditForm(null)}>
+          <div
+            className="w-full max-w-xl rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Edit leave request</h3>
+            <div className="grid gap-3 sm:grid-cols-2 mt-4">
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Leave type</label>
+                <select
+                  value={editForm.leave_type_id}
+                  onChange={(e) => setEditForm((p) => ({ ...p, leave_type_id: e.target.value }))}
+                  className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+                >
+                  {leaveTypes.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">From</label>
+                <input
+                  type="date"
+                  value={editForm.start_date}
+                  onChange={(e) => setEditForm((p) => ({ ...p, start_date: e.target.value }))}
+                  className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">To</label>
+                <input
+                  type="date"
+                  value={editForm.end_date}
+                  onChange={(e) => setEditForm((p) => ({ ...p, end_date: e.target.value }))}
+                  className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reason</label>
+                <textarea
+                  rows={3}
+                  value={editForm.reason}
+                  onChange={(e) => setEditForm((p) => ({ ...p, reason: e.target.value }))}
+                  className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+                />
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditForm(null)}
+                className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={savingEditId === editForm.id}
+                onClick={saveEdit}
+                className="px-4 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+              >
+                {savingEditId === editForm.id ? 'Saving…' : 'Save changes'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

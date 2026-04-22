@@ -4,7 +4,6 @@ import * as api from '../../services/api';
 import { ROLE_LABELS, DEPARTMENTS, ROLES } from '../../utils/constants';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
 import { EmptyState } from '../../components/EmptyState';
-import { isImportedStaffRecord, ImportedUserBadge } from '../../components/MigratedUserBadge';
 import { useToast } from '../../hooks/useToast';
 import { EmployeeRecordEditModal, GENDERS } from '../../components/EmployeeRecordEditModal';
 
@@ -14,7 +13,7 @@ function fieldLabel(className, text) {
   );
 }
 
-function AddEmployeeModal({ users, branches, onClose, onCreated }) {
+function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) {
   const toast = useToast();
   const [saving, setSaving] = useState(false);
   const [adLoading, setAdLoading] = useState(false);
@@ -230,7 +229,7 @@ function AddEmployeeModal({ users, branches, onClose, onCreated }) {
               className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             >
               <option value="">(Unassigned)</option>
-              {DEPARTMENTS.map((d) => (
+              {(departments || DEPARTMENTS).map((d) => (
                 <option key={d} value={d}>
                   {d}
                 </option>
@@ -300,11 +299,17 @@ function AddEmployeeModal({ users, branches, onClose, onCreated }) {
 export function HREmployees() {
   const [users, setUsers] = useState([]);
   const [branches, setBranches] = useState([]);
+  const [departmentOptions, setDepartmentOptions] = useState(DEPARTMENTS);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [updatingId, setUpdatingId] = useState(null);
   const [editUser, setEditUser] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [newDepartment, setNewDepartment] = useState('');
+  const [addingDepartment, setAddingDepartment] = useState(false);
+  const [newBranch, setNewBranch] = useState({ name: '', code: '', address: '' });
+  const [addingBranch, setAddingBranch] = useState(false);
+  const toast = useToast();
 
   const load = () => api.getUsers().then(setUsers).catch(() => setUsers([])).finally(() => setLoading(false));
 
@@ -316,6 +321,10 @@ export function HREmployees() {
     api.getBranches().then(setBranches).catch(() => setBranches([]));
   }, []);
 
+  useEffect(() => {
+    api.getDepartmentOptions().then(setDepartmentOptions).catch(() => setDepartmentOptions(DEPARTMENTS));
+  }, []);
+
   const filtered = users.filter((u) => {
     const q = search.toLowerCase();
     return (
@@ -325,6 +334,8 @@ export function HREmployees() {
       (u.employee_code && String(u.employee_code).toLowerCase().includes(q))
     );
   });
+
+  const displayEmail = (email) => String(email || '').replace(/@migrated\./gi, '@imported.');
 
   const onSupervisorChange = async (employeeId, managerId) => {
     const value = managerId === '' ? null : managerId;
@@ -351,6 +362,50 @@ export function HREmployees() {
     }
   };
 
+  const onCreateDepartment = async () => {
+    const name = (newDepartment || '').trim();
+    if (!name) {
+      toast('Department name is required', 'error');
+      return;
+    }
+    setAddingDepartment(true);
+    try {
+      const res = await api.createDepartment(name);
+      setDepartmentOptions(res.rows || DEPARTMENTS);
+      setNewDepartment('');
+      toast(res.created ? 'Department added' : 'Department already exists', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Failed to add department', 'error');
+    } finally {
+      setAddingDepartment(false);
+    }
+  };
+
+  const onCreateBranch = async () => {
+    const name = (newBranch.name || '').trim();
+    const code = (newBranch.code || '').trim();
+    if (!name || !code) {
+      toast('Branch name and code are required', 'error');
+      return;
+    }
+    setAddingBranch(true);
+    try {
+      await api.createBranch({
+        name,
+        code,
+        address: (newBranch.address || '').trim() || undefined,
+      });
+      const rows = await api.getBranches();
+      setBranches(rows || []);
+      setNewBranch({ name: '', code: '', address: '' });
+      toast('Branch created', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Failed to create branch', 'error');
+    } finally {
+      setAddingBranch(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex justify-center py-12">
@@ -364,11 +419,6 @@ export function HREmployees() {
       <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Employee records</h1>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1 max-w-3xl">
-            Maintain full profiles (gender, phone, codes, job title, division, hire date, supervisor). Staff see their own details on the home
-            dashboard after login. Use <strong className="text-gray-700 dark:text-gray-300">Edit record</strong> for the full form; quick department
-            and supervisor changes stay in the table. Prior bulk imports may show an <span className="font-medium text-amber-800 dark:text-amber-300">Imported</span> badge.
-          </p>
         </div>
         <button
           type="button"
@@ -387,6 +437,64 @@ export function HREmployees() {
           className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-4 py-2 w-full max-w-md"
         />
       </div>
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Add department</h2>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={newDepartment}
+              onChange={(e) => setNewDepartment(e.target.value)}
+              placeholder="e.g. Procurement"
+              className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2"
+            />
+            <button
+              type="button"
+              onClick={onCreateDepartment}
+              disabled={addingDepartment}
+              className="px-3 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+            >
+              {addingDepartment ? 'Adding…' : 'Add'}
+            </button>
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Add branch</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <input
+              type="text"
+              value={newBranch.name}
+              onChange={(e) => setNewBranch((p) => ({ ...p, name: e.target.value }))}
+              placeholder="Branch name"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2"
+            />
+            <input
+              type="text"
+              value={newBranch.code}
+              onChange={(e) => setNewBranch((p) => ({ ...p, code: e.target.value }))}
+              placeholder="Code"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2"
+            />
+            <input
+              type="text"
+              value={newBranch.address}
+              onChange={(e) => setNewBranch((p) => ({ ...p, address: e.target.value }))}
+              placeholder="Address (optional)"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2"
+            />
+          </div>
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={onCreateBranch}
+              disabled={addingBranch}
+              className="px-3 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+            >
+              {addingBranch ? 'Creating…' : 'Create branch'}
+            </button>
+          </div>
+        </div>
+      </div>
       {!filtered.length ? (
         <EmptyState title="No employee records" message={search ? 'No matches for your search.' : 'No employees in the system yet.'} />
       ) : (
@@ -397,6 +505,7 @@ export function HREmployees() {
                 <tr>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Name</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Email</th>
+                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Department</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Branch</th>
@@ -407,11 +516,19 @@ export function HREmployees() {
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
                 {filtered.map((u) => (
                   <tr key={u.id} className="text-gray-700 dark:text-gray-300">
+                    <td className="px-4 py-2"><span className="font-medium">{u.full_name}</span></td>
+                    <td className="px-4 py-2">{displayEmail(u.email)}</td>
                     <td className="px-4 py-2">
-                      <span className="font-medium">{u.full_name}</span>
-                      {isImportedStaffRecord(u.id) && <ImportedUserBadge />}
+                      {u.is_active === 1 || u.is_active === true ? (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+                          Active
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300">
+                          Inactive
+                        </span>
+                      )}
                     </td>
-                    <td className="px-4 py-2">{u.email}</td>
                     <td className="px-4 py-2">
                       <span className="px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-700">{ROLE_LABELS[u.role] || u.role}</span>
                     </td>
@@ -423,10 +540,10 @@ export function HREmployees() {
                         className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm py-1 pr-6 min-w-[160px] max-w-[220px]"
                       >
                         <option value="">(Unassigned)</option>
-                        {u.department && !DEPARTMENTS.includes(u.department) && (
+                        {u.department && !departmentOptions.includes(u.department) && (
                           <option value={u.department}>{u.department} (current)</option>
                         )}
-                        {DEPARTMENTS.map((d) => (
+                        {departmentOptions.map((d) => (
                           <option key={d} value={d}>
                             {d}
                           </option>
@@ -476,12 +593,13 @@ export function HREmployees() {
             user={editUser}
             users={users}
             branches={branches}
+            departments={departmentOptions}
             onClose={() => setEditUser(null)}
             onSaved={load}
           />
         )}
         {showAdd && (
-          <AddEmployeeModal users={users} branches={branches} onClose={() => setShowAdd(false)} onCreated={load} />
+          <AddEmployeeModal users={users} branches={branches} departments={departmentOptions} onClose={() => setShowAdd(false)} onCreated={load} />
         )}
       </AnimatePresence>
     </motion.div>
