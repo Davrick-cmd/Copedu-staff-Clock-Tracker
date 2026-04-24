@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useSelector } from 'react-redux';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as api from '../../services/api';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
@@ -50,6 +50,79 @@ function groupKpisByCycle(kpis) {
   return Object.values(byCycle).sort((a, b) => (b.year !== a.year ? b.year - a.year : (b.quarter || '').localeCompare(a.quarter || '')));
 }
 
+function downloadAnnualKpiCsvBlob(annualDetail, titlesWithItems = []) {
+  const escape = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = [
+    ['Year', annualDetail?.year ?? ''],
+    ['Status', annualDetail?.status ?? ''],
+    ['Total weight %', annualDetail?.total_weight ?? ''],
+    [],
+    ['Category', 'KPI description', 'Weight %', 'Expected results %'],
+  ];
+  (titlesWithItems || []).forEach((t) => {
+    const items = t?.items || [];
+    if (!items.length) {
+      rows.push([t?.name || '', '', '', '']);
+      return;
+    }
+    items.forEach((it) => {
+      rows.push([
+        t?.name || '',
+        it?.description || '',
+        it?.weight ?? '',
+        it?.target ?? '',
+      ]);
+    });
+  });
+  const content = rows.map((r) => r.map(escape).join(',')).join('\n');
+  return new Blob([content], { type: 'text/csv;charset=utf-8' });
+}
+
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let q = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (q && line[i + 1] === '"') {
+        cur += '"';
+        i += 1;
+      } else {
+        q = !q;
+      }
+    } else if (ch === ',' && !q) {
+      out.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+function parseAnnualKpiCsvText(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const headerIdx = lines.findIndex((l) => /^"?Category"?\s*,\s*"?KPI description"?/i.test(l));
+  if (headerIdx < 0) return [];
+  const rows = [];
+  for (let i = headerIdx + 1; i < lines.length; i += 1) {
+    const cols = parseCsvLine(lines[i]).map((v) => String(v || '').replace(/^"|"$/g, '').trim());
+    if (cols.length < 4) continue;
+    const category = cols[0];
+    const description = cols[1];
+    const weight = Number(cols[2]);
+    const target = Number(cols[3]);
+    if (!category || !description) continue;
+    rows.push({ category, description, weight, target });
+  }
+  return rows;
+}
+
 export function EmployeeAppraisal() {
   const toast = useToast();
   const profile = useSelector((s) => s.auth.profile);
@@ -78,6 +151,9 @@ export function EmployeeAppraisal() {
   const [confirmAgreeing, setConfirmAgreeing] = useState(false);
   const [downloadingSummary, setDownloadingSummary] = useState(false);
   const [signUploading, setSignUploading] = useState(false);
+  const [downloadingKpiCsv, setDownloadingKpiCsv] = useState(false);
+  const [importingKpiCsv, setImportingKpiCsv] = useState(false);
+  const location = useLocation();
 
   const load = () => {
     api.getAppraisalDashboardStaff()
@@ -332,27 +408,120 @@ export function EmployeeAppraisal() {
   const activeYearClosed = !!(active && closedYears.includes(Number(active.year)));
   const editKpiYearClosed = !!(editingKpi && closedYears.includes(Number(editingKpi.year)));
   const kpiYearBlocked = editKpiYearClosed || (!editingKpi && activeYearClosed);
+  const kpiOnlyView = location.pathname.endsWith('/kpi');
+  const appraisalOnlyView = location.pathname.endsWith('/reviews');
+  const showLegacyCycleKpi = false;
+  const showKpiSections = !appraisalOnlyView;
+  const showAppraisalSections = !kpiOnlyView;
+  const appraisalYear = Number(active?.year || appraisals?.[0]?.year || new Date().getFullYear());
+  const quarterOrder = ['Q1', 'Q2', 'Q3', 'Q4'];
+  const quarterlyCycles = (cycles || []).filter(
+    (c) => String(c.type || '').toLowerCase() === 'quarterly' && Number(c.year) === appraisalYear
+  );
+  const quarterlyRows = quarterOrder.map((q) => {
+    const cycle = quarterlyCycles.find((c) => String(c.quarter || '').toUpperCase() === q) || null;
+    const appraisal = cycle ? appraisals.find((a) => a.cycle_id === cycle.id) || null : null;
+    return { quarter: q, cycle, appraisal };
+  });
+
+  const refreshAnnualItems = async (annualKpiId) => {
+    const updated = await api.getAnnualKpi(annualKpiId);
+    setAnnualDetail(updated);
+    const titles = await api.getAnnualKpiTitles(annualKpiId);
+    const withItems = await Promise.all(
+      (titles || []).map(async (tit) => ({
+        ...tit,
+        items: await api.getKpiTitleItems(tit.id),
+      }))
+    );
+    setAnnualTitlesWithItems(withItems);
+  };
+
+  const importEditedAnnualKpiCsv = async (file) => {
+    if (!annualDetail?.id || !file) return;
+    const status = String(annualDetail.status || '');
+    const canEdit = status === 'draft' || status.includes('returned');
+    if (!canEdit) {
+      toast('You can upload edited KPI CSV only while the annual KPI is draft/returned.', 'error');
+      return;
+    }
+    if (closedYears.includes(annualDetail.year)) {
+      toast(`Year ${annualDetail.year} is closed for appraisal.`, 'error');
+      return;
+    }
+    setImportingKpiCsv(true);
+    try {
+      const text = await file.text();
+      const parsed = parseAnnualKpiCsvText(text);
+      if (!parsed.length) {
+        toast('No valid KPI rows found in CSV.', 'error');
+        return;
+      }
+      for (const row of parsed) {
+        if (Number.isNaN(row.weight) || row.weight < 0 || row.weight > 100) {
+          toast(`Invalid weight for "${row.description}". Use 0–100.`, 'error');
+          return;
+        }
+        if (Number.isNaN(row.target) || row.target < 0 || row.target > 100) {
+          toast(`Invalid expected results for "${row.description}". Use 0–100.`, 'error');
+          return;
+        }
+      }
+      if (!window.confirm('Replace existing KPI lines with this uploaded CSV?')) return;
+
+      const existingTitles = annualTitlesWithItems || [];
+      for (const t of existingTitles) {
+        for (const item of t.items || []) {
+          await api.deleteKpiItem(item.id);
+        }
+      }
+
+      const titleMap = new Map(existingTitles.map((t) => [String(t.name || '').trim().toLowerCase(), t.id]));
+      for (const row of parsed) {
+        const key = row.category.trim().toLowerCase();
+        let titleId = titleMap.get(key);
+        if (!titleId) {
+          const created = await api.createAnnualKpiTitle(annualDetail.id, { name: row.category.trim() });
+          titleId = created?.id;
+          titleMap.set(key, titleId);
+        }
+        await api.createKpiItem(titleId, {
+          description: row.description.trim(),
+          weight: row.weight,
+          target: row.target,
+        });
+      }
+      await refreshAnnualItems(annualDetail.id);
+      toast('KPI CSV uploaded and applied.', 'success');
+    } catch (err) {
+      toast(err?.response?.data?.detail || err?.message || 'Failed to import KPI CSV', 'error');
+    } finally {
+      setImportingKpiCsv(false);
+    }
+  };
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Performance contract & appraisal</h1>
-          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Your main KPI sheet is <strong className="text-gray-800 dark:text-gray-200">Annual KPIs</strong> below — same idea as the Excel performance contract (categories, lines, weight %, expected results %). Quarterly appraisals score those lines.</p>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+            {showKpiSections
+              ? <>Set your <strong className="text-gray-800 dark:text-gray-200">Annual KPI contract</strong> here. Once approved/locked, it is used for appraisal scoring.</>
+              : <>Quarterly appraisal happens in <strong className="text-gray-800 dark:text-gray-200">Q1, Q2, Q3, Q4</strong>. Open each quarter to submit and agree scores.</>}
+          </p>
         </div>
         <Link to={ROUTES.EMPLOYEE.DASHBOARD} className="text-primary-600 dark:text-primary-400 hover:underline text-sm">Back to Dashboard</Link>
       </div>
 
       <p className="text-gray-600 dark:text-gray-400 text-sm border-l-4 border-primary-500 pl-3 py-1">
-        <strong>Annual KPIs:</strong> build your contract (total weight 100%), submit for Supervisor → HOD → HR lock.
-        <span className="mx-1.5 text-gray-400">·</span>
-        <strong>Quarterly:</strong> open My Appraisals for self %, narrative, confirm agreed scores, download, sign, upload.
-        <span className="mx-1.5 text-gray-400">·</span>
-        Optional <strong>cycle KPIs</strong> (further down) are separate one-line records per cycle if HR still uses them.
+        {showKpiSections
+          ? <><strong>Annual KPI:</strong> submit to Supervisor → HOD → HR lock. Locked KPI lines are the source for all quarterly appraisals.</>
+          : <><strong>Quarterly appraisal:</strong> set self scores, submit to supervisor, review agreed scores, then confirm and send to HR.</>}
       </p>
 
-      {/* Annual KPIs = performance contract (Excel-style); drives quarterly appraisal score rows */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg ring-1 ring-primary-200/60 dark:ring-primary-900/40 border border-gray-100 dark:border-gray-700 p-6">
+      {showKpiSections && (
+      <div id="set-kpi" className="bg-white dark:bg-gray-800 rounded-xl shadow-lg ring-1 ring-primary-200/60 dark:ring-primary-900/40 border border-gray-100 dark:border-gray-700 p-6">
         <h2 className="text-xl font-semibold text-gray-800 dark:text-white mb-1">Annual KPIs — performance contract</h2>
         <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">Mirror your Excel sheet: each <em>category</em> is a section; each <em>line</em> is a KPI with weighting % and expected results %.</p>
         {selectedAnnualId ? (
@@ -373,6 +542,47 @@ export function EmployeeAppraisal() {
                     {' · '}
                     {STATUS_LABELS[annualDetail.status] || annualDetail.status}
                   </p>
+                  <button
+                    type="button"
+                    disabled={downloadingKpiCsv}
+                    onClick={() => {
+                      setDownloadingKpiCsv(true);
+                      try {
+                        const blob = downloadAnnualKpiCsvBlob(annualDetail, annualTitlesWithItems);
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `kpi-contract-${annualDetail.year}.csv`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                        toast('KPI CSV downloaded', 'success');
+                      } catch {
+                        toast('Failed to download KPI CSV', 'error');
+                      } finally {
+                        setDownloadingKpiCsv(false);
+                      }
+                    }}
+                    className="px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg text-sm text-gray-800 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+                  >
+                    {downloadingKpiCsv ? 'Downloading…' : 'Download KPI (CSV)'}
+                  </button>
+                  {!closedYears.includes(annualDetail.year) && ((annualDetail.status || '') === 'draft' || (annualDetail.status || '').includes('returned')) && (
+                    <label className="px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg text-sm text-gray-800 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer">
+                      {importingKpiCsv ? 'Uploading…' : 'Upload edited KPI (CSV)'}
+                      <input
+                        type="file"
+                        accept=".csv,text/csv"
+                        className="hidden"
+                        disabled={importingKpiCsv}
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          e.target.value = '';
+                          if (!f) return;
+                          await importEditedAnnualKpiCsv(f);
+                        }}
+                      />
+                    </label>
+                  )}
                 </div>
                 {profile && (
                   <div className="rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-900/40 p-4 mb-2">
@@ -666,8 +876,9 @@ export function EmployeeAppraisal() {
           </>
         )}
       </div>
+      )}
 
-      {active && (
+      {showAppraisalSections && active && (
         <div className="bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800 rounded-xl p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -690,7 +901,7 @@ export function EmployeeAppraisal() {
         </div>
       )}
 
-      {receivedKpis.length > 0 && (
+      {showKpiSections && receivedKpis.length > 0 && (
         <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4">
           <h2 className="font-semibold text-amber-900 dark:text-amber-200 mb-2">Pending acknowledgement (KPIs)</h2>
           <p className="text-sm text-amber-800 dark:text-amber-300 mb-3">Please acknowledge your approved KPIs.</p>
@@ -712,7 +923,7 @@ export function EmployeeAppraisal() {
         </div>
       )}
 
-      {receivedAppraisals.length > 0 && (
+      {showAppraisalSections && receivedAppraisals.length > 0 && (
         <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4">
           <h2 className="font-semibold text-amber-900 dark:text-amber-200 mb-2">Pending acknowledgement (Appraisal)</h2>
           <p className="text-sm text-amber-800 dark:text-amber-300 mb-3">Please acknowledge your approved appraisal.</p>
@@ -736,6 +947,7 @@ export function EmployeeAppraisal() {
         </div>
       )}
 
+      {showKpiSections && !appraisalOnlyView && showLegacyCycleKpi && (
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 overflow-hidden">
         <div className="p-6 pb-0 flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -836,8 +1048,56 @@ export function EmployeeAppraisal() {
           </div>
         )}
       </div>
+      )}
 
+      {showAppraisalSections && (
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
+        <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Quarterly appraisals ({appraisalYear})</h2>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {quarterlyRows.map((row) => (
+            <div key={row.quarter} className="rounded-lg border border-gray-200 dark:border-gray-700 p-3">
+              <p className="text-sm font-semibold text-gray-900 dark:text-white">{row.quarter}</p>
+              {!row.cycle ? (
+                <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">HR has not opened this quarter cycle yet.</p>
+              ) : !row.appraisal ? (
+                <div className="mt-2 space-y-2">
+                  <p className="text-xs text-gray-500 dark:text-gray-400">Cycle open, no appraisal created yet.</p>
+                  <button
+                    type="button"
+                    className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-xs hover:bg-primary-700"
+                    onClick={() => {
+                      api.createAppraisal({ cycle_id: row.cycle.id })
+                        .then(() => { toast(`${row.quarter} appraisal created`, 'success'); load(); })
+                        .catch((e) => toast(e.response?.data?.detail || 'Failed', 'error'));
+                    }}
+                  >
+                    Create {row.quarter}
+                  </button>
+                </div>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  <p className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${STATUS_BADGE_CLASS[row.appraisal.status] || STATUS_BADGE_CLASS.draft}`}>
+                    {STATUS_LABELS[row.appraisal.status] || row.appraisal.status}
+                  </p>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => { setSelectedAppraisalId(row.appraisal.id); setSelectedAppraisalRow(row.appraisal); }}
+                      className="text-xs text-primary-600 dark:text-primary-400 hover:underline"
+                    >
+                      Open {row.quarter}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+      )}
+
+      {showAppraisalSections && !kpiOnlyView && (
+      <div id="my-appraisals" className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
         <h2 className="font-semibold text-gray-800 dark:text-white mb-3">My Appraisals by cycle</h2>
         {selectedAppraisalId && appraisalDetail ? (
           <div className="space-y-4">
@@ -1104,6 +1364,7 @@ export function EmployeeAppraisal() {
           </ul>
         )}
       </div>
+      )}
 
       <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
         <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Cycles</h2>

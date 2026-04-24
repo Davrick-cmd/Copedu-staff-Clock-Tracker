@@ -29,6 +29,7 @@ export function AdminSettings() {
     smtp_from: '',
     smtp_use_tls: true,
   });
+  const [testEmailRecipient, setTestEmailRecipient] = useState('');
   const [moduleForm, setModuleForm] = useState({
     hidden_modules: [],
   });
@@ -41,6 +42,7 @@ export function AdminSettings() {
   const [workSaving, setWorkSaving] = useState(false);
   const [securitySaving, setSecuritySaving] = useState(false);
   const [smtpSaving, setSmtpSaving] = useState(false);
+  const [smtpTesting, setSmtpTesting] = useState(false);
   const [moduleSaving, setModuleSaving] = useState(false);
   const [maintenanceBusyTarget, setMaintenanceBusyTarget] = useState('');
 
@@ -223,10 +225,35 @@ export function AdminSettings() {
     }
   };
 
+  const sendTestEmail = async () => {
+    const recipient = (testEmailRecipient || '').trim();
+    if (!recipient) {
+      toast('Enter a recipient email first', 'error');
+      return;
+    }
+    setSmtpTesting(true);
+    try {
+      await api.sendSettingsEmailTest({
+        recipient_email: recipient,
+        subject: 'HR Suite SMTP test',
+      });
+      toast(`Test email sent to ${recipient}`, 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Test email failed', 'error');
+    } finally {
+      setSmtpTesting(false);
+    }
+  };
+
   const saveModuleVisibility = async () => {
     setModuleSaving(true);
     try {
       await api.setSetting('hidden_modules', JSON.stringify(moduleForm.hidden_modules || []));
+      window.dispatchEvent(
+        new CustomEvent('module-visibility-updated', {
+          detail: { hidden_modules: moduleForm.hidden_modules || [] },
+        }),
+      );
       setSettings((prev) => ({ ...prev, hidden_modules: moduleForm.hidden_modules || [] }));
       toast('Module visibility saved', 'success');
     } catch {
@@ -448,6 +475,23 @@ export function AdminSettings() {
             />
             Use STARTTLS (typical for port 587; disable for plain 25 or use port 465 with implicit TLS on the server)
           </label>
+          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+            <input
+              type="email"
+              value={testEmailRecipient}
+              onChange={(e) => setTestEmailRecipient(e.target.value)}
+              placeholder="Recipient for test email (e.g. it@company.com)"
+              className="w-full px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+            <button
+              type="button"
+              onClick={sendTestEmail}
+              disabled={smtpTesting}
+              className="inline-flex items-center justify-center px-4 py-2 rounded-lg border border-primary-300 dark:border-primary-700 text-primary-700 dark:text-primary-300 text-sm font-semibold hover:bg-primary-50 dark:hover:bg-primary-900/30 disabled:opacity-50"
+            >
+              {smtpTesting ? 'Sending test…' : 'Send test email'}
+            </button>
+          </div>
           <div className="flex justify-end">
             <button
               type="button"
@@ -464,7 +508,7 @@ export function AdminSettings() {
             Module visibility
           </h2>
           <p className="text-sm text-gray-600 dark:text-gray-400">
-            Hide modules that are still under development. Hidden modules are removed from non-admin sidebars.
+            Hide modules that are still under development. Hidden modules are removed from sidebars for all roles.
           </p>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {MODULE_VISIBILITY_OPTIONS.map((m) => {

@@ -152,6 +152,12 @@ export function HRAppraisal() {
   const annualKpisLocked = dashboard?.annual_kpis_locked || [];
   const appraisals = dashboard?.appraisals || [];
   const annualReadyToLock = dashboard?.annual_kpis_ready_to_lock || [];
+  const finalizedAppraisals = appraisals.filter((a) => ['approved', 'received', 'acknowledged'].includes(String(a.status || '')));
+  const ratingDistribution = finalizedAppraisals.reduce((acc, a) => {
+    const key = String(a.rating || 'Not rated');
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
 
   const handleLockAnnualKpi = (annualKpiId) => {
     setActionId(annualKpiId);
@@ -166,6 +172,43 @@ export function HRAppraisal() {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Appraisal (HR)</h1>
         <Link to={ROUTES.HR.DASHBOARD} className="text-primary-600 dark:text-primary-400 hover:underline text-sm">Back to HR Dashboard</Link>
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">KPIs set</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{annualKpisLocked.length}</p>
+        </div>
+        <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">KPIs pending lock</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{annualReadyToLock.length}</p>
+        </div>
+        <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Appraisals done</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{finalizedAppraisals.length}</p>
+        </div>
+        <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Appraisals in progress</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{Math.max(0, appraisals.length - finalizedAppraisals.length)}</p>
+        </div>
+      </div>
+
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
+        <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Appraisal result levels</h2>
+        {Object.keys(ratingDistribution).length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">No finalized appraisals yet.</p>
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {Object.entries(ratingDistribution)
+              .sort((a, b) => b[1] - a[1])
+              .map(([rating, count]) => (
+                <div key={rating} className="rounded-lg border border-gray-200 dark:border-gray-600 px-3 py-2">
+                  <p className="text-sm font-medium text-gray-900 dark:text-white">{rating}</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">{count} employee(s)</p>
+                </div>
+              ))}
+          </div>
+        )}
       </div>
 
       {annualReadyToLock.length > 0 && (

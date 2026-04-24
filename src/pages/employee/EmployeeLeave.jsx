@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import DatePicker from 'react-datepicker';
+import { format } from 'date-fns';
 import * as api from '../../services/api';
 import { useToast } from '../../hooks/useToast';
 import { useSelector } from 'react-redux';
 import { LeaveHubNav } from '../../components/LeaveHubNav';
+import 'react-datepicker/dist/react-datepicker.css';
 
 export function EmployeeLeave() {
   const toast = useToast();
@@ -21,8 +24,14 @@ export function EmployeeLeave() {
     leave_type_id: '',
     start_date: '',
     end_date: '',
+    start_time: '',
+    end_time: '',
     reason: '',
   });
+  const [nonWorkingDateSet, setNonWorkingDateSet] = useState(new Set());
+  const [loadedHolidayYears, setLoadedHolidayYears] = useState([]);
+  const fromPickerRef = useRef(null);
+  const toPickerRef = useRef(null);
 
   const load = async () => {
     setLoading(true);
@@ -46,19 +55,74 @@ export function EmployeeLeave() {
     load();
   }, []);
 
+  const loadNonWorkingDaysForYear = async (year) => {
+    const y = Number(year);
+    if (!y || loadedHolidayYears.includes(y)) return;
+    try {
+      const data = await api.getLeaveNonWorkingDays({ year: y });
+      const rows = data?.rows || [];
+      setNonWorkingDateSet((prev) => {
+        const next = new Set(prev);
+        rows.forEach((r) => {
+          const d = String(r?.day_date || '').slice(0, 10);
+          if (d) next.add(d);
+        });
+        return next;
+      });
+      setLoadedHolidayYears((prev) => [...prev, y]);
+    } catch {
+      // Backend validation still protects this.
+    }
+  };
+
   useEffect(() => {
     const t = searchParams.get('tab');
     if (t === 'requests') setLeaveTab('requests');
     else if (t === 'apply') setLeaveTab('apply');
   }, [searchParams]);
 
+  useEffect(() => {
+    const years = new Set([new Date().getFullYear()]);
+    const ys = Number(String(form.start_date || '').slice(0, 4));
+    const ye = Number(String(form.end_date || '').slice(0, 4));
+    if (ys) years.add(ys);
+    if (ye) years.add(ye);
+    years.forEach((y) => {
+      if (y) loadNonWorkingDaysForYear(y);
+    });
+  }, [form.start_date, form.end_date]);
+
+  const isWeekendDate = (isoDate) => {
+    if (!isoDate) return false;
+    const d = new Date(`${isoDate}T00:00:00`);
+    const day = d.getDay();
+    return day === 0 || day === 6;
+  };
+  const isHolidayDate = (isoDate) => nonWorkingDateSet.has(String(isoDate || '').slice(0, 10));
+  const nonWorkingReason = (isoDate) => {
+    if (!isoDate) return '';
+    if (isWeekendDate(isoDate)) return 'Weekend (non-working day)';
+    if (isHolidayDate(isoDate)) return 'HR/public holiday (non-working day)';
+    return '';
+  };
+  const startDateReason = nonWorkingReason(form.start_date);
+  const endDateReason = nonWorkingReason(form.end_date);
+  const hasBoundaryDateError = !!startDateReason || !!endDateReason;
+  const toDateObj = (isoDate) => (isoDate ? new Date(`${isoDate}T00:00:00`) : null);
+  const toIsoDate = (dt) => (dt ? format(dt, 'yyyy-MM-dd') : '');
+  const isSelectableWorkingDate = (dt) => !nonWorkingReason(format(dt, 'yyyy-MM-dd'));
+
   const createAndSubmit = async (e) => {
     e.preventDefault();
+    if (hasBoundaryDateError) {
+      toast('Start and end dates must be working days (not weekend/holiday).', 'error');
+      return;
+    }
     try {
       const created = await api.createLeaveRequest(form);
       await api.submitLeaveRequest(created.id);
       toast('Leave request submitted', 'success');
-      setForm((p) => ({ ...p, start_date: '', end_date: '', reason: '' }));
+      setForm((p) => ({ ...p, start_date: '', end_date: '', start_time: '', end_time: '', reason: '' }));
       load();
     } catch (err) {
       toast(err?.response?.data?.detail || 'Failed to submit leave request', 'error');
@@ -104,6 +168,22 @@ export function EmployeeLeave() {
   const annualRemaining = annualBalance != null ? Number(annualBalance.remaining_days ?? 0) : null;
 
   const selectedType = leaveTypes.find((t) => t.id === form.leave_type_id);
+  const isShortAbsenceType = useMemo(() => {
+    const code = String(selectedType?.code || '').toUpperCase();
+    const name = String(selectedType?.name || '').toLowerCase();
+    return (
+      code === 'SHORT_ABSENCE' ||
+      code === 'PERMISSION_SHORT_ABSENCE' ||
+      name.includes('permission for short absence')
+    );
+  }, [selectedType]);
+  useEffect(() => {
+    if (isShortAbsenceType) {
+      setForm((p) => ({ ...p, end_date: p.start_date || p.end_date }));
+      return;
+    }
+    setForm((p) => ({ ...p, start_time: '', end_time: '' }));
+  }, [isShortAbsenceType]);
   const selectedBalance = useMemo(() => {
     if (!selectedType) return null;
     const byId = balances.find((b) => b.leave_type_id === selectedType.id);
@@ -147,12 +227,6 @@ export function EmployeeLeave() {
             </p>
             <p className="mt-2 text-3xl font-bold tabular-nums text-gray-900 dark:text-white">
               {annualRemaining != null ? `${annualRemaining.toFixed(1)} days` : '-'}
-            </p>
-            <p className="mt-2 text-xs text-gray-500 dark:text-gray-400 leading-snug">
-              These figures are read from your saved leave balances in this system (allocated, used, and remaining),
-              including types such as annual leave and day off in lieu after an OrangeHRM import. Contact HR if totals
-              still differ from the old app. New accounts without a balance row get defaults until HR or an import sets
-              your record.
             </p>
           </div>
           <div className="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/90 p-5 shadow-sm">
@@ -227,29 +301,113 @@ export function EmployeeLeave() {
               <label htmlFor="leave-from" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
                 From date <span className="text-red-600 dark:text-red-400">*</span>
               </label>
-              <input
-                id="leave-from"
-                type="date"
-                value={form.start_date}
-                onChange={(e) => setForm((p) => ({ ...p, start_date: e.target.value }))}
-                className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2.5 text-gray-900 dark:text-white"
-                required
-              />
+              <div className="relative">
+                <DatePicker
+                  ref={fromPickerRef}
+                  id="leave-from"
+                  wrapperClassName="w-full"
+                  selected={toDateObj(form.start_date)}
+                  onChange={(dt) =>
+                    setForm((p) => ({
+                      ...p,
+                      start_date: toIsoDate(dt),
+                      ...(isShortAbsenceType ? { end_date: toIsoDate(dt) } : {}),
+                    }))
+                  }
+                  filterDate={isSelectableWorkingDate}
+                  dateFormat="yyyy-MM-dd"
+                  placeholderText="YYYY-MM-DD"
+                  className={`w-full rounded-lg border px-3 py-2.5 pr-10 text-gray-900 dark:text-white bg-white dark:bg-gray-700 ${
+                    startDateReason
+                      ? 'border-red-400 dark:border-red-600'
+                      : 'border-gray-300 dark:border-gray-600'
+                  }`}
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => fromPickerRef.current?.setOpen(true)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 h-8 w-8 rounded-md text-gray-500 hover:text-gray-700 dark:text-gray-300 dark:hover:text-white"
+                  aria-label="Open from date calendar"
+                >
+                  📅
+                </button>
+              </div>
+              {startDateReason && (
+                <p className="text-xs text-red-600 dark:text-red-400 mt-1">{startDateReason}</p>
+              )}
             </div>
             <div className="space-y-1">
               <label htmlFor="leave-to" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
                 To date <span className="text-red-600 dark:text-red-400">*</span>
               </label>
-              <input
-                id="leave-to"
-                type="date"
-                value={form.end_date}
-                onChange={(e) => setForm((p) => ({ ...p, end_date: e.target.value }))}
-                className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2.5 text-gray-900 dark:text-white"
-                required
-              />
+              <div className="relative">
+                <DatePicker
+                  ref={toPickerRef}
+                  id="leave-to"
+                  wrapperClassName="w-full"
+                  selected={toDateObj(form.end_date)}
+                  onChange={(dt) => setForm((p) => ({ ...p, end_date: toIsoDate(dt) }))}
+                  filterDate={isSelectableWorkingDate}
+                  minDate={toDateObj(form.start_date)}
+                  dateFormat="yyyy-MM-dd"
+                  placeholderText="YYYY-MM-DD"
+                  className={`w-full rounded-lg border px-3 py-2.5 pr-10 text-gray-900 dark:text-white bg-white dark:bg-gray-700 ${
+                    endDateReason
+                      ? 'border-red-400 dark:border-red-600'
+                      : 'border-gray-300 dark:border-gray-600'
+                  }`}
+                  required
+                  disabled={isShortAbsenceType}
+                />
+                <button
+                  type="button"
+                  onClick={() => toPickerRef.current?.setOpen(true)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 h-8 w-8 rounded-md text-gray-500 hover:text-gray-700 dark:text-gray-300 dark:hover:text-white disabled:opacity-40"
+                  aria-label="Open to date calendar"
+                  disabled={isShortAbsenceType}
+                >
+                  📅
+                </button>
+              </div>
+              {endDateReason && (
+                <p className="text-xs text-red-600 dark:text-red-400 mt-1">{endDateReason}</p>
+              )}
             </div>
           </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400 -mt-1">
+            Weekends and HR/public holidays are excluded from leave and cannot be used as From/To boundary dates.
+          </p>
+          {isShortAbsenceType && (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1">
+                <label htmlFor="leave-from-time" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  From time <span className="text-red-600 dark:text-red-400">*</span>
+                </label>
+                <input
+                  id="leave-from-time"
+                  type="time"
+                  value={form.start_time}
+                  onChange={(e) => setForm((p) => ({ ...p, start_time: e.target.value }))}
+                  className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2.5 text-gray-900 dark:text-white"
+                  required={isShortAbsenceType}
+                />
+              </div>
+              <div className="space-y-1">
+                <label htmlFor="leave-to-time" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  To time <span className="text-red-600 dark:text-red-400">*</span>
+                </label>
+                <input
+                  id="leave-to-time"
+                  type="time"
+                  value={form.end_time}
+                  onChange={(e) => setForm((p) => ({ ...p, end_time: e.target.value }))}
+                  className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2.5 text-gray-900 dark:text-white"
+                  required={isShortAbsenceType}
+                />
+              </div>
+            </div>
+          )}
 
           <div className="space-y-1">
             <label htmlFor="leave-comments" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -271,6 +429,7 @@ export function EmployeeLeave() {
             </p>
             <button
               type="submit"
+              disabled={hasBoundaryDateError}
               className="w-full sm:w-auto min-w-[8rem] px-6 py-2.5 rounded-lg bg-orange-500 text-white font-semibold shadow-sm hover:bg-orange-600 focus:outline-none focus:ring-2 focus:ring-orange-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900 transition-colors"
             >
               Apply
@@ -293,6 +452,7 @@ export function EmployeeLeave() {
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Recorded by</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Start</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">End</th>
+                <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Time</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Days</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Comments</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Status</th>
@@ -302,14 +462,14 @@ export function EmployeeLeave() {
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
               {loading && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
+                  <td colSpan={9} className="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
                     Loading…
                   </td>
                 </tr>
               )}
               {!loading && requests.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-12 text-center">
+                  <td colSpan={9} className="px-4 py-12 text-center">
                     <p className="text-sm font-medium text-gray-700 dark:text-gray-300">No leave requests yet</p>
                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 max-w-sm mx-auto">
                       Your applications and leave assigned by a supervisor appear here.
@@ -330,6 +490,9 @@ export function EmployeeLeave() {
                     </td>
                     <td className="px-4 py-3 tabular-nums">{r.start_date}</td>
                     <td className="px-4 py-3 tabular-nums">{r.end_date}</td>
+                    <td className="px-4 py-3 tabular-nums text-xs">
+                      {(r.start_time && r.end_time) ? `${r.start_time} - ${r.end_time}` : '-'}
+                    </td>
                     <td className="px-4 py-3 tabular-nums">{r.days_requested}</td>
                     <td className="px-4 py-3 max-w-[14rem] text-xs text-gray-600 dark:text-gray-400 align-top">
                       {(() => {

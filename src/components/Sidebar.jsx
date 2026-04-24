@@ -20,13 +20,17 @@ const staffLinks = [
   { to: ROUTES.EMPLOYEE.LEAVE, label: 'Leave', Icon: Ni.IconCalendar },
   { to: ROUTES.EMPLOYEE.ANNOUNCEMENTS, label: 'Announcements', Icon: Ni.IconMegaphone },
   { to: ROUTES.EMPLOYEE.DOCUMENTS, label: 'Documents', Icon: Ni.IconFolder },
-  { to: ROUTES.EMPLOYEE.APPRAISAL, label: 'Performance', Icon: Ni.IconChart },
+];
+const performanceLinks = [
+  { to: ROUTES.EMPLOYEE.APPRAISAL_KPI, label: 'Set KPI', Icon: Ni.IconChart },
+  { to: ROUTES.EMPLOYEE.APPRAISAL_REVIEWS, label: 'Appraisal', Icon: Ni.IconClipboard },
 ];
 
 const hrDashboardLinks = [
   { to: ROUTES.HR.DASHBOARD, label: 'HR overview', Icon: Ni.IconLayout },
   { to: ROUTES.HR.DASHBOARD_ATTENDANCE, label: 'Attendance dashboard', Icon: Ni.IconClock },
   { to: ROUTES.HR.DASHBOARD_LEAVE, label: 'Leave dashboard', Icon: Ni.IconCalendar },
+  { to: ROUTES.APPRAISAL.DASHBOARD, label: 'Performance dashboard', Icon: Ni.IconChart },
 ];
 
 const hrReportSectionLinks = [
@@ -50,6 +54,7 @@ const hrPrivilegeLinks = [
 
 const adminDashboardLinks = [
   { to: ROUTES.ADMIN.DASHBOARD, label: 'Admin overview', Icon: Ni.IconLayout },
+  { to: ROUTES.APPRAISAL.DASHBOARD, label: 'Performance dashboard', Icon: Ni.IconChart },
 ];
 
 const adminReportLinks = [
@@ -68,9 +73,13 @@ const adminPrivilegeLinks = [
 
 /** Nav: flat links array or array of { section, links } for dropdown menu */
 const nav = {
-  [ROLES.EMPLOYEE]: [{ section: 'Workspace', links: staffLinks }],
+  [ROLES.EMPLOYEE]: [
+    { section: 'Workspace', links: staffLinks },
+    { section: 'Performance & Appraisal', links: performanceLinks },
+  ],
   [ROLES.MANAGER]: [
     { section: 'Workspace', links: staffLinks },
+    { section: 'Performance & Appraisal', links: performanceLinks },
     {
       section: 'Approvals',
       links: [
@@ -82,6 +91,7 @@ const nav = {
   ],
   [ROLES.HOD]: [
     { section: 'Workspace', links: staffLinks },
+    { section: 'Performance & Appraisal', links: performanceLinks },
     {
       section: 'Approvals',
       links: [
@@ -94,12 +104,14 @@ const nav = {
   [ROLES.HR]: [
     { section: 'Dashboards', links: hrDashboardLinks },
     { section: 'Employee self-service', links: staffLinks },
+    { section: 'Performance & Appraisal', links: performanceLinks },
     { section: 'Reports', links: hrReportSectionLinks },
     { section: 'HR operations', links: hrPrivilegeLinks },
   ],
   [ROLES.ADMIN]: [
     { section: 'Dashboards', links: adminDashboardLinks },
     { section: 'Employee self-service', links: staffLinks },
+    { section: 'Performance & Appraisal', links: performanceLinks },
     { section: 'Reports', links: adminReportLinks },
     { section: 'Administrative tools', links: adminPrivilegeLinks },
   ],
@@ -139,8 +151,18 @@ export function Sidebar({ open, mobileOpen, onToggle, onMobileClose, onMobileOpe
       mounted = false;
     };
   }, []);
+  useEffect(() => {
+    const onVisibilityUpdated = (evt) => {
+      const next = evt?.detail?.hidden_modules;
+      if (Array.isArray(next)) {
+        setHiddenModules(next);
+      }
+    };
+    window.addEventListener('module-visibility-updated', onVisibilityUpdated);
+    return () => window.removeEventListener('module-visibility-updated', onVisibilityUpdated);
+  }, []);
   const navConfig = useMemo(() => {
-    if (role === ROLES.ADMIN || !hiddenModules.length) return navConfigBase;
+    if (!hiddenModules.length) return navConfigBase;
     const hideSet = new Set(hiddenModules);
     const filterLinks = (links = []) =>
       links.filter((l) => {

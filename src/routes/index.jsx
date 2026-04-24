@@ -43,6 +43,7 @@ import { EmployeeAppraisal } from '../pages/appraisal/EmployeeAppraisal';
 import { HRAppraisal } from '../pages/appraisal/HRAppraisal';
 import { ManagerAppraisal } from '../pages/appraisal/ManagerAppraisal';
 import { HodAppraisal } from '../pages/appraisal/HodAppraisal';
+import { AppraisalDashboard } from '../pages/appraisal/AppraisalDashboard';
 
 /** Wraps a page with `ProtectedRoute` plus an explicit role allow-list (omit second arg for “any logged-in user”). */
 const wrapRole = (element, roles) => <ProtectedRoute allowedRoles={roles}>{element}</ProtectedRoute>;
@@ -69,7 +70,10 @@ const router = createBrowserRouter([
         path: 'employee/team-leave',
         element: wrapRole(<TeamLeaveBalances />, [ROLES.MANAGER, ROLES.HOD, ROLES.HR, ROLES.ADMIN]),
       },
-      { path: 'employee/appraisal', element: wrapRole(<EmployeeAppraisal />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN, ROLES.MANAGER, ROLES.HOD]) },
+      { path: 'employee/appraisal', element: <Navigate to={ROUTES.EMPLOYEE.APPRAISAL_KPI} replace /> },
+      { path: 'employee/appraisal/kpi', element: wrapRole(<EmployeeAppraisal />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN, ROLES.MANAGER, ROLES.HOD]) },
+      { path: 'employee/appraisal/reviews', element: wrapRole(<EmployeeAppraisal />, [ROLES.EMPLOYEE, ROLES.HR, ROLES.ADMIN, ROLES.MANAGER, ROLES.HOD]) },
+      { path: 'appraisal/dashboard', element: wrapRole(<AppraisalDashboard />, [ROLES.EMPLOYEE, ROLES.MANAGER, ROLES.HOD, ROLES.HR, ROLES.ADMIN]) },
       /* --- Appraisal: role-specific queues (see backend approval chains) --- */
       {
         path: 'manager/appraisal',

@@ -183,6 +183,7 @@ export function ManagerAppraisal() {
   const appraisals = data?.appraisals_pending_verify || [];
   const returnedKpis = data?.returned_kpis || [];
   const returnedAppraisals = data?.returned_appraisals || [];
+  const teamDoneAppraisals = data?.team_appraisals_done || [];
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
@@ -262,6 +263,26 @@ export function ManagerAppraisal() {
           </ul>
         </div>
       )}
+
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow border border-gray-100 dark:border-gray-700 p-5">
+        <h2 className="font-semibold text-gray-800 dark:text-white mb-3">Team appraisals finalized</h2>
+        {teamDoneAppraisals.length === 0 ? (
+          <EmptyState title="None" message="No finalized team appraisals yet." />
+        ) : (
+          <ul className="space-y-2 text-sm">
+            {teamDoneAppraisals.slice(0, 40).map((a) => (
+              <li key={a.id} className="flex items-center justify-between gap-2 border-b border-gray-100 dark:border-gray-700 pb-2">
+                <span className="text-gray-700 dark:text-gray-300">
+                  {a.user_name} - {a.cycle_type === 'quarterly' ? `${a.year} ${a.quarter || ''}` : a.year}
+                </span>
+                <span className="px-2 py-0.5 rounded text-xs bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
+                  {a.status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
 
       {viewingKpiId && createPortal(
         <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 overflow-y-auto" onClick={(e) => e.target === e.currentTarget && setViewingKpiId(null)}>

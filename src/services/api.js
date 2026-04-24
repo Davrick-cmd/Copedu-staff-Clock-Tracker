@@ -324,6 +324,11 @@ export async function setSetting(key, value) {
   await api.patch('/settings', { key, value: typeof value === 'string' ? value : JSON.stringify(value) });
 }
 
+export async function sendSettingsEmailTest(payload) {
+  const { data } = await api.post('/settings/email-test', payload);
+  return data || {};
+}
+
 export async function getAdminDataMaintenanceSummary(params = {}) {
   const { data } = await api.get('/admin/data-maintenance/summary', { params });
   return data || {};
@@ -352,6 +357,7 @@ export async function uploadHrDocument(file, title) {
   formData.append('title', title || file.name || 'Document');
   const { data } = await api.post('/hr-documents/upload', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120000,
   });
   return data;
 }
@@ -383,6 +389,7 @@ export async function uploadStaffDocument(file, title, kind, subjectUserId, appr
   if (appraisalId) formData.append('appraisal_id', appraisalId);
   const { data } = await api.post('/staff-documents/upload', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120000,
   });
   return data;
 }
@@ -845,6 +852,21 @@ export async function approveLeaveBalanceAdjustment(adjustmentId, comment = '') 
 export async function rejectLeaveBalanceAdjustment(adjustmentId, comment) {
   const { data } = await api.post(`/leave/hr/balance-adjustments/${adjustmentId}/reject`, { comment });
   return data;
+}
+
+export async function getLeaveNonWorkingDays(params = {}) {
+  const { data } = await api.get('/leave/non-working-days', { params });
+  return data || { year: new Date().getFullYear(), rows: [] };
+}
+
+export async function createLeaveNonWorkingDay(payload) {
+  const { data } = await api.post('/leave/hr/non-working-days', payload);
+  return data || {};
+}
+
+export async function deleteLeaveNonWorkingDay(entryId) {
+  const { data } = await api.delete(`/leave/hr/non-working-days/${entryId}`);
+  return data || {};
 }
 
 export async function getLeaveMyDashboard() {

@@ -251,9 +251,10 @@ def _ldap_lookup_user(username: str):
         return None, err
 
 
-# Load .env from backend folder first, then from current working directory
+# Load env from backend folder and project root (for zip/server deployments).
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_backend_dir, ".env"))
+load_dotenv(os.path.abspath(os.path.join(_backend_dir, "..", ".env")))
 load_dotenv()
 # Local storage for HR document uploads (relative to backend folder)
 UPLOAD_DIR = os.path.join(_backend_dir, "uploads")
@@ -353,10 +354,110 @@ def _apply_annual_leave_days_from_env():
         logger.warning("HR_SUITE_ANNUAL_LEAVE_DAYS apply failed: %s", e)
 
 
+def _auto_backup_enabled() -> bool:
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("auto_backup_enabled",))
+        row = c.fetchone()
+    if row and row[0] is not None and str(row[0]).strip() != "":
+        v = str(row[0]).strip().lower().strip('"')
+        return v in ("1", "true", "yes", "on")
+    env = (os.environ.get("AUTO_DB_BACKUP_ENABLED") or "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return True
+
+
+def _auto_backup_hour_utc() -> int:
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("auto_backup_hour_utc",))
+        row = c.fetchone()
+    raw = str(row[0]).strip().strip('"') if row and row[0] is not None else ""
+    if not raw:
+        raw = (os.environ.get("AUTO_DB_BACKUP_HOUR_UTC") or "").strip()
+    try:
+        h = int(raw) if raw else 2
+    except Exception:
+        h = 2
+    return max(0, min(23, h))
+
+
+def _auto_backup_retention_days() -> int:
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("auto_backup_retention_days",))
+        row = c.fetchone()
+    raw = str(row[0]).strip().strip('"') if row and row[0] is not None else ""
+    if not raw:
+        raw = (os.environ.get("AUTO_DB_BACKUP_RETENTION_DAYS") or "").strip()
+    try:
+        d = int(raw) if raw else 14
+    except Exception:
+        d = 14
+    return max(3, min(3650, d))
+
+
+def _run_db_backup_now(trigger: str = "manual") -> str:
+    src = os.path.abspath(DB_PATH)
+    if not os.path.exists(src):
+        raise RuntimeError(f"Database file not found: {src}")
+    backup_dir = os.path.join(_backend_dir, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(backup_dir, f"copedu-{stamp}.db")
+    src_conn = sqlite3.connect(src, timeout=45)
+    dest_conn = sqlite3.connect(dest, timeout=45)
+    try:
+        src_conn.backup(dest_conn)
+    finally:
+        dest_conn.close()
+        src_conn.close()
+    keep_days = _auto_backup_retention_days()
+    cutoff = datetime.utcnow() - timedelta(days=keep_days)
+    for name in os.listdir(backup_dir):
+        if not name.lower().endswith(".db"):
+            continue
+        p = os.path.join(backup_dir, name)
+        try:
+            m = datetime.utcfromtimestamp(os.path.getmtime(p))
+            if m < cutoff:
+                os.remove(p)
+        except Exception:
+            continue
+    logger.info("DB backup created (%s): %s", trigger, dest)
+    return dest
+
+
+def _auto_db_backup_loop() -> None:
+    while True:
+        if not _auto_backup_enabled():
+            _time.sleep(3600)
+            continue
+        now = datetime.utcnow()
+        h = _auto_backup_hour_utc()
+        next_run = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        wait_seconds = max(int((next_run - now).total_seconds()), 60)
+        _time.sleep(wait_seconds)
+        if not _auto_backup_enabled():
+            continue
+        try:
+            _run_db_backup_now("scheduled")
+        except Exception as ex:
+            logger.warning("Auto DB backup failed: %s", ex)
+
+
 # ---------- Startup ----------
 @app.on_event("startup")
 def startup():
     init_db()
+    try:
+        cy = datetime.utcnow().year
+        _ensure_non_working_calendar_seeded(cy)
+        _ensure_non_working_calendar_seeded(cy + 1)
+    except Exception as e:
+        logger.warning("Holiday calendar seed failed: %s", e)
     _apply_annual_leave_days_from_env()
     from auth_jwt import SECRET_KEY
     if SECRET_KEY == "change-me-in-production-use-env":
@@ -393,6 +494,13 @@ def startup():
             logger.info("Recognitions: purged %s expired post(s) (5 working-day retention)", n)
     except Exception as e:
         logger.warning("Recognition retention purge on startup failed: %s", e)
+    try:
+        if _auto_backup_enabled():
+            _run_db_backup_now("startup")
+        b = threading.Thread(target=_auto_db_backup_loop, daemon=True)
+        b.start()
+    except Exception as e:
+        logger.warning("Auto DB backup startup failed: %s", e)
 
 
 @app.get("/health")
@@ -3164,6 +3272,11 @@ class SettingUpdate(BaseModel):
     value: str
 
 
+class SettingsEmailTestRequest(BaseModel):
+    recipient_email: str
+    subject: str | None = None
+
+
 @app.patch("/settings")
 def set_setting(req: SettingUpdate, user_id: str = Depends(get_current_user_id)):
     key, value = req.key, req.value
@@ -3176,6 +3289,51 @@ def set_setting(req: SettingUpdate, user_id: str = Depends(get_current_user_id))
     with cursor() as c:
         c.execute("INSERT OR REPLACE INTO settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)", (key, value, user_id, now))
     return {"ok": True}
+
+
+@app.post("/settings/email-test")
+def settings_send_email_test(req: SettingsEmailTestRequest, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("admin",))
+    recipient = (req.recipient_email or "").strip()
+    if not recipient or "@" not in recipient:
+        raise HTTPException(status_code=400, detail="Valid recipient_email is required")
+    cfg = _get_smtp_config()
+    if not (cfg.get("host") or "").strip() or not (cfg.get("from") or "").strip():
+        raise HTTPException(status_code=400, detail="SMTP host/from are missing. Save Leave notifications settings first.")
+    subject = (req.subject or "").strip() or "HR Suite SMTP test"
+    body = "\n".join(
+        [
+            "This is a test email from HR Suite Admin Settings.",
+            "",
+            f"Sent at (UTC): {datetime.utcnow().isoformat()}",
+            f"From: {cfg.get('from')}",
+            f"SMTP host: {cfg.get('host')}:{cfg.get('port')}",
+            "",
+            "If you received this, SMTP configuration is working.",
+        ]
+    )
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = cfg["from"]
+        msg["To"] = recipient
+        msg.set_content(body)
+        if cfg["port"] == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=45) as smtp:
+                if cfg["user"] and cfg["password"]:
+                    smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=45) as smtp:
+                if cfg["use_tls"]:
+                    smtp.starttls(context=ssl.create_default_context())
+                if cfg["user"] and cfg["password"]:
+                    smtp.login(cfg["user"], cfg["password"])
+                smtp.send_message(msg)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"SMTP test failed: {e}")
+    return {"ok": True, "recipient_email": recipient}
 
 
 DEFAULT_DEPARTMENTS = [
@@ -4456,7 +4614,7 @@ def appraisal_dashboard_manager(user_id: str = Depends(get_current_user_id)):
         )
         appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
     if not reportee_ids:
-        returned_k, returned_a = [], []
+        returned_k, returned_a, team_done_appraisals = [], [], []
     else:
         placeholders = ",".join("?" * len(reportee_ids))
         with cursor() as c:
@@ -4470,7 +4628,24 @@ def appraisal_dashboard_manager(user_id: str = Depends(get_current_user_id)):
                 reportee_ids,
             )
             returned_a = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
-    return {"kpis_pending_verify": kpis, "appraisals_pending_verify": appraisals, "returned_kpis": returned_k, "returned_appraisals": returned_a}
+            c.execute(
+                f"SELECT a.*, u.full_name as user_name, cy.year, cy.quarter, cy.type as cycle_type "
+                f"FROM appraisals a "
+                f"JOIN users u ON a.user_id = u.id "
+                f"JOIN appraisal_cycles cy ON a.cycle_id = cy.id "
+                f"WHERE a.user_id IN ({placeholders}) "
+                f"AND a.status IN ('verified','approved','received','acknowledged') "
+                f"ORDER BY a.updated_at DESC",
+                reportee_ids,
+            )
+            team_done_appraisals = [row_to_dict(r) for r in c.fetchall() if row_to_dict(r)]
+    return {
+        "kpis_pending_verify": kpis,
+        "appraisals_pending_verify": appraisals,
+        "returned_kpis": returned_k,
+        "returned_appraisals": returned_a,
+        "team_appraisals_done": team_done_appraisals,
+    }
 
 
 @app.get("/appraisal/dashboard/hod")
@@ -5305,7 +5480,9 @@ async def upload_staff_document(
         )
     if k == "employee_certificate":
         try:
-            _notify_hr_admins_staff_certificate(sub, (title or "").strip() or file.filename)
+            cert_title = (title or "").strip() or file.filename
+            _notify_hr_admins_staff_certificate(sub, cert_title)
+            _notify_employee_certificate_record_updated(sub, cert_title)
         except Exception as e:
             logger.warning("Certificate notification failed: %s", e)
     if k == "signed_appraisal":
@@ -5693,7 +5870,259 @@ def _calculate_leave_days(start_date: str, end_date: str) -> float:
     ed = _parse_yyyy_mm_dd(end_date)
     if ed < sd:
         raise HTTPException(status_code=400, detail="End date cannot be before start date")
-    return float((ed - sd).days + 1)
+    holiday_dates = set()
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT day_date
+            FROM leave_non_working_days
+            WHERE day_date >= ? AND day_date <= ?
+            """,
+            (sd.isoformat(), ed.isoformat()),
+        )
+        holiday_dates = {str(r[0]) for r in c.fetchall() if r and r[0]}
+    days = 0
+    cur = sd
+    while cur <= ed:
+        iso = cur.isoformat()
+        if cur.weekday() < 5 and iso not in holiday_dates:
+            days += 1
+        cur += timedelta(days=1)
+    if days <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected date range has no working days (weekends and HR-marked holidays are excluded).",
+        )
+    return float(days)
+
+
+def _is_non_working_day(day_iso: str) -> bool:
+    d = _parse_yyyy_mm_dd(day_iso)
+    if d.weekday() >= 5:
+        return True
+    with cursor() as c:
+        c.execute("SELECT 1 FROM leave_non_working_days WHERE day_date = ? LIMIT 1", (d.isoformat(),))
+        return c.fetchone() is not None
+
+
+def _validate_leave_boundary_dates(start_date: str, end_date: str) -> None:
+    if _is_non_working_day(start_date):
+        raise HTTPException(
+            status_code=400,
+            detail="Start date falls on a non-working day (weekend or HR holiday).",
+        )
+    if _is_non_working_day(end_date):
+        raise HTTPException(
+            status_code=400,
+            detail="End date falls on a non-working day (weekend or HR holiday).",
+        )
+
+
+def _easter_sunday(year: int) -> date:
+    """Gregorian Easter Sunday (Meeus/Jones/Butcher)."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _first_friday_of_august(year: int) -> date:
+    d = date(year, 8, 1)
+    while d.weekday() != 4:
+        d += timedelta(days=1)
+    return d
+
+
+def _rwanda_official_holidays_for_year(year: int) -> list[tuple[str, str]]:
+    """Known official holidays (excluding Eid dates announced each year)."""
+    easter = _easter_sunday(year)
+    fixed = [
+        (date(year, 1, 1), "New Year's Day"),
+        (date(year, 1, 2), "Day after New Year's Day"),
+        (date(year, 2, 1), "National Heroes' Day"),
+        (easter - timedelta(days=2), "Good Friday"),
+        (easter + timedelta(days=1), "Easter Monday"),
+        (date(year, 4, 7), "Genocide against the Tutsi Memorial Day"),
+        (date(year, 5, 1), "Labour Day"),
+        (date(year, 7, 1), "Independence Day"),
+        (date(year, 7, 4), "Liberation Day"),
+        (_first_friday_of_august(year), "Umuganura Day"),
+        (date(year, 8, 15), "Assumption Day"),
+        (date(year, 12, 25), "Christmas Day"),
+        (date(year, 12, 26), "Boxing Day"),
+    ]
+
+    items: list[tuple[date, str, bool]] = []
+    for d, name in fixed:
+        items.append((d, name, d == date(year, 4, 7)))  # Apr 7 has no weekend compensation
+
+    # Weekend compensation (except Apr 7): following weekday.
+    comp_groups: list[list[date]] = []
+    cur_group: list[date] = []
+    for d, _name, allow_comp in sorted(items, key=lambda x: x[0]):
+        if not allow_comp or d.weekday() < 5:
+            continue
+        if cur_group and (d - cur_group[-1]).days == 1:
+            cur_group.append(d)
+        else:
+            if cur_group:
+                comp_groups.append(cur_group)
+            cur_group = [d]
+    if cur_group:
+        comp_groups.append(cur_group)
+
+    extra_comp_days: list[date] = []
+    for grp in comp_groups:
+        # If two consecutive holidays are on weekend, compensate with one following working day.
+        probe = grp[-1] + timedelta(days=1)
+        while probe.weekday() >= 5:
+            probe += timedelta(days=1)
+        extra_comp_days.append(probe)
+
+    out: list[tuple[str, str]] = []
+    seen_dates: set[str] = set()
+    for d, name, _ in items:
+        iso = d.isoformat()
+        if iso in seen_dates:
+            continue
+        seen_dates.add(iso)
+        out.append((iso, f"Official public holiday ({name})"))
+    for d in extra_comp_days:
+        iso = d.isoformat()
+        if iso in seen_dates:
+            continue
+        seen_dates.add(iso)
+        out.append((iso, "Official public holiday compensation day"))
+    return out
+
+
+def _ensure_non_working_calendar_seeded(year: int) -> None:
+    entries = _rwanda_official_holidays_for_year(year)
+    with cursor() as c:
+        for day_iso, reason in entries:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO leave_non_working_days (id, day_date, name, created_by, created_at)
+                VALUES (?, ?, ?, NULL, ?)
+                """,
+                (new_id(), day_iso, reason, _now_iso()),
+            )
+
+
+def _is_short_absence_limited_type(leave_type_id: str) -> bool:
+    with cursor() as c:
+        c.execute("SELECT code, name FROM leave_types WHERE id = ?", (leave_type_id,))
+        row = c.fetchone()
+    if not row:
+        return False
+    code = str(row[0] or "").strip().upper()
+    name = str(row[1] or "").strip().lower()
+    if code in ("SHORT_ABSENCE", "PERMISSION_SHORT_ABSENCE"):
+        return True
+    if "permission for short absence" in name:
+        return True
+    return False
+
+
+def _parse_hh_mm_minutes(raw: str | None) -> int | None:
+    val = (raw or "").strip()
+    if not val:
+        return None
+    try:
+        dt = datetime.strptime(val, "%H:%M")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Time must be in HH:MM format (24-hour clock)")
+    return dt.hour * 60 + dt.minute
+
+
+def _enforce_short_absence_rules(
+    requester_user_id: str,
+    leave_type_id: str,
+    start_date: str,
+    end_date: str,
+    start_time: str | None,
+    end_time: str | None,
+    exclude_leave_request_id: str | None = None,
+) -> None:
+    if not _is_short_absence_limited_type(leave_type_id):
+        return
+    if (start_date or "").strip() != (end_date or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Permission for Short Absence (<= 3 hours) must start and end on the same date.",
+        )
+    start_mins = _parse_hh_mm_minutes(start_time)
+    end_mins = _parse_hh_mm_minutes(end_time)
+    if start_mins is None or end_mins is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Permission for Short Absence requires both From time and To time.",
+        )
+    if end_mins <= start_mins:
+        raise HTTPException(status_code=400, detail="To time must be after From time.")
+    duration_minutes = end_mins - start_mins
+    if duration_minutes > 180:
+        raise HTTPException(
+            status_code=400,
+            detail="Permission for Short Absence cannot exceed 3 hours in one request.",
+        )
+    year_month = (start_date or "").strip()[:7]
+    if len(year_month) != 7:
+        return
+    month_start = f"{year_month}-01"
+    y, m = year_month.split("-")
+    y, m = int(y), int(m)
+    if m == 12:
+        month_end_exclusive = f"{y + 1}-01-01"
+    else:
+        month_end_exclusive = f"{y:04d}-{m + 1:02d}-01"
+    with cursor() as c:
+        if exclude_leave_request_id:
+            c.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(days_requested), 0)
+                FROM leave_requests
+                WHERE user_id = ?
+                  AND leave_type_id = ?
+                  AND status IN ('submitted', 'approved')
+                  AND start_date >= ?
+                  AND start_date < ?
+                  AND id <> ?
+                """,
+                (requester_user_id, leave_type_id, month_start, month_end_exclusive, exclude_leave_request_id),
+            )
+        else:
+            c.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(days_requested), 0)
+                FROM leave_requests
+                WHERE user_id = ?
+                  AND leave_type_id = ?
+                  AND status IN ('submitted', 'approved')
+                  AND start_date >= ?
+                  AND start_date < ?
+                """,
+                (requester_user_id, leave_type_id, month_start, month_end_exclusive),
+            )
+        row = c.fetchone()
+    used_count = int((row[0] if row else 0) or 0)
+    used_days = float((row[1] if row else 0) or 0)
+    if used_count >= 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You have exhausted Permission for Short Absence for {year_month}. Maximum is 2 requests per month. Used: {used_count} request(s), {used_days:.2f} day(s).",
+        )
 
 
 def _leave_log(leave_request_id: str, action: str, from_user_id: str | None, from_role: str | None, to_user_id: str | None, to_role: str | None, comment: str | None = None):
@@ -5965,19 +6394,20 @@ def _setting_bool(key: str) -> bool:
 
 
 def _leave_emails_enabled() -> bool:
-    # Settings are the primary source so Admin Settings changes apply immediately.
-    # Env remains a fallback for first-time boot or unmanaged deployments.
+    # Primary source: Admin Settings (so IT can change without code edits).
     with cursor() as c:
         c.execute("SELECT value FROM settings WHERE key = ?", ("leave_email_enabled",))
         row = c.fetchone()
     if row and row[0] is not None and str(row[0]).strip() != "":
         v = str(row[0]).strip().lower().strip('"')
         return v in ("1", "true", "yes", "on")
+    # Fallback to env for bootstrap/unmanaged deployments.
     env = (os.environ.get("LEAVE_EMAIL_ENABLED") or "").strip().lower()
     if env in ("1", "true", "yes", "on"):
         return True
     if env in ("0", "false", "no", "off"):
         return False
+    # Final fallback: auto-enable when SMTP has minimum config.
     cfg = _get_smtp_config()
     return bool((cfg.get("host") or "").strip() and (cfg.get("from") or "").strip())
 
@@ -5991,7 +6421,12 @@ def _get_smtp_config() -> dict:
         port = 587
     user = (_setting_str("smtp_user") or os.environ.get("SMTP_USER") or "").strip()
     password = _setting_str("smtp_password") or os.environ.get("SMTP_PASSWORD")
-    from_addr = (_setting_str("smtp_from") or os.environ.get("SMTP_FROM") or "").strip()
+    from_addr = (
+        _setting_str("smtp_from")
+        or _setting_str("smtp_from_email")
+        or os.environ.get("SMTP_FROM")
+        or ""
+    ).strip()
     if _setting_str("smtp_use_tls") != "":
         use_tls = _setting_bool("smtp_use_tls")
     else:
@@ -6008,15 +6443,25 @@ def _user_email(uid: str) -> str | None:
     return e if e and "@" in e else None
 
 
+def _is_deliverable_notification_email(email: str | None) -> bool:
+    e = (email or "").strip().lower()
+    if not e or "@" not in e:
+        return False
+    domain = e.split("@", 1)[1]
+    if domain in ("example.com", "ad.local", "localhost", "localdomain"):
+        return False
+    return True
+
+
 def _hr_notification_emails() -> list[str]:
     out = []
     with cursor() as c:
         c.execute(
-            "SELECT email FROM users WHERE is_active = 1 AND role IN ('hr','admin') AND email IS NOT NULL AND TRIM(email) != ''"
+            "SELECT email FROM users WHERE is_active = 1 AND role = 'hr' AND email IS NOT NULL AND TRIM(email) != ''"
         )
         for row in c.fetchall():
             e = (row[0] or "").strip()
-            if "@" in e:
+            if _is_deliverable_notification_email(e):
                 out.append(e)
     return list(dict.fromkeys(out))
 
@@ -6029,6 +6474,7 @@ def _send_leave_email(to_addrs: list[str], subject: str, body: str) -> None:
         logger.warning("Leave email skipped: configure smtp_host and smtp_from (or SMTP_* env vars)")
         return
     recipients = [a.strip() for a in to_addrs if a and "@" in a]
+    recipients = [a for a in recipients if _is_deliverable_notification_email(a)]
     if not recipients:
         return
     try:
@@ -6057,10 +6503,14 @@ def _send_leave_email(to_addrs: list[str], subject: str, body: str) -> None:
 
 def _leave_email_body(d: dict) -> list[str]:
     emp = d.get("employee_name") or "Employee"
+    time_text = ""
+    if (d.get("start_time") or "").strip() and (d.get("end_time") or "").strip():
+        time_text = f"{d.get('start_time')} → {d.get('end_time')}"
     return [
         f"Employee: {emp}",
         f"Leave type: {d.get('leave_type_name') or '-'}",
         f"Dates: {d.get('start_date')} → {d.get('end_date')}",
+        f"Time: {time_text or '-'}",
         f"Days: {d.get('days_requested')}",
         f"Reason: {d.get('reason') or '-'}",
         "",
@@ -6128,6 +6578,7 @@ def _send_app_email(to_addrs: list[str], subject: str, body: str) -> None:
     if not cfg.get("host") or not cfg.get("from"):
         return
     recipients = [a.strip() for a in to_addrs if a and "@" in a]
+    recipients = [a for a in recipients if _is_deliverable_notification_email(a)]
     if not recipients:
         return
     try:
@@ -6257,28 +6708,66 @@ def _notify_leave_hr_inbox(req_id: str, title: str, body: str | None = None):
     d = _leave_request_email_detail(req_id)
     if not d:
         return
+    final_body = (body or "").strip()
+    if not final_body:
+        final_body = "\n".join(_leave_email_body(d))
     with cursor() as c:
-        c.execute("SELECT id FROM users WHERE is_active = 1 AND role IN ('hr','admin')")
+        c.execute("SELECT id FROM users WHERE is_active = 1 AND role = 'hr'")
         recipients = [str(r[0]) for r in c.fetchall()]
     seen = set()
     for rid in recipients:
         if not rid or rid in seen:
             continue
         seen.add(rid)
-        _insert_notification(rid, "leave_notice", title, (body or "").strip() or None, "/hr/leave")
+        _insert_notification(rid, "leave_notice", title, final_body, "/hr/leave")
 
 
 def _notify_hr_admins_staff_certificate(staff_user_id: str, doc_title: str):
     staff_name = _employee_display_name(staff_user_id)
-    title = f"New certificate: {staff_name}"
-    body = f"{staff_name} uploaded a certificate: {doc_title or 'Document'}"
+    certificate_title = (doc_title or "Document").strip() or "Document"
+    title = f"Certificate uploaded: {staff_name}"
+    body = (
+        f"{staff_name} uploaded a certificate.\n"
+        f"Certificate: {certificate_title}\n"
+        f"Status: Added to employee record documents."
+    )
     link = "/hr/employees"
+    hr_emails = set()
     with cursor() as c:
-        c.execute("SELECT id FROM users WHERE is_active = 1 AND role IN ('hr','admin')")
-        for (hid,) in c.fetchall():
+        c.execute("SELECT id, email FROM users WHERE is_active = 1 AND role = 'hr'")
+        for (hid, hemail) in c.fetchall():
             _insert_notification(hid, "staff_certificate", title, body, link)
+            if hemail and str(hemail).strip():
+                hr_emails.add(str(hemail).strip())
     for em in _hr_notification_emails():
-        _send_app_email([em], "[HR Suite] " + title, body + "\n\nReview under Employee records in the HR Suite.")
+        if em and str(em).strip():
+            hr_emails.add(str(em).strip())
+    for em in hr_emails:
+        _send_app_email(
+            [em],
+            "[HR Suite] " + title,
+            body + "\n\nAction: Open Employee Records > Documents in the HR Suite to review.",
+        )
+
+
+def _notify_employee_certificate_record_updated(staff_user_id: str, doc_title: str):
+    staff_name = _employee_display_name(staff_user_id)
+    certificate_title = (doc_title or "Document").strip() or "Document"
+    title = "Certificate saved to your employee record"
+    body = (
+        f"Hi {staff_name},\n"
+        f"Your certificate has been uploaded successfully.\n"
+        f"Certificate: {certificate_title}\n"
+        "Status: Updated in your employee record documents."
+    )
+    _insert_notification(staff_user_id, "certificate_updated", title, body, "/employee/documents")
+    to = _user_email(staff_user_id)
+    if to:
+        _send_app_email(
+            [to],
+            "[HR Suite] " + title,
+            body + "\n\nYou can view it under Documents in the HR Suite.",
+        )
 
 
 def _notify_manager_appraisal_submitted(manager_id: str | None, staff_id: str, work_label: str):
@@ -6393,6 +6882,8 @@ class LeaveRequestCreate(BaseModel):
     leave_type_id: str
     start_date: str
     end_date: str
+    start_time: str | None = None
+    end_time: str | None = None
     reason: str | None = None
 
 
@@ -6400,6 +6891,8 @@ class LeaveRequestUpdate(BaseModel):
     leave_type_id: str
     start_date: str
     end_date: str
+    start_time: str | None = None
+    end_time: str | None = None
     reason: str | None = None
 
 
@@ -6507,6 +7000,11 @@ class LeaveTypeCreate(BaseModel):
     default_days: float = 0.0
 
 
+class LeaveNonWorkingDayCreate(BaseModel):
+    day_date: str
+    reason: str
+
+
 @app.post("/leave/types")
 def create_leave_type(body: LeaveTypeCreate, user_id: str = Depends(get_current_user_id)):
     _require_roles(user_id, ("admin", "hr"))
@@ -6538,6 +7036,78 @@ def create_leave_type(body: LeaveTypeCreate, user_id: str = Depends(get_current_
         )
         c.execute("SELECT * FROM leave_types WHERE id = ?", (lid,))
         return row_to_dict(c.fetchone())
+
+
+@app.get("/leave/non-working-days")
+def list_leave_non_working_days(
+    year: int | None = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    _ = _get_user_profile_min(user_id)
+    y = int(year) if year else datetime.utcnow().year
+    _ensure_non_working_calendar_seeded(y)
+    start = f"{y:04d}-01-01"
+    end = f"{y:04d}-12-31"
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, day_date, name, created_by, created_at
+            FROM leave_non_working_days
+            WHERE day_date >= ? AND day_date <= ?
+            ORDER BY day_date ASC
+            """,
+            (start, end),
+        )
+        rows = [row_to_dict(r) for r in c.fetchall()]
+    return {"year": y, "rows": rows}
+
+
+@app.post("/leave/hr/non-working-days")
+def create_leave_non_working_day(
+    body: LeaveNonWorkingDayCreate,
+    user_id: str = Depends(get_current_user_id),
+):
+    _require_roles(user_id, ("hr", "admin"))
+    d = _parse_yyyy_mm_dd(body.day_date).isoformat()
+    if _parse_yyyy_mm_dd(d).weekday() >= 5:
+        raise HTTPException(status_code=400, detail="Weekends are auto non-working. Add weekdays only.")
+    reason = (body.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Reason is required (e.g. government holiday name)")
+    try:
+        with cursor() as c:
+            c.execute(
+                """
+                INSERT INTO leave_non_working_days (id, day_date, name, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (new_id(), d, reason, user_id, _now_iso()),
+            )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="This date already exists in the HR non-working calendar.")
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, day_date, name, created_by, created_at
+            FROM leave_non_working_days
+            WHERE day_date = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (d,),
+        )
+        return row_to_dict(c.fetchone())
+
+
+@app.delete("/leave/hr/non-working-days/{entry_id}")
+def delete_leave_non_working_day(entry_id: str, user_id: str = Depends(get_current_user_id)):
+    _require_roles(user_id, ("hr", "admin"))
+    with cursor() as c:
+        c.execute("DELETE FROM leave_non_working_days WHERE id = ?", (entry_id,))
+        deleted = int(c.rowcount or 0)
+    if deleted <= 0:
+        raise HTTPException(status_code=404, detail="Holiday calendar entry not found")
+    return {"ok": True, "deleted": deleted}
 
 
 @app.delete("/leave/types/{leave_type_id}")
@@ -6588,19 +7158,41 @@ def create_leave_request(req: LeaveRequestCreate, user_id: str = Depends(get_cur
     current = _get_user_profile_min(user_id)
     if not current:
         raise HTTPException(status_code=401, detail="User not found")
+    _validate_leave_boundary_dates(req.start_date, req.end_date)
     days_requested = _calculate_leave_days(req.start_date, req.end_date)
     with cursor() as c:
         c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (req.leave_type_id,))
         if not c.fetchone():
             raise HTTPException(status_code=400, detail="Invalid leave type")
+    _enforce_short_absence_rules(
+        requester_user_id=user_id,
+        leave_type_id=req.leave_type_id,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        start_time=req.start_time,
+        end_time=req.end_time,
+        exclude_leave_request_id=None,
+    )
     rid = new_id()
     with cursor() as c:
         c.execute(
             """
-            INSERT INTO leave_requests (id, user_id, leave_type_id, start_date, end_date, days_requested, reason, status, created_at, updated_at, created_by_user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, NULL)
+            INSERT INTO leave_requests (id, user_id, leave_type_id, start_date, end_date, start_time, end_time, days_requested, reason, status, created_at, updated_at, created_by_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, NULL)
             """,
-            (rid, user_id, req.leave_type_id, req.start_date, req.end_date, days_requested, (req.reason or "").strip() or None, _now_iso(), _now_iso()),
+            (
+                rid,
+                user_id,
+                req.leave_type_id,
+                req.start_date,
+                req.end_date,
+                (req.start_time or "").strip() or None,
+                (req.end_time or "").strip() or None,
+                days_requested,
+                (req.reason or "").strip() or None,
+                _now_iso(),
+                _now_iso(),
+            ),
         )
     _leave_log(rid, "created", user_id, current.get("role"), None, None, req.reason)
     with cursor() as c:
@@ -6628,11 +7220,21 @@ def update_leave_request(leave_request_id: str, body: LeaveRequestUpdate, user_i
         raise HTTPException(status_code=400, detail="Only draft or returned requests can be edited")
     if req.get("status") in ("cancelled", "rejected"):
         raise HTTPException(status_code=400, detail="Cancelled or rejected requests cannot be edited")
+    _validate_leave_boundary_dates(body.start_date, body.end_date)
     days_requested = _calculate_leave_days(body.start_date, body.end_date)
     with cursor() as c:
         c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (body.leave_type_id,))
         if not c.fetchone():
             raise HTTPException(status_code=400, detail="Invalid leave type")
+    _enforce_short_absence_rules(
+        requester_user_id=req.get("user_id") or user_id,
+        leave_type_id=body.leave_type_id,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        start_time=body.start_time,
+        end_time=body.end_time,
+        exclude_leave_request_id=leave_request_id,
+    )
     old_leave_type_id = req.get("leave_type_id")
     old_start = str(req.get("start_date") or "")
     old_days = float(req.get("days_requested") or 0)
@@ -6643,13 +7245,15 @@ def update_leave_request(leave_request_id: str, body: LeaveRequestUpdate, user_i
         c.execute(
             """
             UPDATE leave_requests
-            SET leave_type_id = ?, start_date = ?, end_date = ?, days_requested = ?, reason = ?, updated_at = ?
+            SET leave_type_id = ?, start_date = ?, end_date = ?, start_time = ?, end_time = ?, days_requested = ?, reason = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 body.leave_type_id,
                 body.start_date,
                 body.end_date,
+                (body.start_time or "").strip() or None,
+                (body.end_time or "").strip() or None,
                 days_requested,
                 (body.reason or "").strip() or None,
                 _now_iso(),
@@ -6677,7 +7281,17 @@ def assign_leave_to_staff(body: LeaveAssignBody, user_id: str = Depends(get_curr
     if staff_id == user_id:
         raise HTTPException(status_code=400, detail="Use the normal Apply flow for your own leave")
     _assert_can_assign_leave_for_staff(actor, staff_id)
+    _validate_leave_boundary_dates(body.start_date, body.end_date)
     days_requested = _calculate_leave_days(body.start_date, body.end_date)
+    _enforce_short_absence_rules(
+        requester_user_id=staff_id,
+        leave_type_id=body.leave_type_id or "",
+        start_date=body.start_date or "",
+        end_date=body.end_date or "",
+        start_time=None,
+        end_time=None,
+        exclude_leave_request_id=None,
+    )
     with cursor() as c:
         c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (body.leave_type_id,))
         if not c.fetchone():
@@ -6752,6 +7366,16 @@ def submit_leave_request(leave_request_id: str, user_id: str = Depends(get_curre
         raise HTTPException(status_code=403, detail="Forbidden")
     if req["status"] not in ("draft", "returned"):
         raise HTTPException(status_code=400, detail="Only draft or returned requests can be submitted")
+    _validate_leave_boundary_dates(req.get("start_date") or "", req.get("end_date") or "")
+    _enforce_short_absence_rules(
+        requester_user_id=req["user_id"],
+        leave_type_id=req.get("leave_type_id") or "",
+        start_date=req.get("start_date") or "",
+        end_date=req.get("end_date") or "",
+        start_time=req.get("start_time"),
+        end_time=req.get("end_time"),
+        exclude_leave_request_id=leave_request_id,
+    )
     approver_id = _first_leave_approver(req["user_id"])
     if not approver_id:
         with cursor() as c:
@@ -6847,6 +7471,16 @@ def reschedule_approved_leave_request(
         c.execute("SELECT id FROM leave_types WHERE id = ? AND is_active = 1", (next_leave_type_id,))
         if not c.fetchone():
             raise HTTPException(status_code=400, detail="Invalid leave type")
+    _validate_leave_boundary_dates(body.start_date, body.end_date)
+    _enforce_short_absence_rules(
+        requester_user_id=req.get("user_id") or user_id,
+        leave_type_id=next_leave_type_id,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        start_time=None,
+        end_time=None,
+        exclude_leave_request_id=leave_request_id,
+    )
     new_days = _calculate_leave_days(body.start_date, body.end_date)
     old_leave_type_id = req.get("leave_type_id")
     old_year = int(str(req.get("start_date") or "")[:4] or datetime.utcnow().year)
@@ -6989,15 +7623,10 @@ def _act_on_leave(leave_request_id: str, user_id: str, action: str, body: LeaveA
         extra = f"Approver note: {comment}" if comment else ""
         _notify_leave_employee(leave_request_id, "Your leave request was approved by your supervisor.", extra)
         _notify_leave_employee_inbox(leave_request_id, "Leave approved", extra or "Your leave request was approved by your supervisor.")
-        _notify_leave_hr_info(
-            "[Leave] Supervisor approval",
-            leave_request_id,
-            "A leave request was approved by the assigned supervisor.",
-        )
         _notify_leave_hr_inbox(
             leave_request_id,
-            "Leave approved by supervisor",
-            "A leave request was approved by the assigned supervisor.",
+            "Supervisor approved leave request",
+            "A leave request was approved by your supervisor.",
         )
         return approved
     elif action == "reject":
@@ -7918,33 +8547,27 @@ def leave_hr_approve_balance_adjustment(
     current = _get_user_profile_min(user_id)
     if not current or current.get("role") not in ("hr", "admin"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    now = _now_iso()
     with cursor() as c:
         c.execute("SELECT * FROM leave_balance_adjustments WHERE id = ?", (adjustment_id,))
         row = c.fetchone()
-    adj = row_to_dict(row)
-    if not adj:
-        raise HTTPException(status_code=404, detail="Adjustment request not found")
-    if (adj.get("status") or "") != "pending":
-        raise HTTPException(status_code=400, detail="Only pending requests can be approved")
-    assigned_approver = (adj.get("current_approver_id") or "").strip() or (_first_leave_approver(adj.get("requested_by_user_id") or "") or "")
-    if not assigned_approver:
-        raise HTTPException(status_code=400, detail="No supervisor is assigned to approve this request")
-    if not adj.get("current_approver_id"):
-        with cursor() as c:
-            c.execute(
-                "UPDATE leave_balance_adjustments SET current_approver_id = ?, updated_at = ? WHERE id = ?",
-                (assigned_approver, _now_iso(), adjustment_id),
-            )
-    if not _norm_uid_compare(assigned_approver, user_id):
-        raise HTTPException(status_code=403, detail="Only the assigned supervisor can approve this request")
-    if _norm_uid_compare(adj.get("requested_by_user_id"), user_id):
-        raise HTTPException(status_code=400, detail="Requester cannot approve their own request")
-    target_uid = adj.get("target_user_id")
-    lt_id = adj.get("leave_type_id")
-    year = int(adj.get("year") or datetime.utcnow().year)
-    requested_alloc = float(adj.get("requested_allocated_days") or 0)
-    _ensure_leave_balance_rows_for_user(target_uid, year)
-    with cursor() as c:
+        adj = row_to_dict(row)
+        if not adj:
+            raise HTTPException(status_code=404, detail="Adjustment request not found")
+        if (adj.get("status") or "") != "pending":
+            raise HTTPException(status_code=400, detail="Only pending requests can be approved")
+        assigned_approver = (adj.get("current_approver_id") or "").strip() or (_first_leave_approver(adj.get("requested_by_user_id") or "") or "")
+        if not assigned_approver:
+            raise HTTPException(status_code=400, detail="No supervisor is assigned to approve this request")
+        if not _norm_uid_compare(assigned_approver, user_id):
+            raise HTTPException(status_code=403, detail="Only the assigned supervisor can approve this request")
+        if _norm_uid_compare(adj.get("requested_by_user_id"), user_id):
+            raise HTTPException(status_code=400, detail="Requester cannot approve their own request")
+        target_uid = adj.get("target_user_id")
+        lt_id = adj.get("leave_type_id")
+        year = int(adj.get("year") or datetime.utcnow().year)
+        requested_alloc = float(adj.get("requested_allocated_days") or 0)
+        _ensure_leave_balance_rows_for_user(target_uid, year)
         c.execute(
             """
             SELECT id, used_days FROM leave_balances
@@ -7953,10 +8576,8 @@ def leave_hr_approve_balance_adjustment(
             (target_uid, lt_id, year),
         )
         bal = c.fetchone()
-    used_days = float((bal[1] if bal else 0) or 0)
-    now = _now_iso()
-    if bal:
-        with cursor() as c:
+        used_days = float((bal[1] if bal else 0) or 0)
+        if bal:
             c.execute(
                 """
                 UPDATE leave_balances
@@ -7965,8 +8586,7 @@ def leave_hr_approve_balance_adjustment(
                 """,
                 (requested_alloc, max(requested_alloc - used_days, 0), now, bal[0]),
             )
-    else:
-        with cursor() as c:
+        else:
             c.execute(
                 """
                 INSERT INTO leave_balances (id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at)
@@ -7974,7 +8594,7 @@ def leave_hr_approve_balance_adjustment(
                 """,
                 (new_id(), target_uid, lt_id, year, requested_alloc, requested_alloc, now, now),
             )
-    with cursor() as c:
+        # Persist the workflow state in the same transaction as the balance change.
         c.execute(
             """
             UPDATE leave_balance_adjustments

@@ -24,6 +24,7 @@ export function AdminUsers() {
   const [bulkUploading, setBulkUploading] = useState(false);
   const [bulkResult, setBulkResult] = useState(null);
   const [adLookupLoading, setAdLookupLoading] = useState(false);
+  const [supervisorSearch, setSupervisorSearch] = useState('');
   const [editUser, setEditUser] = useState(null);
   const [passwordModalUser, setPasswordModalUser] = useState(null);
   const [passwordModalValue, setPasswordModalValue] = useState('');
@@ -67,8 +68,8 @@ export function AdminUsers() {
 
   const onAddUser = (data) => {
     const useAD = (data.ad_username || '').trim().length > 0;
-    if (!useAD && (!(data.email || '').trim() || !(data.password || '').trim())) {
-      toast('Email and password are required when not using AD username', 'error');
+    if (!useAD && !(data.email || '').trim()) {
+      toast('Email is required when not using AD username', 'error');
       return;
     }
     if (!(data.full_name || '').trim()) {
@@ -91,8 +92,6 @@ export function AdminUsers() {
     if (phone) payload.phone = phone;
     const eid = (data.employee_id || '').trim();
     if (eid) payload.employee_id = eid;
-    const ec = (data.employee_code || '').trim();
-    if (ec) payload.employee_code = ec;
     const div = (data.division || '').trim();
     if (div) payload.division = div;
     const jt = (data.job_title || '').trim();
@@ -107,7 +106,7 @@ export function AdminUsers() {
       if (email) payload.email = email;
     } else {
       payload.email = (data.email || '').trim();
-      payload.password = data.password || '';
+      payload.password = `Temp#${Date.now()}${Math.floor(Math.random() * 1000)}`;
     }
     api.createUser(payload)
       .then((newUser) => {
@@ -123,6 +122,17 @@ export function AdminUsers() {
     const q = search.toLowerCase();
     return (u.full_name && u.full_name.toLowerCase().includes(q)) || (u.email && u.email.toLowerCase().includes(q));
   });
+  const supervisorOptions = users
+    .filter((u) => u.id !== currentUser?.id)
+    .filter((u) => {
+      const q = supervisorSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        String(u.full_name || '').toLowerCase().includes(q) ||
+        String(u.email || '').toLowerCase().includes(q) ||
+        String(u.role || '').toLowerCase().includes(q)
+      );
+    });
 
   const displayEmail = (email) => String(email || '').replace(/@migrated\./gi, '@imported.');
 
@@ -293,12 +303,6 @@ export function AdminUsers() {
             className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
           />
           <input
-            {...register('password')}
-            type="password"
-            placeholder="Password (required if no AD username)"
-            className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-          />
-          <input
             {...register('full_name', { required: true })}
             type="text"
             placeholder="Full name"
@@ -316,10 +320,17 @@ export function AdminUsers() {
           </select>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Manager (optional)</label>
+            <input
+              type="search"
+              value={supervisorSearch}
+              onChange={(e) => setSupervisorSearch(e.target.value)}
+              placeholder="Search supervisor by name, email, or role"
+              className="w-full mb-2 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
             <select {...register('manager_id')} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
               <option value="">None</option>
-              {users.filter((u) => ['manager', 'hod', 'admin', 'hr'].includes(u.role || '')).map((u) => (
-                <option key={u.id} value={u.id}>{u.full_name} ({u.role})</option>
+              {supervisorOptions.map((u) => (
+                <option key={u.id} value={u.id}>{u.full_name} ({u.role || 'employee'})</option>
               ))}
             </select>
           </div>
@@ -366,15 +377,9 @@ export function AdminUsers() {
               <input {...register('phone')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Optional" />
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Employee ID</label>
-              <input {...register('employee_id')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Staff code</label>
-              <input {...register('employee_code')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
-            </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Employee ID</label>
+            <input {...register('employee_id')} type="text" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
           </div>
           <input {...register('job_title')} type="text" placeholder="Job title (optional)" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
           <input {...register('division')} type="text" placeholder="Division / unit (optional)" className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />

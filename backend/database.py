@@ -592,6 +592,8 @@ def init_db():
                 leave_type_id TEXT NOT NULL REFERENCES leave_types(id),
                 start_date TEXT NOT NULL,
                 end_date TEXT NOT NULL,
+                start_time TEXT,
+                end_time TEXT,
                 days_requested REAL NOT NULL DEFAULT 0,
                 reason TEXT,
                 status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN (
@@ -605,10 +607,31 @@ def init_db():
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS leave_non_working_days (
+                id TEXT PRIMARY KEY,
+                day_date TEXT NOT NULL UNIQUE,
+                name TEXT,
+                created_by TEXT REFERENCES users(id),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         try:
             c.execute("ALTER TABLE leave_requests ADD COLUMN created_by_user_id TEXT REFERENCES users(id)")
         except sqlite3.OperationalError:
             pass
+        c.execute("PRAGMA table_info(leave_requests)")
+        _leave_cols = [row[1] for row in c.fetchall()]
+        if "start_time" not in _leave_cols:
+            try:
+                c.execute("ALTER TABLE leave_requests ADD COLUMN start_time TEXT")
+            except sqlite3.OperationalError:
+                pass
+        if "end_time" not in _leave_cols:
+            try:
+                c.execute("ALTER TABLE leave_requests ADD COLUMN end_time TEXT")
+            except sqlite3.OperationalError:
+                pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS leave_workflow_logs (
                 id TEXT PRIMARY KEY,
@@ -650,6 +673,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_user ON leave_requests(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_status ON leave_requests(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_approver ON leave_requests(current_approver_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leave_non_working_day_date ON leave_non_working_days(day_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_logs_request ON leave_workflow_logs(leave_request_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_status ON leave_balance_adjustments(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_target ON leave_balance_adjustments(target_user_id)")

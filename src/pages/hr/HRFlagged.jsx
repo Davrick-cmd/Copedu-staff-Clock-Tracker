@@ -13,7 +13,7 @@ export function HRFlagged() {
     return d.toISOString().slice(0, 10);
   });
   const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [minLates, setMinLates] = useState(3);
+  const [minLates] = useState(3);
 
   const load = () => {
     setLoading(true);
@@ -30,22 +30,19 @@ export function HRFlagged() {
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
       <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Flagged Staff</h1>
-      <p className="text-gray-600 dark:text-gray-400 text-sm">Staff with 3 or more late clock-ins in the selected period are flagged.</p>
+      <p className="text-gray-600 dark:text-gray-400 text-sm">Employees who are late 3 times or more in the selected period are flagged.</p>
 
       <div className="flex flex-wrap gap-4 items-center">
         <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1 text-gray-900 dark:text-white" />
         <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1 text-gray-900 dark:text-white" />
-        <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
-          Min. lates
-          <input type="number" min={1} value={minLates} onChange={(e) => setMinLates(Number(e.target.value) || 3)} className="w-16 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-gray-900 dark:text-white" />
-        </label>
+        <span className="text-sm text-gray-600 dark:text-gray-400">Late threshold: {minLates} times</span>
         <button type="button" onClick={load} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700">Refresh</button>
       </div>
 
       {loading ? (
         <div className="flex justify-center py-12"><LoadingSpinner size="lg" /></div>
       ) : !list.length ? (
-        <EmptyState title="No flagged staff" message="No one has reached the late threshold in this period." />
+        <EmptyState title="No flagged staff" message="No employee reached 3 late clock-ins in this period." />
       ) : (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
           <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">

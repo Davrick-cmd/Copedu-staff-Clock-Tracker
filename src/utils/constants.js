@@ -58,6 +58,8 @@ export const ROUTES = {
     ANNOUNCEMENTS: '/employee/announcements',
     DOCUMENTS: '/employee/documents',
     APPRAISAL: '/employee/appraisal',
+    APPRAISAL_KPI: '/employee/appraisal/kpi',
+    APPRAISAL_REVIEWS: '/employee/appraisal/reviews',
     LEAVE: '/employee/leave',
     TEAM_LEAVE: '/employee/team-leave',
   },
@@ -93,6 +95,7 @@ export const ROUTES = {
     LEAVE_TYPES: '/admin/leave-types',
   },
   APPRAISAL: {
+    DASHBOARD: '/appraisal/dashboard',
     CYCLES: '/appraisal/cycles',
     STAFF: '/employee/appraisal',
     MANAGER: '/manager/appraisal',

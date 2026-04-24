@@ -22,10 +22,17 @@ export function EmployeeDocuments() {
 
   const refreshCertificates = () => {
     if (!myId) return;
-    api
-      .getStaffDocuments()
-      .then((rows) => setCerts((rows || []).filter((x) => x.kind === 'employee_certificate')))
-      .catch(() => setCerts([]));
+    return api
+      .getStaffDocuments(myId)
+      .then((rows) => {
+        const next = (rows || []).filter((x) => x.kind === 'employee_certificate');
+        setCerts(next);
+        return next;
+      })
+      .catch(() => {
+        setCerts([]);
+        return [];
+      });
   };
 
   useEffect(() => {
@@ -39,7 +46,7 @@ export function EmployeeDocuments() {
     Promise.all([
       api.getHrDocuments().catch(() => []),
       api
-        .getStaffDocuments()
+        .getStaffDocuments(myId)
         .then((rows) => (rows || []).filter((x) => x.kind === 'employee_certificate'))
         .catch(() => []),
     ])
@@ -145,12 +152,25 @@ export function EmployeeDocuments() {
     setCertUploading(true);
     try {
       await api.uploadStaffDocument(certFile, certTitle.trim() || certFile.name, 'employee_certificate', myId);
-      toast('Certificate uploaded. HR and Admin were notified.', 'success');
+      toast('Certificate uploaded. HR was notified, and it now appears in Employee Records documents.', 'success');
       setCertTitle('');
       setCertFile(null);
-      refreshCertificates();
+      await refreshCertificates();
     } catch (err) {
-      toast(err.response?.data?.detail || err.message || 'Upload failed', 'error');
+      const msg = err?.response?.data?.detail || err?.message || 'Upload failed';
+      const looksLikeTimeout = String(msg).toLowerCase().includes('timeout');
+      if (looksLikeTimeout) {
+        const rows = await refreshCertificates();
+        if ((rows || []).length > 0) {
+          toast('Upload finished, but the network response was delayed. Your certificate is saved.', 'success');
+          setCertTitle('');
+          setCertFile(null);
+        } else {
+          toast('Upload is taking longer than expected. Please retry once.', 'error');
+        }
+      } else {
+        toast(msg, 'error');
+      }
     } finally {
       setCertUploading(false);
     }
@@ -215,7 +235,7 @@ export function EmployeeDocuments() {
       <section className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-5 shadow">
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">My certificates</h2>
         <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-          Upload diplomas, licences, or training certificates. HR and Admin receive an in-app alert and email (when outgoing mail is configured).
+          Upload diplomas, licences, or training certificates. HR receives an in-app alert and email (when outgoing mail is configured), and the file appears in Employee Records documents.
         </p>
         <form onSubmit={uploadCert} className="flex flex-col sm:flex-row flex-wrap gap-3 items-end mb-6 pb-6 border-b border-gray-200 dark:border-gray-700">
           <div className="flex-1 min-w-[200px] w-full">
@@ -251,6 +271,7 @@ export function EmployeeDocuments() {
               <li key={d.id} className="py-3 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <p className="font-medium text-gray-900 dark:text-white">{d.title}</p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">{staffFilename(d)}</p>
                   <p className="text-xs text-gray-500 dark:text-gray-400">{formatDateTime(d.created_at)}</p>
                 </div>
                 <div className="flex gap-3 text-sm">
@@ -265,6 +286,9 @@ export function EmployeeDocuments() {
             ))}
           </ul>
         )}
+        <p className="text-xs text-gray-500 dark:text-gray-400 mt-3">
+          Removing a certificate here also removes it from Employee Records documents.
+        </p>
       </section>
     </motion.div>
   );

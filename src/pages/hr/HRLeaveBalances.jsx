@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSelector } from 'react-redux';
+import { addMonths, format, getDay, getDaysInMonth, startOfMonth, subMonths } from 'date-fns';
 import * as api from '../../services/api';
 import { useToast } from '../../hooks/useToast';
 
@@ -39,6 +40,10 @@ export function HRLeaveBalances() {
     reason: '',
   });
   const [newTypeForm, setNewTypeForm] = useState({ code: '', name: '', default_days: '0' });
+  const [holidayRows, setHolidayRows] = useState([]);
+  const [holidayForm, setHolidayForm] = useState({ day_date: '', reason: '' });
+  const [holidayBusy, setHolidayBusy] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
 
   const load = async () => {
     setLoading(true);
@@ -75,6 +80,24 @@ export function HRLeaveBalances() {
   useEffect(() => {
     api.getLeaveTypes().then(setLeaveTypes).catch(() => setLeaveTypes([]));
   }, []);
+
+  const loadHolidayCalendar = async () => {
+    try {
+      const data = await api.getLeaveNonWorkingDays({ year });
+      setHolidayRows(data?.rows || []);
+    } catch {
+      toast('Failed to load HR holiday calendar', 'error');
+    }
+  };
+
+  useEffect(() => {
+    loadHolidayCalendar();
+  }, [year]);
+
+  useEffect(() => {
+    const y = calendarMonth.getFullYear();
+    if (y !== year) setYear(y);
+  }, [calendarMonth]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -322,6 +345,68 @@ export function HRLeaveBalances() {
       setCreatingType(false);
     }
   };
+
+  const addHoliday = async (e) => {
+    e.preventDefault();
+    if (!holidayForm.day_date) {
+      toast('Select a date first', 'error');
+      return;
+    }
+    setHolidayBusy(true);
+    try {
+      await api.createLeaveNonWorkingDay({
+        day_date: holidayForm.day_date,
+        reason: holidayForm.reason,
+      });
+      toast('Holiday/non-working day added', 'success');
+      setHolidayForm({ day_date: '', reason: '' });
+      await loadHolidayCalendar();
+    } catch (e2) {
+      toast(e2?.response?.data?.detail || e2?.message || 'Failed to add holiday', 'error');
+    } finally {
+      setHolidayBusy(false);
+    }
+  };
+
+  const removeHoliday = async (id) => {
+    if (!window.confirm('Remove this non-working day from HR calendar?')) return;
+    setHolidayBusy(true);
+    try {
+      await api.deleteLeaveNonWorkingDay(id);
+      toast('Holiday removed', 'success');
+      await loadHolidayCalendar();
+    } catch (e2) {
+      toast(e2?.response?.data?.detail || e2?.message || 'Failed to remove holiday', 'error');
+    } finally {
+      setHolidayBusy(false);
+    }
+  };
+
+  const holidayByDate = useMemo(() => {
+    const m = new Map();
+    (holidayRows || []).forEach((h) => {
+      const key = String(h.day_date || '').slice(0, 10);
+      if (key) m.set(key, h);
+    });
+    return m;
+  }, [holidayRows]);
+
+  const calendarCells = useMemo(() => {
+    const first = startOfMonth(calendarMonth);
+    const startOffset = getDay(first); // 0=Sun
+    const total = getDaysInMonth(first);
+    const cells = [];
+    for (let i = 0; i < startOffset; i += 1) cells.push(null);
+    for (let d = 1; d <= total; d += 1) {
+      const dt = new Date(first.getFullYear(), first.getMonth(), d);
+      const iso = format(dt, 'yyyy-MM-dd');
+      const isWeekend = dt.getDay() === 0 || dt.getDay() === 6;
+      const holiday = holidayByDate.get(iso) || null;
+      cells.push({ iso, d, isWeekend, holiday });
+    }
+    while (cells.length % 7 !== 0) cells.push(null);
+    return cells;
+  }, [calendarMonth, holidayByDate]);
 
   return (
     <div className="space-y-6">
@@ -571,6 +656,128 @@ export function HRLeaveBalances() {
             </button>
           </div>
         </form>
+      </div>
+
+      <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-5 shadow-sm space-y-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Working-day calendar (HR)</h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+            Weekends are auto non-working. Add government/public holidays here so leave requests exclude them automatically.
+          </p>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            Rwanda known official holidays are auto-seeded yearly. Add EID dates manually each year when announced.
+          </p>
+        </div>
+        <form onSubmit={addHoliday} className="grid gap-4 sm:grid-cols-3 items-end">
+          <div>
+            <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Date</label>
+            <input
+              type="date"
+              value={holidayForm.day_date}
+              onChange={(e) => setHolidayForm((p) => ({ ...p, day_date: e.target.value }))}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Reason *</label>
+            <input
+              type="text"
+              value={holidayForm.reason}
+              onChange={(e) => setHolidayForm((p) => ({ ...p, reason: e.target.value }))}
+              placeholder="e.g. Labour Day (Government holiday)"
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white"
+              required
+            />
+          </div>
+          <div className="flex justify-end">
+            <button type="submit" disabled={holidayBusy} className="px-5 py-2 rounded-lg bg-primary-600 text-white text-sm font-semibold hover:bg-primary-700 disabled:opacity-50">
+              {holidayBusy ? 'Saving…' : 'Add holiday'}
+            </button>
+          </div>
+        </form>
+        <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-900/30 p-3">
+          <div className="flex items-center justify-between mb-3">
+            <button
+              type="button"
+              onClick={() => setCalendarMonth((m) => subMonths(m, 1))}
+              className="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              Prev
+            </button>
+            <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+              {format(calendarMonth, 'MMMM yyyy')}
+            </div>
+            <button
+              type="button"
+              onClick={() => setCalendarMonth((m) => addMonths(m, 1))}
+              className="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              Next
+            </button>
+          </div>
+          <div className="grid grid-cols-7 gap-1 text-[11px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((w) => (
+              <div key={w} className="text-center py-1">{w}</div>
+            ))}
+          </div>
+          <div className="grid grid-cols-7 gap-1">
+            {calendarCells.map((c, i) => {
+              if (!c) return <div key={`empty-${i}`} className="h-16 rounded-lg bg-transparent" />;
+              const isHoliday = !!c.holiday;
+              const base = c.isWeekend
+                ? 'bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400'
+                : 'bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100';
+              const holidayCls = isHoliday
+                ? 'ring-2 ring-rose-400/80 dark:ring-rose-500/70 bg-rose-50 dark:bg-rose-900/25'
+                : '';
+              return (
+                <div key={c.iso} className={`h-16 rounded-lg border border-slate-200 dark:border-slate-700 p-1.5 ${base} ${holidayCls}`} title={c.holiday?.name || (c.isWeekend ? 'Weekend' : 'Working day')}>
+                  <div className="text-xs font-semibold">{c.d}</div>
+                  <div className="mt-1 text-[10px] leading-tight overflow-hidden text-ellipsis whitespace-nowrap">
+                    {isHoliday ? (c.holiday?.name || 'Holiday') : (c.isWeekend ? 'Weekend' : 'Working')}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+            <thead className="bg-gray-50 dark:bg-gray-700">
+              <tr>
+                <th className="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">Date</th>
+                <th className="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">Reason</th>
+                <th className="px-3 py-2 text-left text-xs uppercase text-gray-500 dark:text-gray-300">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+              {holidayRows.map((h) => (
+                <tr key={h.id}>
+                  <td className="px-3 py-2 tabular-nums text-gray-700 dark:text-gray-300">{h.day_date}</td>
+                  <td className="px-3 py-2 text-gray-700 dark:text-gray-300">{h.name || 'Public holiday'}</td>
+                  <td className="px-3 py-2">
+                    <button
+                      type="button"
+                      onClick={() => removeHoliday(h.id)}
+                      disabled={holidayBusy}
+                      className="px-2.5 py-1 rounded border border-red-300 text-red-700 dark:text-red-300 text-xs font-semibold hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
+                    >
+                      Remove
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {!holidayRows.length && (
+                <tr>
+                  <td colSpan={3} className="px-4 py-5 text-center text-sm text-gray-500 dark:text-gray-400">
+                    No holidays added for {year}. Weekends are still automatically excluded.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-5 shadow-sm">

@@ -17,10 +17,10 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
   const toast = useToast();
   const [saving, setSaving] = useState(false);
   const [adLoading, setAdLoading] = useState(false);
+  const [supervisorSearch, setSupervisorSearch] = useState('');
   const [form, setForm] = useState({
     ad_username: '',
     email: '',
-    password: '',
     full_name: '',
     role: 'employee',
     branch_id: '',
@@ -29,13 +29,22 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
     gender: '',
     phone: '',
     employee_id: '',
-    employee_code: '',
     job_title: '',
     division: '',
     work_anniversary: '',
     hr_notes: '',
   });
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const supervisorOptions = users
+    .filter((m) => {
+      const q = supervisorSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        String(m.full_name || '').toLowerCase().includes(q) ||
+        String(m.email || '').toLowerCase().includes(q) ||
+        String(m.role || '').toLowerCase().includes(q)
+      );
+    });
 
   const fetchFromAD = () => {
     const u = (form.ad_username || '').trim();
@@ -61,8 +70,8 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
   const handleSubmit = async (e) => {
     e.preventDefault();
     const useAD = (form.ad_username || '').trim().length > 0;
-    if (!useAD && (!(form.email || '').trim() || !(form.password || '').trim())) {
-      toast('Email and password are required when not using AD', 'error');
+    if (!useAD && !(form.email || '').trim()) {
+      toast('Email is required when not using AD', 'error');
       return;
     }
     if (!(form.full_name || '').trim()) {
@@ -77,7 +86,6 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
         gender: form.gender || undefined,
         phone: form.phone.trim() || undefined,
         employee_id: form.employee_id.trim() || undefined,
-        employee_code: form.employee_code.trim() || undefined,
         job_title: form.job_title.trim() || undefined,
         division: form.division.trim() || undefined,
         work_anniversary: form.work_anniversary.trim() || undefined,
@@ -95,7 +103,7 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
         if (em) payload.email = em;
       } else {
         payload.email = form.email.trim();
-        payload.password = form.password;
+        payload.password = `Temp#${Date.now()}${Math.floor(Math.random() * 1000)}`;
       }
       await api.createUser(payload);
       toast('Employee created', 'success');
@@ -142,13 +150,6 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
             className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
           />
           <input
-            type="password"
-            value={form.password}
-            onChange={(e) => set('password', e.target.value)}
-            placeholder="Password (if no AD)"
-            className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-          />
-          <input
             required
             value={form.full_name}
             onChange={(e) => set('full_name', e.target.value)}
@@ -191,23 +192,13 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
               />
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              {fieldLabel('', 'Employee ID')}
-              <input
-                value={form.employee_id}
-                onChange={(e) => set('employee_id', e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-              />
-            </div>
-            <div>
-              {fieldLabel('', 'Staff code')}
-              <input
-                value={form.employee_code}
-                onChange={(e) => set('employee_code', e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-              />
-            </div>
+          <div>
+            {fieldLabel('', 'Employee ID')}
+            <input
+              value={form.employee_id}
+              onChange={(e) => set('employee_id', e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
           </div>
           <input
             value={form.job_title}
@@ -253,15 +244,22 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
           </div>
           <div>
             {fieldLabel('', 'Supervisor')}
+            <input
+              type="search"
+              value={supervisorSearch}
+              onChange={(e) => setSupervisorSearch(e.target.value)}
+              placeholder="Search all users by name, email, or role"
+              className="w-full mb-2 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
             <select
               value={form.manager_id}
               onChange={(e) => set('manager_id', e.target.value)}
               className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             >
               <option value="">(None)</option>
-              {users.filter((m) => ['manager', 'hod', 'admin', 'hr'].includes(m.role || '')).map((m) => (
+              {supervisorOptions.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.full_name} ({m.role})
+                  {m.full_name} ({m.role || 'employee'})
                 </option>
               ))}
             </select>

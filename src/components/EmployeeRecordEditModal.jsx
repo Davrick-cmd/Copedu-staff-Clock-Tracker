@@ -26,6 +26,7 @@ function fieldLabel(className, text) {
 export function EmployeeRecordEditModal({ user, users, branches, departments = DEPARTMENTS, onClose, onSaved, title = 'Edit employee record' }) {
   const toast = useToast();
   const [saving, setSaving] = useState(false);
+  const [supervisorSearch, setSupervisorSearch] = useState('');
   const [form, setForm] = useState(() => ({
     full_name: user.full_name || '',
     gender: user.gender || '',
@@ -46,6 +47,17 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
   }));
 
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const supervisorOptions = users
+    .filter((m) => m.id !== user.id)
+    .filter((m) => {
+      const q = supervisorSearch.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        String(m.full_name || '').toLowerCase().includes(q) ||
+        String(m.email || '').toLowerCase().includes(q) ||
+        String(m.role || '').toLowerCase().includes(q)
+      );
+    });
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -218,15 +230,22 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
           </div>
           <div>
             {fieldLabel('', 'Supervisor')}
+            <input
+              type="search"
+              value={supervisorSearch}
+              onChange={(e) => setSupervisorSearch(e.target.value)}
+              placeholder="Search all users by name, email, or role"
+              className="w-full mb-2 px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
             <select
               value={form.manager_id}
               onChange={(e) => set('manager_id', e.target.value)}
               className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             >
               <option value="">(None)</option>
-              {users.filter((m) => m.id !== user.id).map((m) => (
+              {supervisorOptions.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.full_name}
+                  {m.full_name} ({m.role || 'employee'})
                 </option>
               ))}
             </select>
