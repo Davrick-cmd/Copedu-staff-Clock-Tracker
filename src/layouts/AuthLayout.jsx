@@ -15,7 +15,7 @@ export function AuthLayout() {
         aria-hidden
       />
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,transparent,rgba(15,23,42,0.85))]" aria-hidden />
-      <div className="relative z-10 min-h-screen flex items-stretch justify-center px-4 py-10 sm:px-6 lg:px-10 lg:py-14">
+      <div className="relative z-10 min-h-screen flex items-stretch justify-center px-4 py-6 sm:px-6 sm:py-8 lg:px-8 lg:py-8">
         <div className="w-full max-w-6xl flex flex-col justify-center">
           <Outlet />
         </div>

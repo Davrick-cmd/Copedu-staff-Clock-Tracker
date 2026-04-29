@@ -412,8 +412,8 @@ export function HRLeaveBalances() {
     <div className="space-y-6">
       <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Leave Balances</h1>
       <p className="text-sm text-gray-600 dark:text-gray-400 max-w-3xl">
-        Numbers come from each employee&apos;s <code className="text-xs bg-gray-100 dark:bg-gray-900 px-1 rounded">leave_balances</code> rows
-        (including data imported from OrangeHRM). They are not recalculated on every page load.
+        Numbers come from each employee&apos;s <code className="text-xs bg-gray-100 dark:bg-gray-900 px-1 rounded">leave_balances</code> rows.
+        They are not recalculated on every page load.
       </p>
       <div className="flex flex-wrap gap-3 items-center">
         <input
@@ -448,7 +448,7 @@ export function HRLeaveBalances() {
         <div>
           <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Request leave entitlement update</h2>
           <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-            Use this when a staff member is missing a leave entitlement or imported allocations need correction. Changes require approval by your assigned supervisor.
+            Use this when a staff member is missing a leave entitlement or allocations need correction. Changes require approval by your assigned supervisor.
           </p>
         </div>
         <form onSubmit={submitAdjustment} className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6 items-end">

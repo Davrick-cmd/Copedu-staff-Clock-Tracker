@@ -12,6 +12,14 @@ export const GENDERS = [
   { value: 'other', label: 'Other' },
   { value: 'prefer_not_say', label: 'Prefer not to say' },
 ];
+const DEFAULT_POSITION_CATEGORIES = [
+  'Officer',
+  'Senior Officer',
+  'Manager',
+  'Head',
+  'Executive Director',
+  'CEO',
+];
 
 function fieldLabel(className, text) {
   return (
@@ -23,7 +31,7 @@ function fieldLabel(className, text) {
  * Full employee profile editor for HR/Admin - updates via PATCH /users/:id/record.
  * Use for promotions, transfers, contact changes, hire dates, etc.
  */
-export function EmployeeRecordEditModal({ user, users, branches, departments = DEPARTMENTS, onClose, onSaved, title = 'Edit employee record' }) {
+export function EmployeeRecordEditModal({ user, users, branches, departments = DEPARTMENTS, employmentTypes = [], categories = DEFAULT_POSITION_CATEGORIES, onClose, onSaved, title = 'Edit employee record' }) {
   const toast = useToast();
   const [saving, setSaving] = useState(false);
   const [supervisorSearch, setSupervisorSearch] = useState('');
@@ -38,6 +46,18 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
     department: user.department || '',
     branch_id: user.branch_id || '',
     manager_id: user.manager_id || '',
+    position_category: user.position_category || '',
+    employment_type: user.employment_type || '',
+    acting_for_user_id: user.acting_for_user_id || '',
+    acting_start_date: user.acting_start_date ? String(user.acting_start_date).slice(0, 10) : '',
+    acting_end_date: user.acting_end_date ? String(user.acting_end_date).slice(0, 10) : '',
+    probation_end_date: user.probation_end_date ? String(user.probation_end_date).slice(0, 10) : '',
+    rssb_number: user.rssb_number || '',
+    national_id_or_passport: user.national_id_or_passport || '',
+    emergency_contact_name: user.emergency_contact_name || '',
+    emergency_contact_phone: user.emergency_contact_phone || '',
+    emergency_contact_relationship: user.emergency_contact_relationship || '',
+    can_assign_shifts: user.can_assign_shifts === 1 || user.can_assign_shifts === true,
     work_anniversary: user.work_anniversary ? String(user.work_anniversary).slice(0, 10) : '',
     date_of_birth: user.date_of_birth ? String(user.date_of_birth).slice(0, 10) : '',
     hr_notes: user.hr_notes || '',
@@ -74,6 +94,18 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
         department: form.department.trim() || null,
         branch_id: form.branch_id || null,
         manager_id: form.manager_id || null,
+        position_category: form.position_category.trim() || null,
+        employment_type: form.employment_type.trim() || null,
+        acting_for_user_id: form.acting_for_user_id || null,
+        acting_start_date: form.acting_start_date.trim() || null,
+        acting_end_date: form.acting_end_date.trim() || null,
+        probation_end_date: form.probation_end_date.trim() || null,
+        rssb_number: form.rssb_number.trim() || null,
+        national_id_or_passport: form.national_id_or_passport.trim() || null,
+        emergency_contact_name: form.emergency_contact_name.trim() || null,
+        emergency_contact_phone: form.emergency_contact_phone.trim() || null,
+        emergency_contact_relationship: form.emergency_contact_relationship.trim() || null,
+        can_assign_shifts: !!form.can_assign_shifts,
         work_anniversary: form.work_anniversary.trim() || null,
         date_of_birth: form.date_of_birth.trim() || null,
         hr_notes: form.hr_notes.trim() || null,
@@ -137,6 +169,32 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
           />
           <div className="grid grid-cols-2 gap-3">
             <div>
+              {fieldLabel('', 'Email')}
+              <input
+                value={user.email || ''}
+                disabled
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
+              />
+            </div>
+            <div>
+              {fieldLabel('', 'AD username')}
+              <input
+                value={user.ad_username || ''}
+                disabled
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
+              />
+            </div>
+          </div>
+          <div>
+            {fieldLabel('', 'Role')}
+            <input
+              value={user.role || ''}
+              disabled
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
               {fieldLabel('', 'Gender')}
               <select
                 value={form.gender}
@@ -170,13 +228,29 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
               />
             </div>
             <div>
-              {fieldLabel('', 'Staff code')}
+              {fieldLabel('', 'RSSB number')}
+              <input
+                value={form.rssb_number}
+                onChange={(e) => set('rssb_number', e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              />
+            </div>
+          </div>
+          <div>
+            {fieldLabel('', 'National ID / Passport')}
+            <input
+              value={form.national_id_or_passport}
+              onChange={(e) => set('national_id_or_passport', e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+          </div>
+          <div>
+            {fieldLabel('', 'Staff code')}
               <input
                 value={form.employee_code}
                 onChange={(e) => set('employee_code', e.target.value)}
                 className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
               />
-            </div>
           </div>
           <div>
             {fieldLabel('', 'Job title')}
@@ -253,6 +327,82 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
               Leave goes to this person first. The next step is always <strong>their</strong> supervisor (your supervisor&apos;s supervisor), and so on until fully approved.
             </p>
           </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              {fieldLabel('', 'Category')}
+              <select
+                value={form.position_category}
+                onChange={(e) => set('position_category', e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="">(Not set)</option>
+                {categories.map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              {fieldLabel('', 'Employment type')}
+              <select
+                value={form.employment_type}
+                onChange={(e) => set('employment_type', e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="">(Not set)</option>
+                {employmentTypes.map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div className="rounded-xl border border-indigo-200 dark:border-indigo-900/50 bg-indigo-50/60 dark:bg-indigo-950/25 p-3 space-y-3">
+            <p className="text-xs font-semibold text-indigo-900 dark:text-indigo-100">Acting assignment</p>
+            <div>
+              <label className="block text-xs font-medium text-indigo-900 dark:text-indigo-100 mb-1">Acting for</label>
+              <select
+                value={form.acting_for_user_id}
+                onChange={(e) => set('acting_for_user_id', e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="">(None)</option>
+                {users.filter((m) => m.id !== user.id).map((m) => (
+                  <option key={m.id} value={m.id}>{m.full_name} ({m.role || 'employee'})</option>
+                ))}
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-indigo-900 dark:text-indigo-100 mb-1">Start date</label>
+                <input type="date" value={form.acting_start_date} onChange={(e) => set('acting_start_date', e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-indigo-900 dark:text-indigo-100 mb-1">End date</label>
+                <input type="date" value={form.acting_end_date} onChange={(e) => set('acting_end_date', e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+              </div>
+            </div>
+          </div>
+          <div className="rounded-xl border border-cyan-200 dark:border-cyan-900/50 bg-cyan-50/60 dark:bg-cyan-950/25 p-3 space-y-2">
+            <p className="text-xs font-semibold text-cyan-900 dark:text-cyan-100">Probation</p>
+            <label className="block text-xs font-medium text-cyan-900 dark:text-cyan-100 mb-1">Probation end date</label>
+            <input type="date" value={form.probation_end_date} onChange={(e) => set('probation_end_date', e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+            {user.probation_end_date && !user.probation_approved_at && (
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await api.approveUserProbation(user.id);
+                    toast('Probation approved and employment type changed to Full time', 'success');
+                    onSaved();
+                  } catch (err) {
+                    toast(err.response?.data?.detail || err.message || 'Approval failed', 'error');
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg bg-cyan-600 text-white text-sm hover:bg-cyan-700"
+              >
+                Approve probation now
+              </button>
+            )}
+          </div>
           <div>
             {fieldLabel('', 'Work anniversary (hire date)')}
             <input
@@ -305,9 +455,44 @@ export function EmployeeRecordEditModal({ user, users, branches, departments = D
                 </select>
               </div>
             </div>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                {fieldLabel('', 'Emergency contact name')}
+                <input
+                  value={form.emergency_contact_name}
+                  onChange={(e) => set('emergency_contact_name', e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                />
+              </div>
+              <div>
+                {fieldLabel('', 'Emergency phone')}
+                <input
+                  value={form.emergency_contact_phone}
+                  onChange={(e) => set('emergency_contact_phone', e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                />
+              </div>
+              <div>
+                {fieldLabel('', 'Relationship')}
+                <input
+                  value={form.emergency_contact_relationship}
+                  onChange={(e) => set('emergency_contact_relationship', e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                />
+              </div>
+            </div>
           </div>
           <div className="rounded-xl border border-rose-200 dark:border-rose-900/50 bg-rose-50/60 dark:bg-rose-950/25 p-3 space-y-2">
             <p className="text-xs font-semibold text-rose-900 dark:text-rose-100">Access status</p>
+            <label className="inline-flex items-center gap-2 text-sm text-rose-900 dark:text-rose-100 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!form.can_assign_shifts}
+                onChange={(e) => set('can_assign_shifts', e.target.checked)}
+                className="rounded border-gray-300"
+              />
+              Can assign shifts (team/department scoped unless HR/Admin)
+            </label>
             <label className="inline-flex items-center gap-2 text-sm text-rose-900 dark:text-rose-100 cursor-pointer">
               <input
                 type="checkbox"

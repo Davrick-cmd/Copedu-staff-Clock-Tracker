@@ -13,6 +13,8 @@ export function HRLeave() {
   const [report, setReport] = useState(null);
   const [commentById, setCommentById] = useState({});
   const [loading, setLoading] = useState(true);
+  const [actingById, setActingById] = useState({});
+  const [remindingById, setRemindingById] = useState({});
 
   const load = async () => {
     setLoading(true);
@@ -37,8 +39,10 @@ export function HRLeave() {
   }, [role]);
 
   const action = async (id, type) => {
+    if (actingById[id]) return;
     const comment = commentById[id] || '';
     try {
+      setActingById((p) => ({ ...p, [id]: type }));
       if (type === 'approve') await api.approveLeaveRequest(id, comment);
       if (type === 'reject') await api.rejectLeaveRequest(id, comment);
       if (type === 'return') await api.returnLeaveRequest(id, comment);
@@ -46,15 +50,29 @@ export function HRLeave() {
       load();
     } catch (err) {
       toast(err?.response?.data?.detail || `Failed to ${type} request`, 'error');
+    } finally {
+      setActingById((p) => {
+        const n = { ...p };
+        delete n[id];
+        return n;
+      });
     }
   };
 
   const remind = async (id) => {
+    if (remindingById[id]) return;
     try {
+      setRemindingById((p) => ({ ...p, [id]: true }));
       await api.remindLeaveApprover(id);
       toast('Reminder sent to current supervisor approver', 'success');
     } catch (err) {
       toast(err?.response?.data?.detail || 'Failed to send reminder', 'error');
+    } finally {
+      setRemindingById((p) => {
+        const n = { ...p };
+        delete n[id];
+        return n;
+      });
     }
   };
 
@@ -159,16 +177,17 @@ export function HRLeave() {
                     type="text"
                     value={commentById[r.id] || ''}
                     onChange={(e) => setCommentById((p) => ({ ...p, [r.id]: e.target.value }))}
+                    disabled={!!actingById[r.id]}
                     className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1"
                     placeholder="Comment"
                   />
                 </td>
                 <td className="px-4 py-2 space-x-2">
-                  <button type="button" onClick={() => action(r.id, 'approve')} className="text-green-600 hover:underline">Approve</button>
-                  <button type="button" onClick={() => action(r.id, 'return')} className="text-amber-600 hover:underline">Return</button>
-                  <button type="button" onClick={() => action(r.id, 'reject')} className="text-red-600 hover:underline">Reject</button>
+                  <button type="button" disabled={!!actingById[r.id]} onClick={() => action(r.id, 'approve')} className="text-green-600 hover:underline disabled:opacity-60 disabled:no-underline">{actingById[r.id] === 'approve' ? 'Approving...' : 'Approve'}</button>
+                  <button type="button" disabled={!!actingById[r.id]} onClick={() => action(r.id, 'return')} className="text-amber-600 hover:underline disabled:opacity-60 disabled:no-underline">{actingById[r.id] === 'return' ? 'Returning...' : 'Return'}</button>
+                  <button type="button" disabled={!!actingById[r.id]} onClick={() => action(r.id, 'reject')} className="text-red-600 hover:underline disabled:opacity-60 disabled:no-underline">{actingById[r.id] === 'reject' ? 'Rejecting...' : 'Reject'}</button>
                   {(role === ROLES.HR || role === ROLES.ADMIN) && (
-                    <button type="button" onClick={() => remind(r.id)} className="text-blue-600 hover:underline">Remind supervisor</button>
+                    <button type="button" disabled={!!remindingById[r.id]} onClick={() => remind(r.id)} className="text-blue-600 hover:underline disabled:opacity-60 disabled:no-underline">{remindingById[r.id] ? 'Sending...' : 'Remind supervisor'}</button>
                   )}
                 </td>
               </tr>

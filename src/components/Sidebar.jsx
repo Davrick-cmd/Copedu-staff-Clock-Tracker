@@ -45,6 +45,7 @@ const hrReportSectionLinks = [
 const hrPrivilegeLinks = [
   { to: ROUTES.HR.ORGANIZATION, label: 'Organization', Icon: Ni.IconBuilding },
   { to: ROUTES.HR.EMPLOYEES, label: 'Employee records', Icon: Ni.IconUsers },
+  { to: ROUTES.HR.SHIFTS, label: 'Shift management', Icon: Ni.IconClock },
   { to: ROUTES.HR.LEAVE_BALANCES, label: 'Leave entitlements', Icon: Ni.IconCalendar },
   { to: ROUTES.HR.FLAGGED, label: 'Flagged attendance', Icon: Ni.IconFlag },
   { to: ROUTES.HR.ANNOUNCEMENTS, label: 'Announcements (HR)', Icon: Ni.IconMegaphone },
@@ -64,6 +65,7 @@ const adminReportLinks = [
 const adminPrivilegeLinks = [
   { to: ROUTES.HR.ORGANIZATION, label: 'Organization', Icon: Ni.IconBuilding },
   { to: ROUTES.ADMIN.USERS, label: 'Employee records', Icon: Ni.IconUsers },
+  { to: ROUTES.HR.SHIFTS, label: 'Shift management', Icon: Ni.IconClock },
   { to: ROUTES.ADMIN.LEAVE_TYPES, label: 'Leave types', Icon: Ni.IconCalendar },
   { to: ROUTES.ADMIN.BRANCHES, label: 'Branches', Icon: Ni.IconBuilding },
   { to: ROUTES.ADMIN.AUDIT, label: 'Audit log', Icon: Ni.IconClipboard },
@@ -162,17 +164,45 @@ export function Sidebar({ open, mobileOpen, onToggle, onMobileClose, onMobileOpe
     return () => window.removeEventListener('module-visibility-updated', onVisibilityUpdated);
   }, []);
   const navConfig = useMemo(() => {
-    if (!hiddenModules.length) return navConfigBase;
+    let dynamicBase = navConfigBase;
+    const allowDelegatedShift = (role === ROLES.MANAGER || role === ROLES.HOD || role === ROLES.EMPLOYEE) && (profile?.can_assign_shifts === 1 || profile?.can_assign_shifts === true);
+    if (allowDelegatedShift) {
+      let added = false;
+      dynamicBase = navConfigBase.map((section) => {
+        if (section.section !== 'Approvals') return section;
+        const hasShiftLink = (section.links || []).some((l) => l.to === ROUTES.HR.SHIFTS);
+        if (hasShiftLink) {
+          added = true;
+          return section;
+        }
+        added = true;
+        return {
+          ...section,
+          links: [...(section.links || []), { to: ROUTES.HR.SHIFTS, label: 'Shift management', Icon: Ni.IconClock }],
+        };
+      });
+      if (!added && dynamicBase.length) {
+        const first = dynamicBase[0];
+        const hasShiftLink = (first.links || []).some((l) => l.to === ROUTES.HR.SHIFTS);
+        if (!hasShiftLink) {
+          dynamicBase = [
+            { ...first, links: [...(first.links || []), { to: ROUTES.HR.SHIFTS, label: 'Shift management', Icon: Ni.IconClock }] },
+            ...dynamicBase.slice(1),
+          ];
+        }
+      }
+    }
+    if (!hiddenModules.length) return dynamicBase;
     const hideSet = new Set(hiddenModules);
     const filterLinks = (links = []) =>
       links.filter((l) => {
         const key = moduleKeyForRoute(l.to);
         return key ? !hideSet.has(key) : true;
       });
-    return navConfigBase
+    return dynamicBase
       .map((section) => ({ ...section, links: filterLinks(section.links) }))
       .filter((section) => section.links.length > 0);
-  }, [navConfigBase, role, hiddenModules]);
+  }, [navConfigBase, role, hiddenModules, profile?.can_assign_shifts]);
   const hasDropdowns = Array.isArray(navConfig) && navConfig.length > 0 && navConfig[0].section;
 
   const [openDropdowns, setOpenDropdowns] = useState(() =>

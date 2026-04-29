@@ -18,6 +18,10 @@ export function HRAnnouncements() {
   const [showInsertLink, setShowInsertLink] = useState(false);
   const [linkText, setLinkText] = useState('');
   const [linkUrl, setLinkUrl] = useState('');
+  const [targetScope, setTargetScope] = useState('all');
+  const [targetValue, setTargetValue] = useState('');
+  const [targetUsersText, setTargetUsersText] = useState('');
+  const [deletingId, setDeletingId] = useState('');
   const bodyRef = useRef(null);
   const bodySelection = useRef({ start: 0, end: 0 });
   const { register, handleSubmit, reset, setValue, getValues } = useForm();
@@ -37,10 +41,18 @@ export function HRAnnouncements() {
       created_by: user?.id,
       priority: data.priority || 'normal',
       deadline_at: deadline ? new Date(deadline).toISOString() : undefined,
+      expires_at: data.expires_at ? new Date(data.expires_at).toISOString() : undefined,
+      is_pinned: !!data.is_pinned,
+      target_scope: targetScope,
+      target_value: targetScope === 'department' || targetScope === 'role' ? targetValue.trim() : undefined,
+      target_user_ids: targetScope === 'users' ? targetUsersText.split(',').map((x) => x.trim()).filter(Boolean) : [],
     })
       .then(() => {
         toast('Announcement published', 'success');
         reset();
+        setTargetScope('all');
+        setTargetValue('');
+        setTargetUsersText('');
         load();
       })
       .catch(() => toast('Failed to publish', 'error'))
@@ -49,7 +61,11 @@ export function HRAnnouncements() {
 
   const handleDelete = (id) => {
     if (!window.confirm('Delete this announcement?')) return;
-    api.deleteAnnouncement(id).then(() => { load(); toast('Deleted', 'success'); }).catch(() => toast('Delete failed', 'error'));
+    setDeletingId(id);
+    api.deleteAnnouncement(id)
+      .then(() => { load(); toast('Deleted', 'success'); })
+      .catch(() => toast('Delete failed', 'error'))
+      .finally(() => setDeletingId(''));
   };
 
   const [receiptsFor, setReceiptsFor] = useState(null);
@@ -138,6 +154,33 @@ export function HRAnnouncements() {
           <option value="high">High</option>
           <option value="urgent">Urgent</option>
         </select>
+        <div className="grid md:grid-cols-3 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Audience</label>
+            <select value={targetScope} onChange={(e) => setTargetScope(e.target.value)} className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">
+              <option value="all">All employees</option>
+              <option value="department">Department</option>
+              <option value="role">Role</option>
+              <option value="users">Specific employees (IDs)</option>
+            </select>
+          </div>
+          {(targetScope === 'department' || targetScope === 'role') && (
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{targetScope === 'department' ? 'Department value' : 'Role value'}</label>
+              <input value={targetValue} onChange={(e) => setTargetValue(e.target.value)} placeholder={targetScope === 'department' ? 'e.g. Finance' : 'e.g. employee'} className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+            </div>
+          )}
+          {targetScope === 'users' && (
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Employee IDs (comma separated)</label>
+              <input value={targetUsersText} onChange={(e) => setTargetUsersText(e.target.value)} placeholder="user_id_1, user_id_2" className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2" />
+            </div>
+          )}
+        </div>
+        <label className="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+          <input type="checkbox" {...register('is_pinned')} className="rounded border-gray-300" />
+          Pin this announcement
+        </label>
         <div>
           <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Deadline (optional)</label>
           <input
@@ -146,6 +189,15 @@ export function HRAnnouncements() {
             className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
           />
           <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Users will see a countdown in red until this date/time.</p>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Expiry (optional)</label>
+          <input
+            type="datetime-local"
+            {...register('expires_at')}
+            className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+          />
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Announcement stops appearing after this date/time.</p>
         </div>
         <button type="submit" disabled={posting} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50">Publish</button>
       </form>
@@ -165,6 +217,9 @@ export function HRAnnouncements() {
               <div className="flex-1 min-w-0">
                 <h3 className="font-semibold text-gray-900 dark:text-white">{a.title}</h3>
                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{formatDateTime(a.published_at)} · {a.users?.full_name || '-'}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                  Audience: {a.target_scope || 'all'}{a.target_value ? ` (${a.target_value})` : ''} {a.is_pinned ? ' · Pinned' : ''} {a.expires_at ? ` · Expires ${formatDateTime(a.expires_at)}` : ''}
+                </p>
                 <p className="mt-2 text-gray-700 dark:text-gray-300 whitespace-pre-wrap"><AnnouncementBody body={a.body} /></p>
                 <p className="mt-2 text-sm font-medium text-primary-600 dark:text-primary-400">
                   Seen by {a.acknowledged_count ?? 0}/{a.total_staff ?? 0} staff
@@ -173,7 +228,14 @@ export function HRAnnouncements() {
                   View who acknowledged
                 </button>
               </div>
-              <button type="button" onClick={() => handleDelete(a.id)} className="text-red-500 hover:text-red-700 text-sm shrink-0">Delete</button>
+              <button
+                type="button"
+                disabled={deletingId === a.id}
+                onClick={() => handleDelete(a.id)}
+                className="text-red-500 hover:text-red-700 text-sm shrink-0 disabled:opacity-60"
+              >
+                {deletingId === a.id ? 'Deleting...' : 'Delete'}
+              </button>
             </motion.div>
           ))}
         </div>

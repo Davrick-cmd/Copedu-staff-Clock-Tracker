@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import * as XLSX from 'xlsx';
 import * as api from '../../services/api';
 import { ROLE_LABELS, DEPARTMENTS, ROLES } from '../../utils/constants';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
@@ -13,7 +14,7 @@ function fieldLabel(className, text) {
   );
 }
 
-function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) {
+function AddEmployeeModal({ users, branches, departments, employmentTypes = [], categories = [], onClose, onCreated }) {
   const toast = useToast();
   const [saving, setSaving] = useState(false);
   const [adLoading, setAdLoading] = useState(false);
@@ -26,9 +27,16 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
     branch_id: '',
     department: '',
     manager_id: '',
+    position_category: '',
+    employment_type: '',
     gender: '',
     phone: '',
     employee_id: '',
+    rssb_number: '',
+    national_id_or_passport: '',
+    emergency_contact_name: '',
+    emergency_contact_phone: '',
+    emergency_contact_relationship: '',
     job_title: '',
     division: '',
     work_anniversary: '',
@@ -83,9 +91,16 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
       const payload = {
         full_name: form.full_name.trim(),
         role: form.role || 'employee',
+        position_category: form.position_category.trim() || undefined,
+        employment_type: form.employment_type.trim() || undefined,
         gender: form.gender || undefined,
         phone: form.phone.trim() || undefined,
         employee_id: form.employee_id.trim() || undefined,
+        rssb_number: form.rssb_number.trim() || undefined,
+        national_id_or_passport: form.national_id_or_passport.trim() || undefined,
+        emergency_contact_name: form.emergency_contact_name.trim() || undefined,
+        emergency_contact_phone: form.emergency_contact_phone.trim() || undefined,
+        emergency_contact_relationship: form.emergency_contact_relationship.trim() || undefined,
         job_title: form.job_title.trim() || undefined,
         division: form.division.trim() || undefined,
         work_anniversary: form.work_anniversary.trim() || undefined,
@@ -200,6 +215,42 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
               className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             />
           </div>
+          <div>
+            {fieldLabel('', 'RSSB number')}
+            <input
+              value={form.rssb_number}
+              onChange={(e) => set('rssb_number', e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+          </div>
+          <div>
+            {fieldLabel('', 'National ID / Passport')}
+            <input
+              value={form.national_id_or_passport}
+              onChange={(e) => set('national_id_or_passport', e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <input
+              value={form.emergency_contact_name}
+              onChange={(e) => set('emergency_contact_name', e.target.value)}
+              placeholder="Emergency contact name"
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+            <input
+              value={form.emergency_contact_phone}
+              onChange={(e) => set('emergency_contact_phone', e.target.value)}
+              placeholder="Emergency phone"
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+            <input
+              value={form.emergency_contact_relationship}
+              onChange={(e) => set('emergency_contact_relationship', e.target.value)}
+              placeholder="Relationship"
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+          </div>
           <input
             value={form.job_title}
             onChange={(e) => set('job_title', e.target.value)}
@@ -212,6 +263,16 @@ function AddEmployeeModal({ users, branches, departments, onClose, onCreated }) 
             placeholder="Division / unit"
             className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
           />
+          <div className="grid grid-cols-2 gap-3">
+            <select value={form.position_category} onChange={(e) => set('position_category', e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+              <option value="">Category (not set)</option>
+              {categories.map((c) => (<option key={c} value={c}>{c}</option>))}
+            </select>
+            <select value={form.employment_type} onChange={(e) => set('employment_type', e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+              <option value="">Employment type (not set)</option>
+              {employmentTypes.map((t) => (<option key={t} value={t}>{t}</option>))}
+            </select>
+          </div>
           <div>
             {fieldLabel('', 'Department')}
             <select
@@ -298,6 +359,8 @@ export function HREmployees() {
   const [users, setUsers] = useState([]);
   const [branches, setBranches] = useState([]);
   const [departmentOptions, setDepartmentOptions] = useState(DEPARTMENTS);
+  const [employmentTypeOptions, setEmploymentTypeOptions] = useState(['Full-time employment', 'Part-time employment', 'Contract employment', 'Internship/Apprenticeship', 'Remote employment', 'Acting']);
+  const [categoryOptions, setCategoryOptions] = useState(['Officer', 'Senior Officer', 'Manager', 'Head', 'Executive Director', 'CEO']);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [updatingId, setUpdatingId] = useState(null);
@@ -305,8 +368,13 @@ export function HREmployees() {
   const [showAdd, setShowAdd] = useState(false);
   const [newDepartment, setNewDepartment] = useState('');
   const [addingDepartment, setAddingDepartment] = useState(false);
+  const [newEmploymentType, setNewEmploymentType] = useState('');
+  const [addingEmploymentType, setAddingEmploymentType] = useState(false);
+  const [newCategory, setNewCategory] = useState('');
+  const [addingCategory, setAddingCategory] = useState(false);
   const [newBranch, setNewBranch] = useState({ name: '', code: '', address: '' });
   const [addingBranch, setAddingBranch] = useState(false);
+  const [bulkUploading, setBulkUploading] = useState(false);
   const toast = useToast();
 
   const load = () => api.getUsers().then(setUsers).catch(() => setUsers([])).finally(() => setLoading(false));
@@ -322,6 +390,12 @@ export function HREmployees() {
   useEffect(() => {
     api.getDepartmentOptions().then(setDepartmentOptions).catch(() => setDepartmentOptions(DEPARTMENTS));
   }, []);
+  useEffect(() => {
+    api.getEmploymentTypeOptions().then((rows) => setEmploymentTypeOptions(rows?.length ? rows : ['Full-time employment', 'Part-time employment', 'Contract employment', 'Internship/Apprenticeship', 'Remote employment', 'Acting'])).catch(() => {});
+  }, []);
+  useEffect(() => {
+    api.getPositionCategoryOptions().then((rows) => setCategoryOptions(rows?.length ? rows : ['Officer', 'Senior Officer', 'Manager', 'Head', 'Executive Director', 'CEO'])).catch(() => {});
+  }, []);
 
   const filtered = users.filter((u) => {
     const q = search.toLowerCase();
@@ -333,7 +407,7 @@ export function HREmployees() {
     );
   });
 
-  const displayEmail = (email) => String(email || '').replace(/@migrated\./gi, '@imported.');
+  const displayEmail = (email) => String(email || '');
 
   const onSupervisorChange = async (employeeId, managerId) => {
     const value = managerId === '' ? null : managerId;
@@ -378,6 +452,76 @@ export function HREmployees() {
       setAddingDepartment(false);
     }
   };
+  const onCreateEmploymentType = async () => {
+    const name = (newEmploymentType || '').trim();
+    if (!name) {
+      toast('Employment type is required', 'error');
+      return;
+    }
+    setAddingEmploymentType(true);
+    try {
+      const res = await api.createEmploymentType(name);
+      setEmploymentTypeOptions(res.rows || employmentTypeOptions);
+      setNewEmploymentType('');
+      toast(res.created ? 'Employment type added' : 'Employment type already exists', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Failed to add employment type', 'error');
+    } finally {
+      setAddingEmploymentType(false);
+    }
+  };
+  const onCreateCategory = async () => {
+    const name = (newCategory || '').trim();
+    if (!name) return toast('Category is required', 'error');
+    setAddingCategory(true);
+    try {
+      const res = await api.createPositionCategory(name);
+      setCategoryOptions(res.rows || categoryOptions);
+      setNewCategory('');
+      toast(res.created ? 'Category added' : 'Category already exists', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Failed to add category', 'error');
+    } finally {
+      setAddingCategory(false);
+    }
+  };
+  const renameOption = async (kind, oldName) => {
+    const next = window.prompt(`Rename "${oldName}" to:`, oldName);
+    if (!next || next.trim() === '' || next.trim() === oldName) return;
+    try {
+      if (kind === 'department') {
+        const res = await api.renameDepartment(oldName, next.trim());
+        setDepartmentOptions(res.rows || []);
+      } else if (kind === 'employment') {
+        const res = await api.renameEmploymentType(oldName, next.trim());
+        setEmploymentTypeOptions(res.rows || []);
+      } else {
+        const res = await api.renamePositionCategory(oldName, next.trim());
+        setCategoryOptions(res.rows || []);
+      }
+      toast('Updated', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Rename failed', 'error');
+    }
+  };
+  const deleteOption = async (kind, name) => {
+    if (!window.confirm(`Delete "${name}"?`)) return;
+    try {
+      if (kind === 'department') {
+        const res = await api.deleteDepartment(name);
+        setDepartmentOptions(res.rows || []);
+      } else if (kind === 'employment') {
+        const res = await api.deleteEmploymentType(name);
+        setEmploymentTypeOptions(res.rows || []);
+      } else {
+        const res = await api.deletePositionCategory(name);
+        setCategoryOptions(res.rows || []);
+      }
+      toast('Deleted', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Delete failed', 'error');
+    }
+  };
 
   const onCreateBranch = async () => {
     const name = (newBranch.name || '').trim();
@@ -404,6 +548,50 @@ export function HREmployees() {
     }
   };
 
+  const downloadAllEmployeeRecords = async () => {
+    try {
+      const res = await api.exportEmployeeRecordsCsv();
+      const csv = String(res?.csv || '');
+      const filename = res?.filename || `employee-records-${new Date().toISOString().slice(0, 10)}.csv`;
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast('Employee records exported', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Failed to export employee records', 'error');
+    }
+  };
+
+  const handleBulkUploadRecords = async (file) => {
+    if (!file) return;
+    setBulkUploading(true);
+    try {
+      let uploadFile = file;
+      const name = String(file.name || '').toLowerCase();
+      if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array' });
+        const sheetName = wb.SheetNames[0];
+        const ws = wb.Sheets[sheetName];
+        const csv = XLSX.utils.sheet_to_csv(ws);
+        uploadFile = new File([csv], `${file.name.replace(/\.(xlsx|xls)$/i, '')}.csv`, { type: 'text/csv' });
+      }
+      const res = await api.bulkUpsertEmployeeRecords(uploadFile);
+      toast(`Bulk upload done. Created: ${res.created || 0}, Updated: ${res.updated || 0}, Failed: ${(res.failed || []).length}`, (res.failed || []).length ? 'warning' : 'success');
+      await load();
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Bulk upload failed', 'error');
+    } finally {
+      setBulkUploading(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex justify-center py-12">
@@ -418,13 +606,36 @@ export function HREmployees() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Employee records</h1>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowAdd(true)}
-          className="shrink-0 px-4 py-2 rounded-xl bg-primary-600 text-white font-medium hover:bg-primary-700"
-        >
-          Add employee
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={downloadAllEmployeeRecords}
+            className="shrink-0 px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 font-medium hover:bg-slate-50 dark:hover:bg-slate-800"
+          >
+            Download all details (CSV)
+          </button>
+          <label className="shrink-0 px-4 py-2 rounded-xl bg-emerald-600 text-white font-medium hover:bg-emerald-700 cursor-pointer">
+            {bulkUploading ? 'Uploading…' : 'Bulk upload (CSV/Excel)'}
+            <input
+              type="file"
+              accept=".csv,.xlsx,.xls"
+              className="hidden"
+              disabled={bulkUploading}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                handleBulkUploadRecords(f);
+                e.target.value = '';
+              }}
+            />
+          </label>
+          <button
+            type="button"
+            onClick={() => setShowAdd(true)}
+            className="shrink-0 px-4 py-2 rounded-xl bg-primary-600 text-white font-medium hover:bg-primary-700"
+          >
+            Add employee
+          </button>
+        </div>
       </div>
       <div className="flex flex-wrap gap-4">
         <input
@@ -435,7 +646,7 @@ export function HREmployees() {
           className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-4 py-2 w-full max-w-md"
         />
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-4 md:grid-cols-4">
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
           <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Add department</h2>
           <div className="flex gap-2">
@@ -453,6 +664,46 @@ export function HREmployees() {
               className="px-3 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
             >
               {addingDepartment ? 'Adding…' : 'Add'}
+            </button>
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Add employment type</h2>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={newEmploymentType}
+              onChange={(e) => setNewEmploymentType(e.target.value)}
+              placeholder="e.g. Contract"
+              className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2"
+            />
+            <button
+              type="button"
+              onClick={onCreateEmploymentType}
+              disabled={addingEmploymentType}
+              className="px-3 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+            >
+              {addingEmploymentType ? 'Adding…' : 'Add'}
+            </button>
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3">
+          <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Add category</h2>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={newCategory}
+              onChange={(e) => setNewCategory(e.target.value)}
+              placeholder="e.g. Director"
+              className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2"
+            />
+            <button
+              type="button"
+              onClick={onCreateCategory}
+              disabled={addingCategory}
+              className="px-3 py-2 rounded-lg bg-primary-600 text-white text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+            >
+              {addingCategory ? 'Adding…' : 'Add'}
             </button>
           </div>
         </div>
@@ -490,6 +741,50 @@ export function HREmployees() {
             >
               {addingBranch ? 'Creating…' : 'Create branch'}
             </button>
+          </div>
+        </div>
+      </div>
+      <div className="grid gap-4 md:grid-cols-3">
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-3">Departments</h3>
+          <div className="space-y-2 max-h-44 overflow-auto pr-1">
+            {departmentOptions.map((name) => (
+              <div key={`d-${name}`} className="flex items-center justify-between rounded-lg border border-gray-200 dark:border-gray-700 px-2 py-1">
+                <span className="text-sm text-gray-800 dark:text-gray-200">{name}</span>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => renameOption('department', name)} className="text-xs text-blue-600">Edit</button>
+                  <button type="button" onClick={() => deleteOption('department', name)} className="text-xs text-rose-600">Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-3">Employment types</h3>
+          <div className="space-y-2 max-h-44 overflow-auto pr-1">
+            {employmentTypeOptions.map((name) => (
+              <div key={`e-${name}`} className="flex items-center justify-between rounded-lg border border-gray-200 dark:border-gray-700 px-2 py-1">
+                <span className="text-sm text-gray-800 dark:text-gray-200">{name}</span>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => renameOption('employment', name)} className="text-xs text-blue-600">Edit</button>
+                  <button type="button" onClick={() => deleteOption('employment', name)} className="text-xs text-rose-600">Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4">
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-3">Categories</h3>
+          <div className="space-y-2 max-h-44 overflow-auto pr-1">
+            {categoryOptions.map((name) => (
+              <div key={`c-${name}`} className="flex items-center justify-between rounded-lg border border-gray-200 dark:border-gray-700 px-2 py-1">
+                <span className="text-sm text-gray-800 dark:text-gray-200">{name}</span>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => renameOption('category', name)} className="text-xs text-blue-600">Edit</button>
+                  <button type="button" onClick={() => deleteOption('category', name)} className="text-xs text-rose-600">Delete</button>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -592,12 +887,14 @@ export function HREmployees() {
             users={users}
             branches={branches}
             departments={departmentOptions}
+            employmentTypes={employmentTypeOptions}
+            categories={categoryOptions}
             onClose={() => setEditUser(null)}
             onSaved={load}
           />
         )}
         {showAdd && (
-          <AddEmployeeModal users={users} branches={branches} departments={departmentOptions} onClose={() => setShowAdd(false)} onCreated={load} />
+          <AddEmployeeModal users={users} branches={branches} departments={departmentOptions} employmentTypes={employmentTypeOptions} categories={categoryOptions} onClose={() => setShowAdd(false)} onCreated={load} />
         )}
       </AnimatePresence>
     </motion.div>

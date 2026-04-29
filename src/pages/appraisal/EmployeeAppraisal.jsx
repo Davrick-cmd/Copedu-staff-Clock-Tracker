@@ -145,15 +145,29 @@ export function EmployeeAppraisal() {
   const [annualTitlesWithItems, setAnnualTitlesWithItems] = useState([]);
   const [newTitleName, setNewTitleName] = useState('');
   const [newItemByTitle, setNewItemByTitle] = useState({});
+  const [editingAnnualItemId, setEditingAnnualItemId] = useState(null);
+  const [editingAnnualItemForm, setEditingAnnualItemForm] = useState({ description: '', weight: '', target: '' });
   const [scoreRows, setScoreRows] = useState({});
   const [savingScores, setSavingScores] = useState(false);
   const [apNarrative, setApNarrative] = useState({ achievements: '', challenges: '', overall_comments: '' });
   const [confirmAgreeing, setConfirmAgreeing] = useState(false);
   const [downloadingSummary, setDownloadingSummary] = useState(false);
+  const [downloadingQuarterById, setDownloadingQuarterById] = useState({});
   const [signUploading, setSignUploading] = useState(false);
   const [downloadingKpiCsv, setDownloadingKpiCsv] = useState(false);
   const [importingKpiCsv, setImportingKpiCsv] = useState(false);
   const location = useLocation();
+
+  const calcFormulaWeightedScore = (agreedPct, plannedPct, weightPct) => {
+    const agreed = Number(agreedPct);
+    const planned = Number(plannedPct);
+    const weight = Number(weightPct);
+    if (Number.isNaN(agreed) || Number.isNaN(planned) || Number.isNaN(weight) || planned <= 0 || weight < 0) return null;
+    const ratio = agreed / planned;
+    const cappedRatio = ratio > 1 ? 1 : ratio;
+    const score = cappedRatio * weight;
+    return Math.round(score * 100) / 100;
+  };
 
   const load = () => {
     api.getAppraisalDashboardStaff()
@@ -500,6 +514,18 @@ export function EmployeeAppraisal() {
     }
   };
 
+  const saveSelfScores = async (appraisalId, scores, rowsByKpiId) => {
+    for (const s of scores || []) {
+      const kid = s.kpi_item_id;
+      const r = rowsByKpiId[kid] || {};
+      const v = r.self_score === '' || r.self_score === null ? null : Number(r.self_score);
+      if (v != null && (Number.isNaN(v) || v < 0 || v > 100)) {
+        throw new Error('Self % must be between 0 and 100');
+      }
+      await api.updateAppraisalScore(appraisalId, kid, { self_score: v, self_comment: r.self_comment || null });
+    }
+  };
+
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -667,27 +693,127 @@ export function EmployeeAppraisal() {
                                 const targetPct = raw != null
                                   ? (typeof raw === 'number' ? raw : parseFloat(String(raw).replace(/%/g, '')))
                                   : null;
+                                const isEditingRow = editingAnnualItemId === i.id;
                                 return (
                                   <tr key={i.id} className="border-b border-slate-200 dark:border-slate-600 bg-white dark:bg-gray-800">
-                                    <td className="px-4 py-3 text-gray-800 dark:text-gray-200 align-top">{i.description}</td>
-                                    <td className="px-3 py-3 text-center tabular-nums text-gray-700 dark:text-gray-300">{i.weight != null ? `${Number(i.weight)}` : '—'}</td>
-                                    <td className="px-3 py-3 text-center tabular-nums text-gray-700 dark:text-gray-300">{targetPct != null && !Number.isNaN(targetPct) ? `${targetPct}` : '—'}</td>
+                                    <td className="px-4 py-3 text-gray-800 dark:text-gray-200 align-top">
+                                      {isEditingRow ? (
+                                        <input
+                                          type="text"
+                                          value={editingAnnualItemForm.description}
+                                          onChange={(e) => setEditingAnnualItemForm((p) => ({ ...p, description: e.target.value }))}
+                                          className="w-full px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
+                                        />
+                                      ) : i.description}
+                                    </td>
+                                    <td className="px-3 py-3 text-center tabular-nums text-gray-700 dark:text-gray-300">
+                                      {isEditingRow ? (
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          max={100}
+                                          step={0.5}
+                                          value={editingAnnualItemForm.weight}
+                                          onChange={(e) => setEditingAnnualItemForm((p) => ({ ...p, weight: e.target.value }))}
+                                          className="w-20 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-center"
+                                        />
+                                      ) : (i.weight != null ? `${Number(i.weight)}` : '—')}
+                                    </td>
+                                    <td className="px-3 py-3 text-center tabular-nums text-gray-700 dark:text-gray-300">
+                                      {isEditingRow ? (
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          max={100}
+                                          step={0.5}
+                                          value={editingAnnualItemForm.target}
+                                          onChange={(e) => setEditingAnnualItemForm((p) => ({ ...p, target: e.target.value }))}
+                                          className="w-20 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-center"
+                                        />
+                                      ) : (targetPct != null && !Number.isNaN(targetPct) ? `${targetPct}` : '—')}
+                                    </td>
                                     {canEdit ? (
                                       <td className="px-2 py-3 text-right">
-                                        <button
-                                          type="button"
-                                          className="text-red-600 dark:text-red-400 text-xs hover:underline"
-                                          onClick={async () => {
-                                            try {
-                                              await api.deleteKpiItem(i.id);
-                                              await refreshAnnualItems();
-                                            } catch (e) {
-                                              toast(e.response?.data?.detail || 'Delete failed', 'error');
-                                            }
-                                          }}
-                                        >
-                                          Delete
-                                        </button>
+                                        {isEditingRow ? (
+                                          <div className="flex items-center justify-end gap-2">
+                                            <button
+                                              type="button"
+                                              className="text-xs text-gray-600 dark:text-gray-300 hover:underline"
+                                              onClick={() => {
+                                                setEditingAnnualItemId(null);
+                                                setEditingAnnualItemForm({ description: '', weight: '', target: '' });
+                                              }}
+                                            >
+                                              Cancel
+                                            </button>
+                                            <button
+                                              type="button"
+                                              className="text-xs text-primary-600 dark:text-primary-400 hover:underline"
+                                              onClick={async () => {
+                                                const weight = Number(editingAnnualItemForm.weight);
+                                                const target = Number(editingAnnualItemForm.target);
+                                                if (!(editingAnnualItemForm.description || '').trim()) {
+                                                  toast('KPI wording is required', 'error');
+                                                  return;
+                                                }
+                                                if (Number.isNaN(weight) || weight < 0 || weight > 100) {
+                                                  toast('KPI weighting must be 0-100%', 'error');
+                                                  return;
+                                                }
+                                                if (Number.isNaN(target) || target < 0 || target > 100) {
+                                                  toast('Expected results must be 0-100%', 'error');
+                                                  return;
+                                                }
+                                                try {
+                                                  await api.updateKpiItem(i.id, {
+                                                    description: editingAnnualItemForm.description.trim(),
+                                                    weight,
+                                                    target,
+                                                  });
+                                                  setEditingAnnualItemId(null);
+                                                  setEditingAnnualItemForm({ description: '', weight: '', target: '' });
+                                                  await refreshAnnualItems();
+                                                  toast('KPI line updated', 'success');
+                                                } catch (e) {
+                                                  toast(e.response?.data?.detail || 'Update failed', 'error');
+                                                }
+                                              }}
+                                            >
+                                              Save
+                                            </button>
+                                          </div>
+                                        ) : (
+                                          <div className="flex items-center justify-end gap-2">
+                                            <button
+                                              type="button"
+                                              className="text-primary-600 dark:text-primary-400 text-xs hover:underline"
+                                              onClick={() => {
+                                                setEditingAnnualItemId(i.id);
+                                                setEditingAnnualItemForm({
+                                                  description: i.description || '',
+                                                  weight: i.weight != null ? String(i.weight) : '',
+                                                  target: targetPct != null && !Number.isNaN(targetPct) ? String(targetPct) : '',
+                                                });
+                                              }}
+                                            >
+                                              Edit
+                                            </button>
+                                            <button
+                                              type="button"
+                                              className="text-red-600 dark:text-red-400 text-xs hover:underline"
+                                              onClick={async () => {
+                                                try {
+                                                  await api.deleteKpiItem(i.id);
+                                                  await refreshAnnualItems();
+                                                } catch (e) {
+                                                  toast(e.response?.data?.detail || 'Delete failed', 'error');
+                                                }
+                                              }}
+                                            >
+                                              Delete
+                                            </button>
+                                          </div>
+                                        )}
                                       </td>
                                     ) : null}
                                   </tr>
@@ -868,7 +994,32 @@ export function EmployeeAppraisal() {
                     <span className="font-semibold text-gray-800 dark:text-white text-base">{a.year}</span>
                     <span className="text-base text-gray-600 dark:text-gray-400">{(a.total_weight ?? 0)}%</span>
                     <span className={`px-3 py-1 rounded-md text-sm font-medium ${STATUS_BADGE_CLASS[a.status] || 'bg-gray-100 dark:bg-gray-600'}`}>{STATUS_LABELS[a.status] || a.status}</span>
-                    <button type="button" onClick={() => setSelectedAnnualId(a.id)} className="text-primary-600 dark:text-primary-400 hover:underline text-base font-medium">Open</button>
+                    <div className="flex items-center gap-4">
+                      {['draft', 'returned_supervisor', 'returned_hod'].includes(String(a.status || '')) ? (
+                        <button
+                          type="button"
+                          className="text-red-600 dark:text-red-400 hover:underline text-sm font-medium"
+                          onClick={async () => {
+                            const ok = window.confirm(`Delete KPI plan for ${a.year}? This cannot be undone.`);
+                            if (!ok) return;
+                            try {
+                              await api.deleteAnnualKpi(a.id);
+                              toast('Annual KPI deleted', 'success');
+                              if (selectedAnnualId === a.id) {
+                                setSelectedAnnualId(null);
+                                setAnnualDetail(null);
+                              }
+                              loadAnnualKpis();
+                            } catch (err) {
+                              toast(err.response?.data?.detail || 'Failed to delete annual KPI', 'error');
+                            }
+                          }}
+                        >
+                          Delete
+                        </button>
+                      ) : null}
+                      <button type="button" onClick={() => setSelectedAnnualId(a.id)} className="text-primary-600 dark:text-primary-400 hover:underline text-base font-medium">Open</button>
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -1080,13 +1231,43 @@ export function EmployeeAppraisal() {
                     {STATUS_LABELS[row.appraisal.status] || row.appraisal.status}
                   </p>
                   <div>
-                    <button
-                      type="button"
-                      onClick={() => { setSelectedAppraisalId(row.appraisal.id); setSelectedAppraisalRow(row.appraisal); }}
-                      className="text-xs text-primary-600 dark:text-primary-400 hover:underline"
-                    >
-                      Open {row.quarter}
-                    </button>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => { setSelectedAppraisalId(row.appraisal.id); setSelectedAppraisalRow(row.appraisal); }}
+                        className="text-xs text-primary-600 dark:text-primary-400 hover:underline"
+                      >
+                        Open {row.quarter}
+                      </button>
+                      <button
+                        type="button"
+                        className="text-xs text-gray-700 dark:text-gray-300 hover:underline disabled:opacity-50"
+                        disabled={!!downloadingQuarterById[row.appraisal.id]}
+                        onClick={async () => {
+                          const appraisalId = row.appraisal.id;
+                          setDownloadingQuarterById((p) => ({ ...p, [appraisalId]: true }));
+                          try {
+                            const blob = await api.fetchAppraisalAgreedSummaryBlob(appraisalId);
+                            const url = window.URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            const q = row.appraisal?.quarter || row.quarter || 'quarter';
+                            a.href = url;
+                            a.download = `appraisal-${row.appraisal?.year || appraisalYear}-${q}.html`;
+                            document.body.appendChild(a);
+                            a.click();
+                            a.remove();
+                            window.URL.revokeObjectURL(url);
+                            toast(`${row.quarter} appraisal downloaded`, 'success');
+                          } catch (e) {
+                            toast(e?.response?.data?.detail || 'Failed to download appraisal', 'error');
+                          } finally {
+                            setDownloadingQuarterById((p) => ({ ...p, [appraisalId]: false }));
+                          }
+                        }}
+                      >
+                        {downloadingQuarterById[row.appraisal.id] ? 'Downloading…' : 'Download'}
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1157,10 +1338,11 @@ export function EmployeeAppraisal() {
                     <tr className="border-b border-gray-200 dark:border-gray-600">
                       <th className="text-left py-2 text-gray-700 dark:text-gray-300">KPI (from locked annual contract)</th>
                       <th className="text-center py-2 text-gray-700 dark:text-gray-300">Weight %</th>
-                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Self %</th>
-                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Supervisor %</th>
-                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Agreed %</th>
-                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Weighted</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Results (evaluated by employee)</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Results (reviewed)</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Agreed notes</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Formula</th>
+                      <th className="text-center py-2 text-gray-700 dark:text-gray-300">Score</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1168,6 +1350,7 @@ export function EmployeeAppraisal() {
                       const kid = s.kpi_item_id;
                       const row = scoreRows[kid] || { self_score: '', self_comment: '' };
                       const canEditSelf = ((appraisalDetail.status || '') === 'draft' || (appraisalDetail.status || '') === 'returned') && isActive;
+                      const formulaWeighted = calcFormulaWeightedScore(s.agreed_score, Number(s.target), Number(s.weight));
                       return (
                         <tr key={s.id} className="border-b border-gray-100 dark:border-gray-700 align-top">
                           <td className="py-2 text-gray-800 dark:text-gray-200 max-w-[200px]">{s.description} — {s.target}</td>
@@ -1189,7 +1372,12 @@ export function EmployeeAppraisal() {
                           </td>
                           <td className="py-2 text-center tabular-nums">{s.supervisor_score != null ? s.supervisor_score : '—'}</td>
                           <td className="py-2 text-center tabular-nums">{s.agreed_score != null ? s.agreed_score : '—'}</td>
-                          <td className="py-2 text-center text-gray-600 dark:text-gray-400 tabular-nums">{s.weighted_score != null ? `${s.weighted_score}%` : '—'}</td>
+                          <td className="py-2 text-center text-gray-600 dark:text-gray-400 tabular-nums">
+                            {s.target != null ? 'IF(Agreed/Planned<=100%,(Agreed/Planned)*Weight,Weight)' : '—'}
+                          </td>
+                          <td className="py-2 text-center text-gray-600 dark:text-gray-400 tabular-nums">
+                            {formulaWeighted != null ? `${formulaWeighted}%` : (s.weighted_score != null ? `${s.weighted_score}%` : '—')}
+                          </td>
                         </tr>
                       );
                     })}
@@ -1202,17 +1390,7 @@ export function EmployeeAppraisal() {
                     onClick={async () => {
                       setSavingScores(true);
                       try {
-                        for (const s of appraisalDetail.scores) {
-                          const kid = s.kpi_item_id;
-                          const r = scoreRows[kid] || {};
-                          const v = r.self_score === '' || r.self_score === null ? null : Number(r.self_score);
-                          if (v != null && (Number.isNaN(v) || v < 0 || v > 100)) {
-                            toast('Self % must be between 0 and 100', 'error');
-                            setSavingScores(false);
-                            return;
-                          }
-                          await api.updateAppraisalScore(selectedAppraisalId, kid, { self_score: v, self_comment: r.self_comment || null });
-                        }
+                        await saveSelfScores(selectedAppraisalId, appraisalDetail.scores, scoreRows);
                         toast('Self scores saved', 'success');
                         const d = await api.getAppraisal(selectedAppraisalId);
                         setAppraisalDetail(d);
@@ -1240,8 +1418,9 @@ export function EmployeeAppraisal() {
                 onClick={async () => {
                   setSavingScores(true);
                   try {
+                    await saveSelfScores(selectedAppraisalId, appraisalDetail.scores, scoreRows);
                     await api.submitAppraisal(selectedAppraisalId);
-                    toast('Submitted to your supervisor', 'success');
+                    toast('Appraisal submitted', 'success');
                     const d = await api.getAppraisal(selectedAppraisalId);
                     setAppraisalDetail(d);
                     load();
@@ -1253,13 +1432,13 @@ export function EmployeeAppraisal() {
                 }}
                 className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm hover:bg-primary-700 disabled:opacity-50"
               >
-                Submit appraisal to supervisor
+                Submit appraisal
               </button>
             )}
 
             {(appraisalDetail.status || '') === 'verified' && (appraisalDetail.scores || []).length > 0 && !appraisalDetail.employee_agreed_scores_at && (
               <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 p-4 space-y-2">
-                <p className="text-sm text-gray-800 dark:text-gray-200">Your manager has completed the review chain. Confirm that you agree with the <strong>Agreed %</strong> on every line (your manager must fill them all first).</p>
+                <p className="text-sm text-gray-800 dark:text-gray-200">Review is complete. Confirm that you agree with the <strong>Agreed %</strong> on every line (all agreed values must be filled first).</p>
                 <button
                   type="button"
                   disabled={confirmAgreeing}
@@ -1267,7 +1446,7 @@ export function EmployeeAppraisal() {
                     setConfirmAgreeing(true);
                     try {
                       await api.confirmAppraisalAgreedScores(selectedAppraisalId);
-                      toast('Agreement recorded. HOD/HR can now approve.', 'success');
+                      toast('Agreement recorded. Appraisal can now proceed for approval.', 'success');
                       const d = await api.getAppraisal(selectedAppraisalId);
                       setAppraisalDetail(d);
                       load();

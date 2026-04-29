@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useSelector } from 'react-redux';
 import { useForm } from 'react-hook-form';
 import { motion } from 'framer-motion';
+import * as XLSX from 'xlsx';
 import * as api from '../../services/api';
 import { createAuditLog } from '../../services/api';
 import { LoadingSpinner } from '../../components/LoadingSpinner';
@@ -134,7 +135,7 @@ export function AdminUsers() {
       );
     });
 
-  const displayEmail = (email) => String(email || '').replace(/@migrated\./gi, '@imported.');
+  const displayEmail = (email) => String(email || '');
 
   const setRole = (userId, role) => {
     api.setUserRole(userId, role)
@@ -194,6 +195,56 @@ export function AdminUsers() {
       .finally(() => { setBulkUploading(false); setBulkFile(null); });
   };
 
+  const downloadAllEmployeeRecords = async () => {
+    try {
+      const res = await api.exportEmployeeRecordsCsv();
+      const csv = String(res?.csv || '');
+      const filename = res?.filename || `employee-records-${new Date().toISOString().slice(0, 10)}.csv`;
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast('Employee records exported', 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || 'Failed to export employee records', 'error');
+    }
+  };
+
+  const onBulkUpsertRecords = async () => {
+    if (!bulkFile) {
+      toast('Choose a CSV or Excel file first', 'error');
+      return;
+    }
+    setBulkUploading(true);
+    setBulkResult(null);
+    try {
+      let uploadFile = bulkFile;
+      const name = String(bulkFile.name || '').toLowerCase();
+      if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+        const buf = await bulkFile.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const csv = XLSX.utils.sheet_to_csv(ws);
+        uploadFile = new File([csv], `${bulkFile.name.replace(/\.(xlsx|xls)$/i, '')}.csv`, { type: 'text/csv' });
+      }
+      const res = await api.bulkUpsertEmployeeRecords(uploadFile);
+      setBulkResult(res);
+      await loadUsers();
+      toast(`Created ${res.created || 0}, updated ${res.updated || 0}, failed ${res.failed?.length || 0}`, (res.failed?.length || 0) ? 'warning' : 'success');
+    } catch (e) {
+      toast(e?.response?.data?.detail || e.message || 'Bulk upload failed', 'error');
+      setBulkResult(null);
+    } finally {
+      setBulkUploading(false);
+      setBulkFile(null);
+    }
+  };
+
   if (loading) return <div className="flex justify-center py-12"><LoadingSpinner size="lg" /></div>;
 
   return (
@@ -231,38 +282,42 @@ export function AdminUsers() {
           onClick={() => setShowBulkImport((v) => !v)}
           className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
         >
-          {showBulkImport ? 'Cancel' : 'Bulk import (CSV)'}
+          {showBulkImport ? 'Cancel' : 'Bulk upload/export records'}
+        </button>
+        <button
+          type="button"
+          onClick={downloadAllEmployeeRecords}
+          className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"
+        >
+          Download all details (CSV)
         </button>
       </div>
 
       {showBulkImport && (
         <div className="bg-white dark:bg-gray-800 rounded-xl shadow p-4 space-y-3 max-w-lg">
-          <h2 className="font-semibold text-gray-800 dark:text-white">Bulk import users from CSV</h2>
+          <h2 className="font-semibold text-gray-800 dark:text-white">Bulk upload employee records (full details)</h2>
           <p className="text-sm text-gray-500 dark:text-gray-400">
-            Upload a CSV with columns: <strong>username</strong> (AD sAMAccountName), <strong>role</strong> (admin, hr, employee). Optional: full_name, email, department, branch (branch name or code).
+            First click <strong>Download all details (CSV)</strong>, update rows in Excel, then upload CSV or Excel here.
           </p>
-          <a href="/users-bulk-import-sample.csv" download="users-bulk-import-sample.csv" className="inline-block text-sm text-primary-600 dark:text-primary-400 hover:underline">
-            Download sample CSV
-          </a>
           <div className="flex flex-wrap gap-2 items-center">
             <input
               type="file"
-              accept=".csv"
+              accept=".csv,.xlsx,.xls"
               onChange={(e) => { setBulkFile(e.target.files?.[0] || null); setBulkResult(null); }}
               className="text-sm text-gray-700 dark:text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:bg-primary-600 file:text-white"
             />
             <button
               type="button"
-              onClick={onBulkImport}
+              onClick={onBulkUpsertRecords}
               disabled={bulkUploading || !bulkFile}
               className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {bulkUploading ? 'Importing…' : 'Upload & import'}
+              {bulkUploading ? 'Uploading…' : 'Upload & apply'}
             </button>
           </div>
           {bulkResult && (
             <div className="text-sm border border-gray-200 dark:border-gray-600 rounded-lg p-3">
-              <p className="font-medium text-gray-800 dark:text-white">Created: {bulkResult.created} · Failed: {bulkResult.failed?.length ?? 0}</p>
+              <p className="font-medium text-gray-800 dark:text-white">Created: {bulkResult.created || 0} · Updated: {bulkResult.updated || 0} · Failed: {bulkResult.failed?.length ?? 0}</p>
               {bulkResult.failed?.length > 0 && (
                 <ul className="mt-2 text-red-600 dark:text-red-400 list-disc list-inside">
                   {bulkResult.failed.slice(0, 5).map((f, i) => (

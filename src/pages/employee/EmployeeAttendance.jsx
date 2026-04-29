@@ -67,6 +67,8 @@ export function EmployeeAttendance() {
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Clock In</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Clock Out</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Duration</th>
+                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Late (min)</th>
+                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Overtime (min)</th>
                   <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
                 </tr>
               </thead>
@@ -77,6 +79,8 @@ export function EmployeeAttendance() {
                     <td className="px-4 py-2">{formatTime(log.clock_in_at)}</td>
                     <td className="px-4 py-2">{log.clock_out_at ? formatTime(log.clock_out_at) : '-'}</td>
                     <td className="px-4 py-2">{formatDuration(log.total_minutes)}</td>
+                    <td className="px-4 py-2">{Number(log.late_minutes || 0)}</td>
+                    <td className="px-4 py-2">{Number(log.overtime_minutes || 0)}</td>
                     <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded text-xs ${log.status === 'late' ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300' : 'bg-gray-100 dark:bg-gray-700'}`}>{log.status || 'present'}</span></td>
                   </tr>
                 ))}

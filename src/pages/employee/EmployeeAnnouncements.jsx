@@ -13,12 +13,21 @@ export function EmployeeAnnouncements() {
   const [list, setList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [acking, setAcking] = useState(null);
+  const [commentDraft, setCommentDraft] = useState({});
+  const [commenting, setCommenting] = useState(null);
 
   const load = () => api.getAnnouncements(false).then(setList).catch(() => setList([]));
 
   useEffect(() => {
     load().finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    // Mark all currently visible announcements as read.
+    list.forEach((a) => {
+      if (!a.read_by_me) api.readAnnouncement(a.id).catch(() => {});
+    });
+  }, [list]);
 
   const handleAcknowledge = (a) => {
     setAcking(a.id);
@@ -50,6 +59,12 @@ export function EmployeeAnnouncements() {
             >
               <h2 className="font-semibold text-gray-900 dark:text-white">{a.title}</h2>
               <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{formatDateTime(a.published_at)} {a.users?.full_name && ` · ${a.users.full_name}`}</p>
+              <div className="mt-1 flex items-center gap-2">
+                {a.is_pinned ? <span className="text-[11px] px-2 py-0.5 rounded bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300">Pinned</span> : null}
+                <span className={`text-[11px] px-2 py-0.5 rounded ${a.read_by_me ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                  {a.read_by_me ? 'Read' : 'Unread'}
+                </span>
+              </div>
               {a.deadline_at && (
                 <div className="mt-2">
                   <AnnouncementCountdown deadlineAt={a.deadline_at} />
@@ -69,6 +84,42 @@ export function EmployeeAnnouncements() {
                     {acking === a.id ? '…' : 'Acknowledge'}
                   </button>
                 )}
+              </div>
+              <div className="mt-4 border-t border-gray-200 dark:border-gray-700 pt-3 space-y-2">
+                <p className="text-xs font-semibold text-gray-600 dark:text-gray-300">Comments / Feedback</p>
+                {(a.comments || []).slice(0, 5).map((c) => (
+                  <div key={c.id} className="text-sm">
+                    <span className="font-medium text-gray-800 dark:text-gray-100">{c.user_name || c.user_email || 'Staff'}:</span>{' '}
+                    <span className="text-gray-700 dark:text-gray-300">{c.comment}</span>
+                  </div>
+                ))}
+                <div className="flex items-center gap-2">
+                  <input
+                    value={commentDraft[a.id] || ''}
+                    onChange={(e) => setCommentDraft((p) => ({ ...p, [a.id]: e.target.value }))}
+                    placeholder="Write feedback..."
+                    className="flex-1 px-3 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm"
+                  />
+                  <button
+                    type="button"
+                    disabled={commenting === a.id}
+                    onClick={() => {
+                      const text = (commentDraft[a.id] || '').trim();
+                      if (!text) return;
+                      setCommenting(a.id);
+                      api.addAnnouncementComment(a.id, text)
+                        .then((created) => {
+                          setList((prev) => prev.map((x) => (x.id === a.id ? { ...x, comments: [created, ...(x.comments || [])] } : x)));
+                          setCommentDraft((p) => ({ ...p, [a.id]: '' }));
+                        })
+                        .catch(() => toast('Failed to send feedback', 'error'))
+                        .finally(() => setCommenting(null));
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-slate-700 text-white text-sm hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    Send
+                  </button>
+                </div>
               </div>
             </motion.div>
           ))}

@@ -14,7 +14,12 @@ export const doClockIn = createAsyncThunk('attendance/clockIn', async ({ userId,
   try {
     return await api.clockIn(userId, branchId);
   } catch (e) {
-    return rejectWithValue(e.message);
+    const data = e?.response?.data;
+    const detail =
+      typeof data === 'string'
+        ? data
+        : data?.detail || data?.message || data?.error;
+    return rejectWithValue(detail || e?.message || 'Clock-in failed');
   }
 });
 

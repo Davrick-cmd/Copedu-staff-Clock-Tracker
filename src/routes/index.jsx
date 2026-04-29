@@ -32,6 +32,7 @@ import { HRLeave } from '../pages/hr/HRLeave';
 import { HRLeaveBalances } from '../pages/hr/HRLeaveBalances';
 import { HRLeaveOverview } from '../pages/hr/HRLeaveOverview';
 import { HRLeaveOrganization } from '../pages/hr/HRLeaveOrganization';
+import { HRShifts } from '../pages/hr/HRShifts';
 import { TeamLeaveBalances } from '../pages/employee/TeamLeaveBalances';
 import { AdminDashboard } from '../pages/admin/AdminDashboard';
 import { AdminUsers } from '../pages/admin/AdminUsers';
@@ -83,6 +84,7 @@ const router = createBrowserRouter([
       /* --- HR + Admin consoles --- */
       { path: 'hr', element: wrapRole(<HRDashboard />, [ROLES.HR, ROLES.ADMIN]) },
       { path: 'hr/dashboard-attendance', element: wrapRole(<HRAttendanceDashboard />, [ROLES.HR, ROLES.ADMIN]) },
+      { path: 'hr/shifts', element: wrapRole(<HRShifts />, [ROLES.HR, ROLES.ADMIN, ROLES.MANAGER, ROLES.HOD, ROLES.EMPLOYEE]) },
       { path: 'hr/dashboard-leave', element: wrapRole(<HRLeaveDashboard />, [ROLES.HR, ROLES.ADMIN]) },
       { path: 'hr/organization', element: wrapRole(<HROrganizationDashboard />, [ROLES.HR, ROLES.ADMIN]) },
       { path: 'hr/employees', element: wrapRole(<HREmployees />, [ROLES.HR, ROLES.ADMIN]) },

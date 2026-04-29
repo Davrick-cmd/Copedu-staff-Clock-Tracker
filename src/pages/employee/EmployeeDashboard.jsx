@@ -10,6 +10,7 @@ import { DashboardAnnouncements } from '../../components/DashboardAnnouncements'
 import { useToast } from '../../hooks/useToast';
 import * as api from '../../services/api';
 import { ROUTES } from '../../utils/constants';
+import { restrictLeaveDashToActiveTypes } from '../../utils/activeLeaveBalances';
 
 const WORK_START = '09:00';
 const WORK_END = '18:00';
@@ -71,6 +72,27 @@ function Countdown({ workStart, threshold, onTick }) {
   );
 }
 
+function clockInSuccessMessage(log) {
+  const lateMinutes = Number(log?.late_minutes || 0);
+  if (lateMinutes > 0) {
+    return `Clock-in recorded. You checked in ${lateMinutes} min late.`;
+  }
+  return 'Clock-in recorded. You are on time.';
+}
+
+function clockOutSuccessMessage(log) {
+  const worked = Number(log?.total_minutes || 0);
+  const overtime = Number(log?.overtime_minutes || 0);
+  const workedLabel = worked > 0 ? formatDuration(worked) : null;
+  if (overtime > 0 && workedLabel) {
+    return `Clock-out recorded. Worked ${workedLabel} today (${overtime} min overtime).`;
+  }
+  if (workedLabel) {
+    return `Clock-out recorded. Worked ${workedLabel} today.`;
+  }
+  return 'Clock-out recorded successfully.';
+}
+
 export function EmployeeDashboard() {
   const dispatch = useDispatch();
   const toast = useToast();
@@ -92,7 +114,10 @@ export function EmployeeDashboard() {
 
   useEffect(() => {
     if (!userId) return;
-    const load = () => api.getLeaveMyDashboard().then(setLeaveDash).catch(() => setLeaveDash(null));
+    const load = () =>
+      Promise.all([api.getLeaveMyDashboard(), api.getLeaveTypes()])
+        .then(([dash, types]) => setLeaveDash(restrictLeaveDashToActiveTypes(dash, types)))
+        .catch(() => setLeaveDash(null));
     load();
     const t = setInterval(load, 60000);
     return () => clearInterval(t);
@@ -133,8 +158,9 @@ export function EmployeeDashboard() {
   const handleClockIn = () => {
     dispatch(doClockIn({ userId, branchId: profile?.branch_id }))
       .unwrap()
-      .then(() => {
-        toast(isPastLateCutoff ? 'Clocked in (marked late)' : 'Clocked in successfully', isPastLateCutoff ? 'warning' : 'success');
+      .then((log) => {
+        const lateMinutes = Number(log?.late_minutes || 0);
+        toast(clockInSuccessMessage(log), lateMinutes > 0 ? 'warning' : 'success');
       })
       .catch((e) => toast(e?.response?.data?.detail || e?.message || 'Clock-in failed', 'error'));
   };
@@ -147,7 +173,7 @@ export function EmployeeDashboard() {
     }
     dispatch(doClockOut({ logId }))
       .unwrap()
-      .then(() => toast('Clocked out successfully', 'success'))
+      .then((log) => toast(clockOutSuccessMessage(log), 'success'))
       .catch((e) => {
         const msg = e?.response?.data?.detail ?? e?.message ?? e;
         const text = typeof msg === 'string' ? msg : 'Clock-out failed. Try again or refresh.';
@@ -295,7 +321,7 @@ export function EmployeeDashboard() {
                     <span className="font-semibold text-primary-600 dark:text-primary-400 tabular-nums">{formatDuration(todayLog.total_minutes)}</span>
                   </div>
                   {todayLog.status === 'late' && (
-                    <p className="text-amber-600 dark:text-amber-400 text-sm">Marked as late arrival</p>
+                    <p className="text-amber-600 dark:text-amber-400 text-sm">Arrival recorded as late ({Number(todayLog.late_minutes || 0)} min)</p>
                   )}
                 </>
               ) : (

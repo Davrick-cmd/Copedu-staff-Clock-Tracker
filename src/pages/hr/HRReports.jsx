@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import * as api from '../../services/api';
@@ -101,6 +101,7 @@ function initialReportModeForScope(reportScope) {
 
 /** @param {{ reportScope?: 'all' | 'attendance' | 'leave' | 'recognition' | 'performance' | 'organization' }} props */
 export function HRReports({ reportScope = 'all' }) {
+  const [searchParams] = useSearchParams();
   const toast = useToast();
   const [reportMode, setReportMode] = useState(() => initialReportModeForScope(reportScope));
   const [dailyDate, setDailyDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -117,6 +118,8 @@ export function HRReports({ reportScope = 'all' }) {
   const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [branchId, setBranchId] = useState('');
   const [reportType, setReportType] = useState('all');
+  const [attendanceDepartment, setAttendanceDepartment] = useState('');
+  const [attendanceUserId, setAttendanceUserId] = useState('');
   const [modal, setModal] = useState(null);
   const [recognitionReport, setRecognitionReport] = useState(null);
   const [recognitionReportSection, setRecognitionReportSection] = useState('recent');
@@ -154,6 +157,21 @@ export function HRReports({ reportScope = 'all' }) {
   useEffect(() => {
     setReportMode(initialReportModeForScope(reportScope));
   }, [reportScope]);
+
+  useEffect(() => {
+    const t = (searchParams.get('type') || '').toLowerCase();
+    if (!t) return;
+    if (reportScope === 'attendance') {
+      setReportMode(REPORT_MODE.RAW);
+      if (t === 'late') setReportType('late');
+      else if (t === 'overtime') setReportType('overtime');
+      else setReportType('all');
+    } else if (reportScope === 'leave') {
+      setReportMode(REPORT_MODE.LEAVE);
+      if (t === 'department') setLeaveReportSection('department');
+      else if (t === 'trends') setLeaveReportSection('activity');
+    }
+  }, [reportScope, searchParams]);
 
   useEffect(() => {
     if (reportMode !== REPORT_MODE.LEAVE) return;
@@ -224,22 +242,29 @@ export function HRReports({ reportScope = 'all' }) {
     setLoading(true);
     const filters = { fromDate: `${fromDate}T00:00:00`, toDate: `${toDate}T23:59:59` };
     if (branchId) filters.branchId = branchId;
+    if (attendanceDepartment.trim()) filters.department = attendanceDepartment.trim();
+    if (attendanceUserId.trim()) filters.userId = attendanceUserId.trim();
     if (reportType === 'late') {
       api.getLateReport(filters).then(setLogs).catch(() => setLogs([])).finally(() => setLoading(false));
+    } else if (reportType === 'overtime') {
+      api.getOvertimeReport({ ...filters, minMinutes: 1 }).then(setLogs).catch(() => setLogs([])).finally(() => setLoading(false));
     } else {
       api.getAllAttendance(filters).then(setLogs).catch(() => setLogs([])).finally(() => setLoading(false));
     }
-  }, [reportMode, fromDate, toDate, branchId, reportType]);
+  }, [reportMode, fromDate, toDate, branchId, reportType, attendanceDepartment, attendanceUserId]);
 
   const exportCSV = () => {
-    const headers = ['Date', 'Employee', 'Email', 'Clock In', 'Clock Out', 'Minutes', 'Status', 'IP'];
+    const headers = ['Date', 'Employee', 'Email', 'Department', 'Clock In', 'Clock Out', 'Minutes', 'Late (min)', 'Overtime (min)', 'Status', 'IP'];
     const rows = logs.map((l) => [
       formatDate(l.clock_in_at),
       l.users?.full_name || '',
       l.users?.email || '',
+      l.users?.department || '',
       formatTime(l.clock_in_at),
       l.clock_out_at ? formatTime(l.clock_out_at) : '',
       l.total_minutes ?? '',
+      l.late_minutes ?? 0,
+      l.overtime_minutes ?? 0,
       l.status || 'present',
       l.client_ip || '',
     ]);
@@ -253,9 +278,12 @@ export function HRReports({ reportScope = 'all' }) {
       date: formatDate(l.clock_in_at),
       employee: l.users?.full_name || '',
       email: l.users?.email || '',
+      department: l.users?.department || '',
       clock_in: formatTime(l.clock_in_at),
       clock_out: l.clock_out_at ? formatTime(l.clock_out_at) : '',
       minutes: l.total_minutes ?? '',
+      late_minutes: l.late_minutes ?? 0,
+      overtime_minutes: l.overtime_minutes ?? 0,
       status: l.status || 'present',
       ip: l.client_ip || '',
     }));
@@ -1174,7 +1202,22 @@ export function HRReports({ reportScope = 'all' }) {
             <select value={reportType} onChange={(e) => setReportType(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white">
               <option value="all">All attendance</option>
               <option value="late">Late only</option>
+              <option value="overtime">Overtime only</option>
             </select>
+            <input
+              type="text"
+              value={attendanceDepartment}
+              onChange={(e) => setAttendanceDepartment(e.target.value)}
+              placeholder="Department filter"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+            />
+            <input
+              type="text"
+              value={attendanceUserId}
+              onChange={(e) => setAttendanceUserId(e.target.value)}
+              placeholder="Employee ID filter"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+            />
             <button type="button" onClick={exportRawAttendanceXlsx} disabled={!logs.length} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50">Download XLSX</button>
             <button type="button" onClick={exportCSV} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">CSV</button>
             <button type="button" onClick={printReportSafe} disabled={!logs.length} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
@@ -1606,9 +1649,12 @@ export function HRReports({ reportScope = 'all' }) {
                     <tr>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Date</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Employee</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Department</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">In</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Out</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Duration</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Late</th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Overtime</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Status</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">IP</th>
                     </tr>
@@ -1618,9 +1664,12 @@ export function HRReports({ reportScope = 'all' }) {
                       <tr key={log.id} className="text-gray-700 dark:text-gray-300">
                         <td className="px-4 py-2">{formatDate(log.clock_in_at)}</td>
                         <td className="px-4 py-2">{log.users?.full_name || '-'}</td>
+                        <td className="px-4 py-2">{log.users?.department || '-'}</td>
                         <td className="px-4 py-2">{formatTime(log.clock_in_at)}</td>
                         <td className="px-4 py-2">{log.clock_out_at ? formatTime(log.clock_out_at) : '-'}</td>
                         <td className="px-4 py-2">{formatDuration(log.total_minutes)}</td>
+                        <td className="px-4 py-2">{log.late_minutes ?? 0}m</td>
+                        <td className="px-4 py-2">{log.overtime_minutes ?? 0}m</td>
                         <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded text-xs ${log.status === 'late' ? 'bg-amber-100 dark:bg-amber-900/30' : 'bg-gray-100 dark:bg-gray-700'}`}>{log.status || 'present'}</span></td>
                         <td className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">{log.client_ip || '-'}</td>
                       </tr>

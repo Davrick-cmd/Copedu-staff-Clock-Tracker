@@ -122,10 +122,16 @@ def init_db():
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(id),
                 branch_id TEXT REFERENCES branches(id),
+                shift_id TEXT REFERENCES attendance_shifts(id),
                 clock_in_at TEXT NOT NULL,
                 clock_out_at TEXT,
                 total_minutes INTEGER,
                 status TEXT DEFAULT 'present',
+                expected_start_time TEXT,
+                expected_end_time TEXT,
+                late_minutes INTEGER DEFAULT 0,
+                early_departure_minutes INTEGER DEFAULT 0,
+                overtime_minutes INTEGER DEFAULT 0,
                 notes TEXT,
                 client_ip TEXT,
                 user_agent TEXT,
@@ -139,6 +145,47 @@ def init_db():
                 c.execute(f"ALTER TABLE attendance_logs ADD COLUMN {col} TEXT")
             except sqlite3.OperationalError:
                 pass
+        for col, col_type in (
+            ("shift_id", "TEXT"),
+            ("expected_start_time", "TEXT"),
+            ("expected_end_time", "TEXT"),
+            ("late_minutes", "INTEGER DEFAULT 0"),
+            ("early_departure_minutes", "INTEGER DEFAULT 0"),
+            ("overtime_minutes", "INTEGER DEFAULT 0"),
+        ):
+            try:
+                c.execute(f"ALTER TABLE attendance_logs ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS attendance_shifts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                grace_period_minutes INTEGER NOT NULL DEFAULT 0,
+                overtime_threshold_minutes INTEGER NOT NULL DEFAULT 0,
+                department TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT REFERENCES users(id),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS attendance_shift_assignments (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                shift_id TEXT NOT NULL REFERENCES attendance_shifts(id) ON DELETE CASCADE,
+                effective_from TEXT NOT NULL,
+                effective_to TEXT,
+                created_by TEXT REFERENCES users(id),
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_shift_assignments_user_dates ON attendance_shift_assignments(user_id, effective_from, effective_to)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_shift_assignments_shift ON attendance_shift_assignments(shift_id)")
         # One clock-in per user per calendar day. Use substr so ISO timestamps (2025-02-15T08:00:00.000Z) work.
         try:
             c.execute("DROP INDEX IF EXISTS idx_attendance_user_date")
@@ -166,6 +213,12 @@ def init_db():
         ann_cols = [row[1] for row in c.fetchall()]
         if "deadline_at" not in ann_cols:
             c.execute("ALTER TABLE announcements ADD COLUMN deadline_at TEXT")
+        if "is_pinned" not in ann_cols:
+            c.execute("ALTER TABLE announcements ADD COLUMN is_pinned INTEGER DEFAULT 0")
+        if "target_scope" not in ann_cols:
+            c.execute("ALTER TABLE announcements ADD COLUMN target_scope TEXT DEFAULT 'all'")
+        if "target_value" not in ann_cols:
+            c.execute("ALTER TABLE announcements ADD COLUMN target_value TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS announcement_reads (
                 announcement_id TEXT NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
@@ -174,6 +227,33 @@ def init_db():
                 PRIMARY KEY (announcement_id, user_id)
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS announcement_views (
+                announcement_id TEXT NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                read_at TEXT NOT NULL,
+                PRIMARY KEY (announcement_id, user_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS announcement_targets (
+                announcement_id TEXT NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                PRIMARY KEY (announcement_id, user_id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS announcement_comments (
+                id TEXT PRIMARY KEY,
+                announcement_id TEXT NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                comment TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_announcement_views_user ON announcement_views(user_id, read_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_announcement_targets_user ON announcement_targets(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_announcement_comments_ann ON announcement_comments(announcement_id, created_at)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS hr_documents (
                 id TEXT PRIMARY KEY,
@@ -221,6 +301,20 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_password', '\"\"')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_from', '\"\"')")
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('smtp_use_tls', 'true')")
+        # Employment types (HR/Admin can add options)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS employment_types (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for et in ("Full-time employment", "Part-time employment", "Contract employment", "Internship/Apprenticeship", "Remote employment", "Acting"):
+            c.execute(
+                "INSERT OR IGNORE INTO employment_types (id, name, is_active) VALUES (?, ?, 1)",
+                ("employment-type-" + et.lower().replace(" ", "-"), et),
+            )
         # AD/LDAP: ensure users table has ad_username column (add if missing)
         # SQLite cannot add a UNIQUE column via ALTER; add column then create unique index
         c.execute("PRAGMA table_info(users)")
@@ -232,6 +326,20 @@ def init_db():
             c.execute("ALTER TABLE users ADD COLUMN department TEXT")
         if "manager_id" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN manager_id TEXT REFERENCES users(id)")
+            user_cols.append("manager_id")
+        if "employment_type" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN employment_type TEXT")
+            user_cols.append("employment_type")
+        # Normalize legacy label variants so analytics and filters remain consistent
+        if "employment_type" in user_cols:
+            c.execute(
+                """
+                UPDATE users
+                SET employment_type = 'Full-time employment',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE LOWER(TRIM(COALESCE(employment_type, ''))) IN ('full time', 'full-time', 'full-time employment')
+                """
+            )
         # Allow manager and hod roles: SQLite cannot ALTER CHECK, so recreate users table once
         c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")
         users_sql = c.fetchone()
@@ -571,6 +679,13 @@ def init_db():
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("PRAGMA table_info(leave_types)")
+        _leave_type_cols = [row[1] for row in c.fetchall()]
+        if "is_active" not in _leave_type_cols:
+            try:
+                c.execute("ALTER TABLE leave_types ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS leave_balances (
                 id TEXT PRIMARY KEY,
@@ -673,6 +788,20 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_user ON leave_requests(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_status ON leave_requests(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_requests_approver ON leave_requests(current_approver_id)")
+        # Draft/returned requests for a retired leave type would still surface to employees; close them on startup.
+        try:
+            _lr_cleanup_ts = datetime.utcnow().isoformat()
+            c.execute(
+                """
+                UPDATE leave_requests
+                SET status = 'cancelled', current_approver_id = NULL, updated_at = ?
+                WHERE status IN ('draft', 'returned')
+                  AND leave_type_id IN (SELECT id FROM leave_types WHERE IFNULL(is_active, 1) = 0)
+                """,
+                (_lr_cleanup_ts,),
+            )
+        except sqlite3.OperationalError:
+            pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_non_working_day_date ON leave_non_working_days(day_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_logs_request ON leave_workflow_logs(leave_request_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_leave_adj_status ON leave_balance_adjustments(status)")
@@ -765,6 +894,20 @@ def init_db():
             ("date_of_birth", "ALTER TABLE users ADD COLUMN date_of_birth TEXT"),
             ("net_salary", "ALTER TABLE users ADD COLUMN net_salary REAL"),
             ("is_married", "ALTER TABLE users ADD COLUMN is_married INTEGER"),
+            ("position_category", "ALTER TABLE users ADD COLUMN position_category TEXT"),
+            ("employment_type", "ALTER TABLE users ADD COLUMN employment_type TEXT"),
+            ("acting_for_user_id", "ALTER TABLE users ADD COLUMN acting_for_user_id TEXT REFERENCES users(id)"),
+            ("acting_start_date", "ALTER TABLE users ADD COLUMN acting_start_date TEXT"),
+            ("acting_end_date", "ALTER TABLE users ADD COLUMN acting_end_date TEXT"),
+            ("probation_end_date", "ALTER TABLE users ADD COLUMN probation_end_date TEXT"),
+            ("probation_alert_sent_at", "ALTER TABLE users ADD COLUMN probation_alert_sent_at TEXT"),
+            ("probation_approved_at", "ALTER TABLE users ADD COLUMN probation_approved_at TEXT"),
+            ("rssb_number", "ALTER TABLE users ADD COLUMN rssb_number TEXT"),
+            ("national_id_or_passport", "ALTER TABLE users ADD COLUMN national_id_or_passport TEXT"),
+            ("emergency_contact_name", "ALTER TABLE users ADD COLUMN emergency_contact_name TEXT"),
+            ("emergency_contact_phone", "ALTER TABLE users ADD COLUMN emergency_contact_phone TEXT"),
+            ("emergency_contact_relationship", "ALTER TABLE users ADD COLUMN emergency_contact_relationship TEXT"),
+            ("can_assign_shifts", "ALTER TABLE users ADD COLUMN can_assign_shifts INTEGER DEFAULT 0"),
         ]:
             if col not in _user_cols:
                 try:

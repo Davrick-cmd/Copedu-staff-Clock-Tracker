@@ -44,6 +44,20 @@ export function downloadOrganizationDemographicsCsv(data) {
     ...(data.by_branch || []).map((row) =>
       `${escapeCsvCell(row.branch_name || row.branch_code || '-')},${row.count}`,
     ),
+    '',
+    'Workforce status',
+    'Metric,Count',
+    `Currently acting,${data.acting_now_count ?? 0}`,
+    `Probation due approval,${data.probation_due_count ?? 0}`,
+    `On probation,${data.probation_upcoming_count ?? 0}`,
+    '',
+    'By category',
+    'Category,Count',
+    ...(data.by_position_category || []).map((row) => `${escapeCsvCell(row.position_category)},${row.count ?? 0}`),
+    '',
+    'By employment type',
+    'Employment type,Count',
+    ...(data.by_employment_type || []).map((row) => `${escapeCsvCell(row.employment_type)},${row.count ?? 0}`),
   ];
   const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);

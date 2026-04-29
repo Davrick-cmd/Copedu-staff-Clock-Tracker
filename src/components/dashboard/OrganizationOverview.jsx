@@ -26,6 +26,8 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
 
   const deptTop = (data.by_department || []).slice(0, 8);
   const branchTop = (data.by_branch || []).slice(0, 8);
+  const categoryTop = (data.by_position_category || []).slice(0, 8);
+  const employmentTop = (data.by_employment_type || []).slice(0, 8);
   const ann = (data.upcoming_anniversaries || []).slice(0, 10);
   const g = data.gender_counts || {};
   const wm = data.women_men || { women: g.female ?? 0, men: g.male ?? 0, other_or_not_set: 0 };
@@ -100,6 +102,13 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
           hint={`${age.unknown_count ?? 0} active staff missing or invalid date of birth.`}
           variant="amber"
         />
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatTile label="Currently acting" value={data.acting_now_count ?? 0} hint="Active acting assignments today." variant="blue" />
+        <StatTile label="Probation due approval" value={data.probation_due_count ?? 0} hint="Probation ended, pending HR approval." variant="amber" />
+        <StatTile label="On probation" value={data.probation_upcoming_count ?? 0} hint="Probation end date still in future." variant="default" />
+        <StatTile label="Employment types" value={(data.by_employment_type || []).length} hint="Distinct employment-type groups." variant="green" />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -181,11 +190,16 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
           hint="Locations with at least one active employee"
           variant="amber"
         />
-        <StatTile label="Recorded as female" value={g.female ?? 0} hint="Subset of active employees" variant="default" />
-        <StatTile label="Recorded as male" value={g.male ?? 0} hint="Subset of active employees" variant="default" />
+        <StatTile label="Role categories" value={(data.by_position_category || []).length} hint="Distinct position-category groups." variant="default" />
+        <StatTile
+          label="Full-time employment"
+          value={(data.by_employment_type || []).find((x) => String(x.employment_type || '').toLowerCase() === 'full-time employment')?.count ?? 0}
+          hint="Active staff marked full-time."
+          variant="default"
+        />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid gap-4 lg:grid-cols-4">
         <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft">
           <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-3">By department</h3>
           <ul className="space-y-2 max-h-56 overflow-y-auto text-sm">
@@ -221,28 +235,33 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
         </div>
 
         <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft">
-          <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-3">Gender detail</h3>
-          <ul className="space-y-1.5 text-sm text-slate-700 dark:text-slate-300">
-            <li className="flex justify-between">
-              <span>Female</span>
-              <span className="tabular-nums font-medium">{g.female ?? 0}</span>
-            </li>
-            <li className="flex justify-between">
-              <span>Male</span>
-              <span className="tabular-nums font-medium">{g.male ?? 0}</span>
-            </li>
-            <li className="flex justify-between">
-              <span>Other / not listed</span>
-              <span className="tabular-nums font-medium">{g.other ?? 0}</span>
-            </li>
-            <li className="flex justify-between">
-              <span>Prefer not to say</span>
-              <span className="tabular-nums font-medium">{g.prefer_not_say ?? 0}</span>
-            </li>
-            <li className="flex justify-between text-slate-500 dark:text-slate-400 pt-1 border-t border-slate-100 dark:border-slate-700">
-              <span>Not set</span>
-              <span className="tabular-nums font-medium">{g.unset ?? 0}</span>
-            </li>
+          <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-3">By category</h3>
+          <ul className="space-y-2 max-h-56 overflow-y-auto text-sm">
+            {categoryTop.length === 0 ? (
+              <li className="text-slate-500 dark:text-slate-400">No data</li>
+            ) : (
+              categoryTop.map((row) => (
+                <li key={row.position_category} className="flex justify-between gap-2">
+                  <span className="text-slate-700 dark:text-slate-300 truncate">{row.position_category}</span>
+                  <span className="font-semibold tabular-nums text-slate-900 dark:text-white shrink-0">{row.count}</span>
+                </li>
+              ))
+            )}
+          </ul>
+        </div>
+        <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft">
+          <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-3">By employment type</h3>
+          <ul className="space-y-2 max-h-56 overflow-y-auto text-sm">
+            {employmentTop.length === 0 ? (
+              <li className="text-slate-500 dark:text-slate-400">No data</li>
+            ) : (
+              employmentTop.map((row) => (
+                <li key={row.employment_type} className="flex justify-between gap-2">
+                  <span className="text-slate-700 dark:text-slate-300 truncate">{row.employment_type}</span>
+                  <span className="font-semibold tabular-nums text-slate-900 dark:text-white shrink-0">{row.count}</span>
+                </li>
+              ))
+            )}
           </ul>
         </div>
       </div>

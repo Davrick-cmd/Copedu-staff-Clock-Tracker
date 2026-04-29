@@ -7,12 +7,18 @@ import { ROUTES, ROLES } from '../../utils/constants';
 import { DashboardPageHeader, QuickLinkCard, QuickLinksSection } from '../../components/dashboard/DashboardWidgets';
 import { LeaveInsightCharts } from '../../components/dashboard/InsightChartCards';
 import { DashboardSwitcher } from '../../components/dashboard/DashboardSwitcher';
+import { useToast } from '../../hooks/useToast';
 
 export function HRLeaveDashboard() {
+  const toast = useToast();
   const role = useSelector((s) => s.auth.profile?.role);
   const dashboardSwitcherMode = role === ROLES.ADMIN ? 'admin' : 'hr';
   const [leaveOverview, setLeaveOverview] = useState(null);
   const [myLeaveInbox, setMyLeaveInbox] = useState(null);
+  const [showPendingPopover, setShowPendingPopover] = useState(false);
+  const [showPendingPanel, setShowPendingPanel] = useState(false);
+  const [remindingId, setRemindingId] = useState('');
+  const [deletingId, setDeletingId] = useState('');
 
   useEffect(() => {
     api.getLeaveOverview().then(setLeaveOverview).catch(() => setLeaveOverview(null));
@@ -58,12 +64,160 @@ export function HRLeaveDashboard() {
         <p className="text-sm text-slate-500 dark:text-slate-400">
           Clear numbers first. Use the detail links below when you need full tables and workflows.
         </p>
-        <div className="grid gap-4 grid-cols-2 lg:grid-cols-5">
-          <KpiCard label="Pending total" value={leaveOverview?.pending_total ?? 0} tone="violet" />
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-3">
+          <div
+            className="relative"
+            onMouseEnter={() => setShowPendingPopover(true)}
+            onMouseLeave={() => setShowPendingPopover(false)}
+          >
+            <KpiCard label="Pending total" value={leaveOverview?.pending_total ?? 0} tone="violet" />
+            {showPendingPopover && (
+              <div className="absolute left-0 top-full z-20 mt-2 w-[30rem] max-w-[90vw] rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-xl p-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">Pending approvals (hover preview)</p>
+                {!(leaveOverview?.recent_pending || []).length ? (
+                  <p className="text-sm text-slate-500 dark:text-slate-400">No pending requests.</p>
+                ) : (
+                  <div className="space-y-2 max-h-72 overflow-auto pr-1">
+                    {(leaveOverview?.recent_pending || []).map((r) => (
+                      <div key={r.id} className="rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-2 text-xs">
+                        <p className="font-semibold text-slate-900 dark:text-slate-100">{r.full_name} · {r.leave_type_name}</p>
+                        <p className="text-slate-600 dark:text-slate-300">{r.start_date} to {r.end_date} ({Number(r.days_requested || 0)} day(s))</p>
+                        <p className="text-slate-500 dark:text-slate-400">Approver: {r.approver_name || 'Not assigned'}</p>
+                        <div className="pt-1.5">
+                          <button
+                            type="button"
+                            disabled={!r.approver_name || remindingId === r.id}
+                            onClick={async () => {
+                              try {
+                                setRemindingId(r.id);
+                                await api.remindLeaveApprover(r.id);
+                                toast(`Reminder sent to ${r.approver_name || 'approver'}`, 'success');
+                                const ov = await api.getLeaveOverview();
+                                setLeaveOverview(ov);
+                              } catch (e) {
+                                toast(e?.response?.data?.detail || 'Failed to send reminder', 'error');
+                              } finally {
+                                setRemindingId('');
+                              }
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50"
+                          >
+                            {remindingId === r.id ? 'Sending...' : 'Send reminder'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={deletingId === r.id}
+                            onClick={async () => {
+                              if (!window.confirm('Delete this pending leave request? This cannot be undone.')) return;
+                              try {
+                                setDeletingId(r.id);
+                                await api.deletePendingLeaveRequest(r.id);
+                                toast('Pending leave request deleted', 'success');
+                                const ov = await api.getLeaveOverview();
+                                setLeaveOverview(ov);
+                              } catch (e) {
+                                toast(e?.response?.data?.detail || 'Failed to delete request', 'error');
+                              } finally {
+                                setDeletingId('');
+                              }
+                            }}
+                            className="ml-1 px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white disabled:opacity-50"
+                          >
+                            {deletingId === r.id ? 'Deleting...' : 'Delete'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
           <KpiCard label="Awaiting supervisor" value={leaveOverview?.pipeline?.pending_manager ?? 0} tone="amber" />
-          <KpiCard label="Awaiting HOD" value={leaveOverview?.pipeline?.pending_hod ?? 0} tone="sky" />
-          <KpiCard label="Awaiting HR" value={leaveOverview?.pipeline?.pending_hr ?? 0} tone="slate" />
           <KpiCard label="On leave today" value={leaveOverview?.staff_on_leave_today ?? 0} tone="emerald" />
+        </div>
+        <div className="pt-1">
+          <button
+            type="button"
+            onClick={() => setShowPendingPanel((v) => !v)}
+            className="px-3 py-2 rounded-xl border border-amber-300/80 dark:border-amber-700/70 text-sm font-medium text-amber-800 dark:text-amber-200 hover:bg-amber-50 dark:hover:bg-amber-900/20"
+          >
+            {showPendingPanel ? 'Hide pending + reminders' : 'Show pending + send reminders'}
+          </button>
+        </div>
+        {showPendingPanel && (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-3">
+            {!(leaveOverview?.recent_pending || []).length ? (
+              <p className="text-sm text-slate-500 dark:text-slate-400">No pending requests.</p>
+            ) : (
+              <div className="grid gap-2">
+                {(leaveOverview?.recent_pending || []).map((r) => (
+                  <div key={r.id} className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm">
+                    <p className="font-semibold text-slate-900 dark:text-slate-100">{r.full_name} · {r.leave_type_name}</p>
+                    <p className="text-slate-600 dark:text-slate-300">{r.start_date} to {r.end_date} ({Number(r.days_requested || 0)} day(s))</p>
+                    <p className="text-slate-500 dark:text-slate-400">Approver: {r.approver_name || 'Not assigned'}</p>
+                    <div className="pt-2">
+                      <button
+                        type="button"
+                        disabled={!r.approver_name || remindingId === r.id}
+                        onClick={async () => {
+                          try {
+                            setRemindingId(r.id);
+                            await api.remindLeaveApprover(r.id);
+                            toast(`Reminder sent to ${r.approver_name || 'approver'}`, 'success');
+                            const ov = await api.getLeaveOverview();
+                            setLeaveOverview(ov);
+                          } catch (e) {
+                            toast(e?.response?.data?.detail || 'Failed to send reminder', 'error');
+                          } finally {
+                            setRemindingId('');
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50"
+                      >
+                        {remindingId === r.id ? 'Sending...' : 'Send reminder'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={deletingId === r.id}
+                        onClick={async () => {
+                          if (!window.confirm('Delete this pending leave request? This cannot be undone.')) return;
+                          try {
+                            setDeletingId(r.id);
+                            await api.deletePendingLeaveRequest(r.id);
+                            toast('Pending leave request deleted', 'success');
+                            const ov = await api.getLeaveOverview();
+                            setLeaveOverview(ov);
+                          } catch (e) {
+                            toast(e?.response?.data?.detail || 'Failed to delete request', 'error');
+                          } finally {
+                            setDeletingId('');
+                          }
+                        }}
+                        className="ml-2 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white disabled:opacity-50"
+                      >
+                        {deletingId === r.id ? 'Deleting...' : 'Delete'}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        <div className="flex flex-wrap gap-2 pt-1">
+          <Link
+            to={ROUTES.HR.LEAVE_OVERVIEW}
+            className="px-3 py-2 rounded-xl border border-violet-300/80 dark:border-violet-700/70 text-sm font-medium text-violet-800 dark:text-violet-200 hover:bg-violet-50 dark:hover:bg-violet-900/20"
+          >
+            Review all pending requests
+          </Link>
+          <Link
+            to={ROUTES.HR.LEAVE}
+            className="px-3 py-2 rounded-xl border border-amber-300/80 dark:border-amber-700/70 text-sm font-medium text-amber-800 dark:text-amber-200 hover:bg-amber-50 dark:hover:bg-amber-900/20"
+          >
+            Open my approval queue
+          </Link>
         </div>
         <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
           <KpiCard label="Approved (range)" value={leaveOverview?.approved_this_month ?? 0} tone="emerald" />

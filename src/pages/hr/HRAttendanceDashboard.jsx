@@ -16,6 +16,8 @@ export function HRAttendanceDashboard() {
   const role = useSelector((s) => s.auth.profile?.role);
   const dashboardSwitcherMode = role === ROLES.ADMIN ? 'admin' : 'hr';
   const [summary, setSummary] = useState(null);
+  const [advanced, setAdvanced] = useState({ totals: { late_minutes: 0, early_departure_minutes: 0, overtime_minutes: 0, rows: 0 }, rows: [] });
+  const [deptTrend, setDeptTrend] = useState([]);
   const [chartData, setChartData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState(null);
@@ -29,11 +31,31 @@ export function HRAttendanceDashboard() {
 
   useEffect(() => {
     const today = new Date().toISOString().slice(0, 10);
+    const from = new Date();
+    from.setDate(from.getDate() - 29);
+    const fromDate = from.toISOString().slice(0, 10);
     api
       .getDailyReportSummary(today)
       .then(setSummary)
       .catch(() => setSummary(null))
       .finally(() => setLoading(false));
+    api
+      .getAttendanceSummary({ fromDate, toDate: today })
+      .then((res) => {
+        setAdvanced(res || { totals: { late_minutes: 0, early_departure_minutes: 0, overtime_minutes: 0, rows: 0 }, rows: [] });
+        const grouped = {};
+        for (const r of res?.rows || []) {
+          const dept = r?.user_department || 'Unassigned';
+          if (!grouped[dept]) grouped[dept] = { department: dept, overtime: 0, late: 0 };
+          grouped[dept].overtime += Number(r?.overtime_minutes || 0);
+          grouped[dept].late += Number(r?.late_minutes || 0);
+        }
+        setDeptTrend(Object.values(grouped).sort((a, b) => (b.overtime + b.late) - (a.overtime + a.late)).slice(0, 8));
+      })
+      .catch(() => {
+        setAdvanced({ totals: { late_minutes: 0, early_departure_minutes: 0, overtime_minutes: 0, rows: 0 }, rows: [] });
+        setDeptTrend([]);
+      });
   }, []);
 
   useEffect(() => {
@@ -58,7 +80,24 @@ export function HRAttendanceDashboard() {
   useEffect(() => {
     const interval = setInterval(() => {
       const today = new Date().toISOString().slice(0, 10);
+      const from = new Date();
+      from.setDate(from.getDate() - 29);
+      const fromDate = from.toISOString().slice(0, 10);
       api.getDailyReportSummary(today).then(setSummary).catch(() => {});
+      api
+        .getAttendanceSummary({ fromDate, toDate: today })
+        .then((res) => {
+          setAdvanced(res || { totals: { late_minutes: 0, early_departure_minutes: 0, overtime_minutes: 0, rows: 0 }, rows: [] });
+          const grouped = {};
+          for (const r of res?.rows || []) {
+            const dept = r?.user_department || 'Unassigned';
+            if (!grouped[dept]) grouped[dept] = { department: dept, overtime: 0, late: 0 };
+            grouped[dept].overtime += Number(r?.overtime_minutes || 0);
+            grouped[dept].late += Number(r?.late_minutes || 0);
+          }
+          setDeptTrend(Object.values(grouped).sort((a, b) => (b.overtime + b.late) - (a.overtime + a.late)).slice(0, 8));
+        })
+        .catch(() => {});
     }, 15000);
     return () => clearInterval(interval);
   }, []);
@@ -82,6 +121,9 @@ export function HRAttendanceDashboard() {
   const pctOnTime = s.pct_on_time ?? 0;
   const pctAbsent = s.pct_absent ?? 0;
   const users = s.users || {};
+  const overtimeMinutes = Number(advanced?.totals?.overtime_minutes || 0);
+  const lateMinutes = Number(advanced?.totals?.late_minutes || 0);
+  const earlyDepartureMinutes = Number(advanced?.totals?.early_departure_minutes || 0);
 
   const statCard = (label, value, sub, colorClass, modalKey, modalTitle) => {
     const count = typeof value === 'number' ? value : 0;
@@ -140,6 +182,11 @@ export function HRAttendanceDashboard() {
             </Link>
           </motion.div>
         </div>
+        <div className="grid gap-4 grid-cols-2 lg:grid-cols-3 mt-4">
+          {statCard('Overtime (30d mins)', overtimeMinutes, 'Across visible scope', 'text-indigo-600 dark:text-indigo-400')}
+          {statCard('Late (30d mins)', lateMinutes, 'Across visible scope', 'text-amber-600 dark:text-amber-400')}
+          {statCard('Early departure (30d mins)', earlyDepartureMinutes, 'Across visible scope', 'text-rose-600 dark:text-rose-400')}
+        </div>
       </section>
 
       {modal && <UserListModal title={modal.title} users={modal.list} onClose={() => setModal(null)} />}
@@ -162,6 +209,23 @@ export function HRAttendanceDashboard() {
           )}
         </div>
         <AttendanceTodayDonut summary={s} />
+      </div>
+      <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-6 shadow-soft">
+        <h2 className="font-semibold text-slate-900 dark:text-white mb-1">Department trend (last 30 days)</h2>
+        <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">Stacked minutes: overtime + lateness by department.</p>
+        {deptTrend.length ? (
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={deptTrend}>
+              <XAxis dataKey="department" stroke="#9ca3af" fontSize={12} />
+              <YAxis stroke="#9ca3af" fontSize={12} allowDecimals={false} />
+              <Tooltip {...CHART_TOOLTIP_DARK} formatter={(v) => [`${v} mins`, '']} />
+              <Bar dataKey="overtime" stackId="mins" fill="#6366f1" name="Overtime" />
+              <Bar dataKey="late" stackId="mins" fill="#f59e0b" name="Late" />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : (
+          <EmptyState title="No department trend yet" message="Start assigning shifts and clocking attendance to populate this chart." />
+        )}
       </div>
 
       <div className="rounded-2xl border border-slate-200/80 dark:border-slate-700/80 bg-slate-50/80 dark:bg-slate-800/40 px-5 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">

@@ -121,12 +121,69 @@ export async function getAllAttendance(filters = {}) {
   return data || [];
 }
 
+export async function getAttendanceSummary(filters = {}) {
+  const params = {};
+  if (filters.fromDate) params.from_date = filters.fromDate;
+  if (filters.toDate) params.to_date = filters.toDate;
+  if (filters.department) params.department = filters.department;
+  if (filters.userId) params.user_id = filters.userId;
+  const { data } = await api.get('/attendance/summary', { params });
+  return data || { rows: [], totals: { late_minutes: 0, early_departure_minutes: 0, overtime_minutes: 0, rows: 0 } };
+}
+
+export async function getAttendanceShifts() {
+  const { data } = await api.get('/attendance/shifts');
+  return data || [];
+}
+
+export async function createAttendanceShift(payload) {
+  const { data } = await api.post('/attendance/shifts', payload);
+  return data || {};
+}
+
+export async function updateAttendanceShift(shiftId, payload) {
+  const { data } = await api.patch(`/attendance/shifts/${shiftId}`, payload);
+  return data || {};
+}
+
+export async function deleteAttendanceShift(shiftId) {
+  const { data } = await api.delete(`/attendance/shifts/${shiftId}`);
+  return data || {};
+}
+
+export async function assignAttendanceShift(payload) {
+  const { data } = await api.post('/attendance/shifts/assign', payload);
+  return data || {};
+}
+
+export async function getAttendanceShiftAssignments() {
+  const { data } = await api.get('/attendance/shifts/assignments');
+  return data || [];
+}
+
+export async function getAttendanceShiftAssignees() {
+  const { data } = await api.get('/attendance/shifts/assignees');
+  return data || [];
+}
+
 export async function getLateReport(filters = {}) {
   const params = {};
   if (filters.fromDate) params.from_date = filters.fromDate;
   if (filters.toDate) params.to_date = filters.toDate;
   if (filters.branchId) params.branch_id = filters.branchId;
   const { data } = await api.get('/reports/late', { params });
+  return data || [];
+}
+
+export async function getOvertimeReport(filters = {}) {
+  const params = {};
+  if (filters.fromDate) params.from_date = filters.fromDate;
+  if (filters.toDate) params.to_date = filters.toDate;
+  if (filters.branchId) params.branch_id = filters.branchId;
+  if (filters.department) params.department = filters.department;
+  if (filters.userId) params.user_id = filters.userId;
+  if (filters.minMinutes != null) params.min_minutes = filters.minMinutes;
+  const { data } = await api.get('/reports/overtime', { params });
   return data || [];
 }
 
@@ -211,6 +268,25 @@ export async function updateEmployeeRecord(userId, payload) {
   return data;
 }
 
+export async function exportEmployeeRecordsCsv() {
+  const { data } = await api.get('/users/records/export');
+  return data || { filename: 'employee-records.csv', csv: '' };
+}
+
+export async function bulkUpsertEmployeeRecords(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post('/users/records/bulk-upsert', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+}
+
+export async function approveUserProbation(userId) {
+  const { data } = await api.post(`/users/${userId}/probation/approve`);
+  return data || {};
+}
+
 /** HR/Admin: workforce snapshot - departments, branches, gender mix, upcoming work anniversaries. */
 export async function getOrganizationOverview() {
   const { data } = await api.get('/hr/organization-overview');
@@ -244,6 +320,16 @@ export async function deleteAnnouncement(id) {
 
 export async function acknowledgeAnnouncement(announcementId) {
   const { data } = await api.post(`/announcements/${announcementId}/acknowledge`);
+  return data;
+}
+
+export async function readAnnouncement(announcementId) {
+  const { data } = await api.post(`/announcements/${announcementId}/read`);
+  return data;
+}
+
+export async function addAnnouncementComment(announcementId, comment) {
+  const { data } = await api.post(`/announcements/${announcementId}/comments`, { comment });
   return data;
 }
 
@@ -290,6 +376,48 @@ export async function getDepartmentOptions() {
 
 export async function createDepartment(name) {
   const { data } = await api.post('/departments', { name });
+  return data || {};
+}
+export async function renameDepartment(old_name, new_name) {
+  const { data } = await api.put('/departments', { old_name, new_name });
+  return data || {};
+}
+export async function deleteDepartment(name) {
+  const { data } = await api.delete('/departments', { params: { name } });
+  return data || {};
+}
+
+export async function getEmploymentTypeOptions() {
+  const { data } = await api.get('/employment-types/options');
+  return data?.rows || [];
+}
+
+export async function createEmploymentType(name) {
+  const { data } = await api.post('/employment-types', { name });
+  return data || {};
+}
+export async function renameEmploymentType(old_name, new_name) {
+  const { data } = await api.put('/employment-types', { old_name, new_name });
+  return data || {};
+}
+export async function deleteEmploymentType(name) {
+  const { data } = await api.delete('/employment-types', { params: { name } });
+  return data || {};
+}
+export async function getPositionCategoryOptions() {
+  const { data } = await api.get('/position-categories/options');
+  return data?.rows || [];
+}
+export async function createPositionCategory(name) {
+  const { data } = await api.post('/position-categories', { name });
+  return data || {};
+}
+export async function renamePositionCategory(old_name, new_name) {
+  const { data } = await api.put('/position-categories', { old_name, new_name });
+  return data || {};
+}
+export async function deletePositionCategory(name) {
+  const { data } = await api.delete('/position-categories', { params: { name } });
   return data || {};
 }
 
@@ -643,6 +771,11 @@ export async function createAnnualKpi(year) {
   return data;
 }
 
+export async function deleteAnnualKpi(annualKpiId) {
+  const { data } = await api.delete(`/appraisal/annual-kpis/${annualKpiId}`);
+  return data;
+}
+
 export async function getAnnualKpi(annualKpiId) {
   const { data } = await api.get(`/appraisal/annual-kpis/${annualKpiId}`);
   return data;
@@ -795,6 +928,11 @@ export async function returnLeaveRequest(leaveRequestId, comment) {
 
 export async function remindLeaveApprover(leaveRequestId) {
   const { data } = await api.post(`/leave/requests/${leaveRequestId}/remind-approver`);
+  return data;
+}
+
+export async function deletePendingLeaveRequest(leaveRequestId) {
+  const { data } = await api.delete(`/leave/requests/${leaveRequestId}/pending`);
   return data;
 }
 

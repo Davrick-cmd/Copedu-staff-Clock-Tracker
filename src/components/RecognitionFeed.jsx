@@ -59,6 +59,7 @@ export function RecognitionFeed() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [recognitionType, setRecognitionType] = useState('');
+  const [recognitionTypeOther, setRecognitionTypeOther] = useState('');
   const [message, setMessage] = useState('');
   const [expandedId, setExpandedId] = useState(null);
   const [comments, setComments] = useState({});
@@ -130,7 +131,14 @@ export function RecognitionFeed() {
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    const type = (recognitionType || '').trim() || 'Other';
+    const selectedType = (recognitionType || '').trim() || 'Other';
+    const type = selectedType.toLowerCase() === 'other'
+      ? ((recognitionTypeOther || '').trim() || 'Other')
+      : selectedType;
+    if (selectedType.toLowerCase() === 'other' && !String(recognitionTypeOther || '').trim()) {
+      toast('Write the recognition type you want', 'error');
+      return;
+    }
     if (!(message || '').trim()) {
       toast('Write a message', 'error');
       return;
@@ -140,6 +148,7 @@ export function RecognitionFeed() {
       .then((newRec) => {
         setRecognitions((prev) => [newRec, ...prev]);
         setRecognitionType('');
+        setRecognitionTypeOther('');
         setMessage('');
         toast('Recognition posted!', 'success');
       })
@@ -245,6 +254,15 @@ export function RecognitionFeed() {
             ))}
           </select>
         </div>
+        {String(recognitionType || '').toLowerCase() === 'other' && (
+          <input
+            type="text"
+            value={recognitionTypeOther}
+            onChange={(e) => setRecognitionTypeOther(e.target.value)}
+            placeholder="Write custom recognition type"
+            className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+          />
+        )}
         <div className="relative">
           <textarea
             ref={messageInputRef}

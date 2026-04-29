@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import DatePicker from 'react-datepicker';
 import { format } from 'date-fns';
 import * as api from '../../services/api';
+import { restrictLeaveDashToActiveTypes } from '../../utils/activeLeaveBalances';
 import { useToast } from '../../hooks/useToast';
 import { useSelector } from 'react-redux';
 import { LeaveHubNav } from '../../components/LeaveHubNav';
@@ -17,6 +18,8 @@ export function EmployeeLeave() {
   const [requests, setRequests] = useState([]);
   const [dash, setDash] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [submittingLeave, setSubmittingLeave] = useState(false);
+  const [rowActionLoading, setRowActionLoading] = useState({});
   const [leaveTab, setLeaveTab] = useState(() =>
     searchParams.get('tab') === 'requests' ? 'requests' : 'apply'
   );
@@ -43,7 +46,7 @@ export function EmployeeLeave() {
       ]);
       setLeaveTypes(types);
       setRequests(myRequests);
-      setDash(myDash);
+      setDash(restrictLeaveDashToActiveTypes(myDash, types));
     } catch {
       toast('Failed to load leave data', 'error');
     } finally {
@@ -114,11 +117,13 @@ export function EmployeeLeave() {
 
   const createAndSubmit = async (e) => {
     e.preventDefault();
+    if (submittingLeave) return;
     if (hasBoundaryDateError) {
       toast('Start and end dates must be working days (not weekend/holiday).', 'error');
       return;
     }
     try {
+      setSubmittingLeave(true);
       const created = await api.createLeaveRequest(form);
       await api.submitLeaveRequest(created.id);
       toast('Leave request submitted', 'success');
@@ -126,26 +131,38 @@ export function EmployeeLeave() {
       load();
     } catch (err) {
       toast(err?.response?.data?.detail || 'Failed to submit leave request', 'error');
+    } finally {
+      setSubmittingLeave(false);
     }
   };
 
   const cancelRequest = async (id) => {
+    if (rowActionLoading[id]) return;
     try {
+      setRowActionLoading((p) => ({ ...p, [id]: 'cancel' }));
       await api.cancelLeaveRequest(id, 'Cancelled by employee');
       toast('Leave request cancelled', 'success');
       load();
     } catch (err) {
       toast(err?.response?.data?.detail || 'Failed to cancel request', 'error');
+    } finally {
+      setRowActionLoading((p) => {
+        const n = { ...p };
+        delete n[id];
+        return n;
+      });
     }
   };
 
   const rescheduleApproved = async (r) => {
+    if (rowActionLoading[r.id]) return;
     const start = window.prompt('New start date (YYYY-MM-DD):', String(r.start_date || ''));
     if (!start) return;
     const end = window.prompt('New end date (YYYY-MM-DD):', String(r.end_date || ''));
     if (!end) return;
     const reason = window.prompt('Reason for reschedule (optional):', String(r.reason || '')) || '';
     try {
+      setRowActionLoading((p) => ({ ...p, [r.id]: 'reschedule' }));
       await api.rescheduleApprovedLeaveRequest(r.id, {
         start_date: start.trim(),
         end_date: end.trim(),
@@ -155,6 +172,12 @@ export function EmployeeLeave() {
       load();
     } catch (err) {
       toast(err?.response?.data?.detail || 'Failed to reschedule leave', 'error');
+    } finally {
+      setRowActionLoading((p) => {
+        const n = { ...p };
+        delete n[r.id];
+        return n;
+      });
     }
   };
 
@@ -429,10 +452,10 @@ export function EmployeeLeave() {
             </p>
             <button
               type="submit"
-              disabled={hasBoundaryDateError}
-              className="w-full sm:w-auto min-w-[8rem] px-6 py-2.5 rounded-lg bg-orange-500 text-white font-semibold shadow-sm hover:bg-orange-600 focus:outline-none focus:ring-2 focus:ring-orange-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900 transition-colors"
+              disabled={hasBoundaryDateError || submittingLeave}
+              className="w-full sm:w-auto min-w-[8rem] px-6 py-2.5 rounded-lg bg-orange-500 text-white font-semibold shadow-sm hover:bg-orange-600 disabled:opacity-60 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-orange-400 focus:ring-offset-2 dark:focus:ring-offset-gray-900 transition-colors"
             >
-              Apply
+              {submittingLeave ? 'Applying...' : 'Apply'}
             </button>
           </div>
         </form>
@@ -515,18 +538,20 @@ export function EmployeeLeave() {
                         <button
                           type="button"
                           onClick={() => cancelRequest(r.id)}
-                          className="text-sm font-medium text-red-600 dark:text-red-400 hover:underline"
+                          disabled={!!rowActionLoading[r.id]}
+                          className="text-sm font-medium text-red-600 dark:text-red-400 hover:underline disabled:opacity-60 disabled:no-underline"
                         >
-                          Cancel
+                          {rowActionLoading[r.id] === 'cancel' ? 'Cancelling...' : 'Cancel'}
                         </button>
                       )}
                       {r.status === 'approved' && (
                         <button
                           type="button"
                           onClick={() => rescheduleApproved(r)}
-                          className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                          disabled={!!rowActionLoading[r.id]}
+                          className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-60 disabled:no-underline"
                         >
-                          Reschedule
+                          {rowActionLoading[r.id] === 'reschedule' ? 'Submitting...' : 'Reschedule'}
                         </button>
                       )}
                     </td>

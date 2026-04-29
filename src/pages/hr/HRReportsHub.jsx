@@ -1,4 +1,5 @@
-import { Link, Navigate, useSearchParams } from 'react-router-dom';
+import { Link, Navigate, useNavigate, useSearchParams } from 'react-router-dom';
+import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { ROUTES } from '../../utils/constants';
 import { DashboardPageHeader } from '../../components/dashboard/DashboardWidgets';
@@ -46,7 +47,9 @@ const cards = [
  * so the sidebar and this page stay easy to scan.
  */
 export function HRReportsHub() {
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const [builderType, setBuilderType] = useState('attendance_raw');
   const mode = (searchParams.get('mode') || '').toLowerCase();
   if (mode === 'leave') return <Navigate to={ROUTES.HR.REPORTS_LEAVE} replace />;
   if (mode === 'recognition') return <Navigate to={ROUTES.HR.REPORTS_RECOGNITION} replace />;
@@ -79,6 +82,36 @@ export function HRReportsHub() {
             <span className="inline-block mt-4 text-sm font-semibold text-primary-600 dark:text-primary-400">Open →</span>
           </Link>
         ))}
+      </div>
+
+      <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-6 shadow-soft">
+        <h3 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wide">Quick report builder</h3>
+        <p className="text-sm text-slate-600 dark:text-slate-400 mt-2 leading-relaxed">
+          Pick a report type and jump straight to the right module. Keep leave analysis in leave reports and attendance analysis in attendance reports.
+        </p>
+        <div className="flex flex-wrap gap-3 mt-4">
+          <select
+            value={builderType}
+            onChange={(e) => setBuilderType(e.target.value)}
+            className="rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-900 dark:text-white"
+          >
+            <option value="attendance_raw">Attendance raw logs</option>
+            <option value="attendance_late">Absenteeism & lateness focus</option>
+            <option value="attendance_overtime">Overtime report</option>
+            <option value="leave_department">Department leave usage</option>
+            <option value="leave_trends">Leave trends</option>
+          </select>
+          <button
+            type="button"
+            onClick={() => {
+              if (builderType.startsWith('attendance_')) navigate(`${ROUTES.HR.REPORTS_ATTENDANCE}?type=${builderType.replace('attendance_', '')}`);
+              else navigate(`${ROUTES.HR.REPORTS_LEAVE}?type=${builderType.replace('leave_', '')}`);
+            }}
+            className="px-4 py-2 rounded-xl bg-primary-600 text-white text-sm font-semibold hover:bg-primary-700"
+          >
+            Generate
+          </button>
+        </div>
       </div>
 
       <div className="rounded-2xl border border-slate-200/90 dark:border-slate-700/90 bg-white/90 dark:bg-slate-900/70 p-6 shadow-soft">
