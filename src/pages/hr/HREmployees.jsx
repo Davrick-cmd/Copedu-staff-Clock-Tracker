@@ -31,6 +31,7 @@ function AddEmployeeModal({ users, branches, departments, employmentTypes = [], 
     employment_type: '',
     gender: '',
     phone: '',
+    date_of_birth: '',
     employee_id: '',
     rssb_number: '',
     national_id_or_passport: '',
@@ -95,6 +96,7 @@ function AddEmployeeModal({ users, branches, departments, employmentTypes = [], 
         employment_type: form.employment_type.trim() || undefined,
         gender: form.gender || undefined,
         phone: form.phone.trim() || undefined,
+        date_of_birth: form.date_of_birth.trim() || undefined,
         employee_id: form.employee_id.trim() || undefined,
         rssb_number: form.rssb_number.trim() || undefined,
         national_id_or_passport: form.national_id_or_passport.trim() || undefined,
@@ -325,14 +327,25 @@ function AddEmployeeModal({ users, branches, departments, employmentTypes = [], 
               ))}
             </select>
           </div>
-          <div>
-            {fieldLabel('', 'Work anniversary (hire date)')}
-            <input
-              type="date"
-              value={form.work_anniversary}
-              onChange={(e) => set('work_anniversary', e.target.value)}
-              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-            />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              {fieldLabel('', 'Work anniversary (hire date)')}
+              <input
+                type="date"
+                value={form.work_anniversary}
+                onChange={(e) => set('work_anniversary', e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              />
+            </div>
+            <div>
+              {fieldLabel('', 'Date of birth')}
+              <input
+                type="date"
+                value={form.date_of_birth}
+                onChange={(e) => set('date_of_birth', e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              />
+            </div>
           </div>
           <textarea
             value={form.hr_notes}
@@ -375,6 +388,8 @@ export function HREmployees() {
   const [newBranch, setNewBranch] = useState({ name: '', code: '', address: '' });
   const [addingBranch, setAddingBranch] = useState(false);
   const [bulkUploading, setBulkUploading] = useState(false);
+  const [bulkImportFile, setBulkImportFile] = useState(null);
+  const [bulkImportResult, setBulkImportResult] = useState(null);
   const toast = useToast();
 
   const load = () => api.getUsers().then(setUsers).catch(() => setUsers([])).finally(() => setLoading(false));
@@ -568,25 +583,73 @@ export function HREmployees() {
     }
   };
 
-  const handleBulkUploadRecords = async (file) => {
-    if (!file) return;
+  const downloadImportSampleCsv = () => {
+    const toCsvCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+    const headers = [
+      'No.',
+      'Last Name',
+      'First Name',
+      'Job Title',
+      'DEPARTMENT',
+      'Work anniversary (hire date)',
+      'BRANCH',
+      'Email',
+      'Employee ID',
+      'Date of Birth',
+      'Role',
+    ];
+    const rows = [
+      [1, 'MUGANGA', 'David', 'Head of IT', 'IT', '2024-09-24', 'HQ', 'david@example.com', 'E-001', '1990-05-17', 'employee'],
+      [2, 'DOE', 'Jane', 'HR Officer', 'HR', '2023-01-10', 'Kigali Branch', 'jane@example.com', 'E-002', '1995-11-02', 'employee'],
+    ];
+    const csv = [headers.map(toCsvCell).join(','), ...rows.map((line) => line.map(toCsvCell).join(','))].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'employee-import-sample.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('Employee import sample downloaded', 'success');
+  };
+
+  const normalizeBulkImportFile = async (file) => {
+    if (!file) return null;
+    const name = String(file.name || '').toLowerCase();
+    if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheetName = wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+      const csv = XLSX.utils.sheet_to_csv(ws);
+      return new File([csv], `${file.name.replace(/\.(xlsx|xls)$/i, '')}.csv`, { type: 'text/csv;charset=utf-8;' });
+    }
+    return file;
+  };
+
+  const handleBulkUploadRecords = async (dryRun) => {
+    if (!bulkImportFile) {
+      toast('Choose a CSV/Excel file first', 'error');
+      return;
+    }
     setBulkUploading(true);
     try {
-      let uploadFile = file;
-      const name = String(file.name || '').toLowerCase();
-      if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
-        const buf = await file.arrayBuffer();
-        const wb = XLSX.read(buf, { type: 'array' });
-        const sheetName = wb.SheetNames[0];
-        const ws = wb.Sheets[sheetName];
-        const csv = XLSX.utils.sheet_to_csv(ws);
-        uploadFile = new File([csv], `${file.name.replace(/\.(xlsx|xls)$/i, '')}.csv`, { type: 'text/csv' });
+      const uploadFile = await normalizeBulkImportFile(bulkImportFile);
+      const res = await api.bulkUpsertEmployeeRecords(uploadFile, { dryRun });
+      setBulkImportResult(res || null);
+      if (dryRun) {
+        toast(
+          `Preview: valid ${res?.rows_valid || 0}, invalid ${res?.rows_invalid || 0}`,
+          (res?.rows_invalid || 0) > 0 ? 'warning' : 'success'
+        );
+      } else {
+        toast(`Import done. Created: ${res?.created || 0}, Updated: ${res?.updated || 0}, Failed: ${(res?.failed || []).length}`, (res?.failed || []).length ? 'warning' : 'success');
+        await load();
       }
-      const res = await api.bulkUpsertEmployeeRecords(uploadFile);
-      toast(`Bulk upload done. Created: ${res.created || 0}, Updated: ${res.updated || 0}, Failed: ${(res.failed || []).length}`, (res.failed || []).length ? 'warning' : 'success');
-      await load();
     } catch (e) {
-      toast(e?.response?.data?.detail || 'Bulk upload failed', 'error');
+      toast(e?.response?.data?.detail || e?.message || 'Bulk upload failed', 'error');
     } finally {
       setBulkUploading(false);
     }
@@ -614,20 +677,13 @@ export function HREmployees() {
           >
             Download all details (CSV)
           </button>
-          <label className="shrink-0 px-4 py-2 rounded-xl bg-emerald-600 text-white font-medium hover:bg-emerald-700 cursor-pointer">
-            {bulkUploading ? 'Uploading…' : 'Bulk upload (CSV/Excel)'}
-            <input
-              type="file"
-              accept=".csv,.xlsx,.xls"
-              className="hidden"
-              disabled={bulkUploading}
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                handleBulkUploadRecords(f);
-                e.target.value = '';
-              }}
-            />
-          </label>
+          <button
+            type="button"
+            onClick={downloadImportSampleCsv}
+            className="shrink-0 px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 font-medium hover:bg-slate-50 dark:hover:bg-slate-800"
+          >
+            Download import sample
+          </button>
           <button
             type="button"
             onClick={() => setShowAdd(true)}
@@ -637,6 +693,64 @@ export function HREmployees() {
           </button>
         </div>
       </div>
+      <div className="rounded-xl border border-emerald-200 dark:border-emerald-900/40 bg-emerald-50/70 dark:bg-emerald-900/10 p-4 space-y-3">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-emerald-800 dark:text-emerald-300">Bulk employee update</h2>
+            <p className="text-xs text-emerald-700/90 dark:text-emerald-200/90">
+              Upload CSV/Excel to add or update details. Empty cells are ignored and existing staff are never removed.
+            </p>
+          </div>
+          <div className="text-xs text-slate-600 dark:text-slate-300">
+            {bulkImportFile ? `Selected: ${bulkImportFile.name}` : 'No file selected'}
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <input
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            disabled={bulkUploading}
+            onChange={(e) => setBulkImportFile(e.target.files?.[0] || null)}
+            className="shrink-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800"
+          />
+          <button
+            type="button"
+            disabled={bulkUploading || !bulkImportFile}
+            onClick={() => handleBulkUploadRecords(true)}
+            className="shrink-0 px-4 py-2 rounded-lg border border-emerald-400 text-emerald-700 dark:text-emerald-300 font-medium hover:bg-emerald-100/70 dark:hover:bg-emerald-900/20 disabled:opacity-50"
+          >
+            {bulkUploading ? 'Working…' : 'Preview upload'}
+          </button>
+          <button
+            type="button"
+            disabled={bulkUploading || !bulkImportFile}
+            onClick={() => handleBulkUploadRecords(false)}
+            className="shrink-0 px-4 py-2 rounded-lg bg-emerald-600 text-white font-medium hover:bg-emerald-700 disabled:opacity-50"
+          >
+            {bulkUploading ? 'Uploading…' : 'Apply upload'}
+          </button>
+        </div>
+      </div>
+      {bulkImportResult && (
+        <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 p-3 space-y-2">
+          <p className="text-sm text-slate-700 dark:text-slate-200">
+            Total: <strong>{bulkImportResult.rows_total || bulkImportResult.total_rows || 0}</strong> ·
+            Valid: <strong>{bulkImportResult.rows_valid || 0}</strong> ·
+            Invalid: <strong>{bulkImportResult.rows_invalid || (bulkImportResult.failed || []).length || 0}</strong> ·
+            Created: <strong>{bulkImportResult.created || 0}</strong> ·
+            Updated: <strong>{bulkImportResult.updated || 0}</strong>
+          </p>
+          {(bulkImportResult.failed || []).length > 0 && (
+            <div className="max-h-36 overflow-y-auto rounded border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-900/20 p-2">
+              {(bulkImportResult.failed || []).slice(0, 80).map((f, idx) => (
+                <p key={`${f.line || 'row'}-${idx}`} className="text-xs text-red-700 dark:text-red-300">
+                  Line {f.line || '?'}: {f.error}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <div className="flex flex-wrap gap-4">
         <input
           type="search"
@@ -833,9 +947,7 @@ export function HREmployees() {
                         className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm py-1 pr-6 min-w-[160px] max-w-[220px]"
                       >
                         <option value="">(Unassigned)</option>
-                        {u.department && !departmentOptions.includes(u.department) && (
-                          <option value={u.department}>{u.department} (current)</option>
-                        )}
+                        {u.department && !departmentOptions.includes(u.department) && <option value={u.department}>{u.department}</option>}
                         {departmentOptions.map((d) => (
                           <option key={d} value={d}>
                             {d}

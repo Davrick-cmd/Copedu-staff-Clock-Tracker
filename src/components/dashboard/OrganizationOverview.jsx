@@ -1,15 +1,32 @@
+import { useState } from 'react';
+import { useSelector } from 'react-redux';
 import { Link } from 'react-router-dom';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
-import { ROUTES } from '../../utils/constants';
+import * as api from '../../services/api';
+import { ROLES, ROUTES } from '../../utils/constants';
 import { formatDate } from '../../utils/formatters';
 import { downloadOrganizationDemographicsCsv } from '../../utils/organizationDemographicsCsv';
 import { StatTile } from './DashboardWidgets';
 import { GenderDonutChart } from './InsightChartCards';
 
+function localTodayIso() {
+  const t = new Date();
+  const y = t.getFullYear();
+  const m = String(t.getMonth() + 1).padStart(2, '0');
+  const d = String(t.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 /**
  * @param {{ data: object | null, loading?: boolean, compactTitle?: boolean }} props
  */
 export function OrganizationOverview({ data, loading, compactTitle = false }) {
+  const role = useSelector((s) => s.auth.profile?.role);
+  const canSendAnniversaryEmails = role === ROLES.HR || role === ROLES.ADMIN;
+  const [anniversaryRunDate, setAnniversaryRunDate] = useState(localTodayIso);
+  const [anniversaryBusy, setAnniversaryBusy] = useState(false);
+  const [anniversaryNotice, setAnniversaryNotice] = useState(null);
+
   if (loading) {
     return (
       <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 p-6 animate-pulse shadow-soft">
@@ -39,6 +56,12 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
   const genderRecorded = (wm.women ?? 0) + (wm.men ?? 0) + (wm.other_or_not_set ?? 0);
   const womenPct = genderRecorded > 0 ? Math.round(((wm.women ?? 0) / genderRecorded) * 1000) / 10 : 0;
   const menPct = genderRecorded > 0 ? Math.round(((wm.men ?? 0) / genderRecorded) * 1000) / 10 : 0;
+  const today = new Date();
+  const daysUntil = (isoDate) => {
+    const d = new Date(`${isoDate}T00:00:00`);
+    const ms = d.getTime() - new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+    return Math.max(0, Math.round(ms / 86400000));
+  };
 
   return (
     <section className="space-y-5">
@@ -108,7 +131,12 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
         <StatTile label="Currently acting" value={data.acting_now_count ?? 0} hint="Active acting assignments today." variant="blue" />
         <StatTile label="Probation due approval" value={data.probation_due_count ?? 0} hint="Probation ended, pending HR approval." variant="amber" />
         <StatTile label="On probation" value={data.probation_upcoming_count ?? 0} hint="Probation end date still in future." variant="default" />
-        <StatTile label="Employment types" value={(data.by_employment_type || []).length} hint="Distinct employment-type groups." variant="green" />
+        <StatTile
+          label="Retiring soon (60 years)"
+          value={age.retiring_within_12_months_count ?? 0}
+          hint={`${age.retirement_due_count ?? 0} already at/above retirement age.`}
+          variant="green"
+        />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -267,23 +295,128 @@ export function OrganizationOverview({ data, loading, compactTitle = false }) {
       </div>
 
       <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white/90 dark:bg-slate-900/70 p-5 shadow-soft">
-        <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-3">Upcoming work anniversaries (30 days)</h3>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between mb-3">
+          <h3 className="text-sm font-bold text-slate-900 dark:text-white">Upcoming work anniversaries (30 days)</h3>
+          {canSendAnniversaryEmails && (
+            <div className="flex flex-col gap-2 sm:items-end shrink-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
+                  <span className="whitespace-nowrap">Send for date</span>
+                  <input
+                    type="date"
+                    value={anniversaryRunDate}
+                    onChange={(e) => setAnniversaryRunDate(e.target.value)}
+                    disabled={anniversaryBusy}
+                    className="rounded-lg border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-xs px-2 py-1.5"
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={anniversaryBusy}
+                  onClick={async () => {
+                    setAnniversaryBusy(true);
+                    setAnniversaryNotice(null);
+                    try {
+                      const res = await api.hrSendWorkAnniversaryEmails({
+                        runDate: anniversaryRunDate,
+                        dryRun: true,
+                      });
+                      if (res.enabled === false && res.detail) {
+                        setAnniversaryNotice({ type: 'err', text: String(res.detail) });
+                      } else {
+                        setAnniversaryNotice({
+                          type: 'ok',
+                          text: `Preview: ${res.sent ?? 0} would be sent, ${res.skipped_duplicate ?? 0} skipped (already emailed this year). Eligible today: ${res.eligible ?? 0}.`,
+                        });
+                      }
+                    } catch (e) {
+                      const msg = e?.response?.data?.detail || e?.message || 'Preview failed';
+                      setAnniversaryNotice({ type: 'err', text: Array.isArray(msg) ? msg.map((x) => x.msg || x).join(' ') : String(msg) });
+                    } finally {
+                      setAnniversaryBusy(false);
+                    }
+                  }}
+                  className="inline-flex items-center justify-center px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 hover:border-primary-400 disabled:opacity-50"
+                >
+                  Preview emails
+                </button>
+                <button
+                  type="button"
+                  disabled={anniversaryBusy}
+                  onClick={async () => {
+                    if (
+                      !window.confirm(
+                        'Send work anniversary emails now for the selected date? Anyone already logged for this celebration year is skipped (same as automatic sends).'
+                      )
+                    ) {
+                      return;
+                    }
+                    setAnniversaryBusy(true);
+                    setAnniversaryNotice(null);
+                    try {
+                      const res = await api.hrSendWorkAnniversaryEmails({
+                        runDate: anniversaryRunDate,
+                        dryRun: false,
+                      });
+                      if (res.enabled === false && res.detail) {
+                        setAnniversaryNotice({ type: 'err', text: String(res.detail) });
+                      } else {
+                        setAnniversaryNotice({
+                          type: 'ok',
+                          text: `Sent ${res.sent ?? 0} email(s). ${res.skipped_duplicate ?? 0} skipped (already sent this year). Eligible on that date: ${res.eligible ?? 0}.`,
+                        });
+                      }
+                    } catch (e) {
+                      const msg = e?.response?.data?.detail || e?.message || 'Send failed';
+                      setAnniversaryNotice({ type: 'err', text: Array.isArray(msg) ? msg.map((x) => x.msg || x).join(' ') : String(msg) });
+                    } finally {
+                      setAnniversaryBusy(false);
+                    }
+                  }}
+                  className="inline-flex items-center justify-center px-3 py-1.5 rounded-lg text-xs font-semibold bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50"
+                >
+                  Send emails now
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 max-w-md sm:text-right">
+                Manual send uses the same duplicate log as the daily job—no one gets two emails for the same anniversary year.
+              </p>
+            </div>
+          )}
+        </div>
+        {anniversaryNotice && (
+          <p
+            className={`text-sm mb-3 rounded-lg px-3 py-2 ${
+              anniversaryNotice.type === 'err'
+                ? 'bg-red-50 text-red-800 dark:bg-red-900/20 dark:text-red-200'
+                : 'bg-emerald-50 text-emerald-900 dark:bg-emerald-900/25 dark:text-emerald-100'
+            }`}
+          >
+            {anniversaryNotice.text}
+          </p>
+        )}
         {ann.length === 0 ? (
           <p className="text-sm text-slate-500 dark:text-slate-400">
             No anniversaries in the next 30 days, or hire dates are not recorded yet. Add{' '}
             <strong className="text-slate-700 dark:text-slate-300">Work anniversary (hire date)</strong> on employee records.
           </p>
         ) : (
-          <ul className="flex flex-wrap gap-2">
+          <ul className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {ann.map((a) => (
               <li
                 key={a.user_id}
-                className="inline-flex flex-col px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-slate-100 dark:border-slate-700 text-sm"
+                className="rounded-xl border border-slate-200 dark:border-slate-700 bg-gradient-to-r from-slate-50 to-white dark:from-slate-800/80 dark:to-slate-900/80 p-3 text-sm shadow-sm"
               >
-                <span className="font-medium text-slate-900 dark:text-white">{a.full_name}</span>
-                <span className="text-xs text-slate-500 dark:text-slate-400">
-                  {formatDate(a.next_celebration_date)} · {a.years_of_service ?? '-'} yrs
-                </span>
+                <div className="flex items-start justify-between gap-2">
+                  <span className="font-semibold text-slate-900 dark:text-white leading-tight">{a.full_name}</span>
+                  <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-primary-50 text-primary-700 dark:bg-primary-900/30 dark:text-primary-200 whitespace-nowrap">
+                    {daysUntil(a.next_celebration_date) === 0 ? 'Today' : `${daysUntil(a.next_celebration_date)}d`}
+                  </span>
+                </div>
+                <div className="mt-2 flex items-center justify-between text-xs">
+                  <span className="text-slate-500 dark:text-slate-400">{formatDate(a.next_celebration_date)}</span>
+                  <span className="font-semibold text-slate-700 dark:text-slate-200">{a.years_of_service ?? '-'} yrs</span>
+                </div>
               </li>
             ))}
           </ul>

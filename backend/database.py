@@ -886,6 +886,8 @@ def init_db():
         for col, sql in [
             ("gender", "ALTER TABLE users ADD COLUMN gender TEXT"),
             ("phone", "ALTER TABLE users ADD COLUMN phone TEXT"),
+            ("grade", "ALTER TABLE users ADD COLUMN grade TEXT"),
+            ("echelon", "ALTER TABLE users ADD COLUMN echelon TEXT"),
             ("employee_code", "ALTER TABLE users ADD COLUMN employee_code TEXT"),
             ("job_title", "ALTER TABLE users ADD COLUMN job_title TEXT"),
             ("division", "ALTER TABLE users ADD COLUMN division TEXT"),
@@ -943,6 +945,18 @@ def init_db():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, read_at)")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS work_anniversary_email_logs (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                celebration_year INTEGER NOT NULL,
+                sent_to TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                UNIQUE(user_id, celebration_year)
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_anniversary_email_logs_user_year ON work_anniversary_email_logs(user_id, celebration_year)")
 
 
 def row_to_dict(row):

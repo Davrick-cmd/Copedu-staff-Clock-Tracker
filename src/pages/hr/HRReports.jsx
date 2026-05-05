@@ -120,6 +120,11 @@ export function HRReports({ reportScope = 'all' }) {
   const [reportType, setReportType] = useState('all');
   const [attendanceDepartment, setAttendanceDepartment] = useState('');
   const [attendanceUserId, setAttendanceUserId] = useState('');
+  /** Daily table + CSV/XLSX: all | present | late | absent (matches row.status from API). */
+  const [dailyTableFilter, setDailyTableFilter] = useState('all');
+  const [rawDepartmentOptions, setRawDepartmentOptions] = useState([]);
+  const [rawEmployeeOptions, setRawEmployeeOptions] = useState([]);
+  const [rawEmployeeSearch, setRawEmployeeSearch] = useState('');
   const [modal, setModal] = useState(null);
   const [recognitionReport, setRecognitionReport] = useState(null);
   const [recognitionReportSection, setRecognitionReportSection] = useState('recent');
@@ -176,6 +181,21 @@ export function HRReports({ reportScope = 'all' }) {
   useEffect(() => {
     if (reportMode !== REPORT_MODE.LEAVE) return;
     api.getLeaveHrFilters().then((d) => setLeaveDepartments(d.departments || [])).catch(() => setLeaveDepartments([]));
+  }, [reportMode]);
+
+  useEffect(() => {
+    if (reportMode !== REPORT_MODE.RAW) return;
+    api.getDepartmentOptions().then(setRawDepartmentOptions).catch(() => setRawDepartmentOptions([]));
+    api
+      .getUsers()
+      .then((users) => {
+        const staff = (users || []).filter((u) => (u.role || '').toLowerCase() === 'employee');
+        staff.sort((a, b) =>
+          String(a.full_name || '').localeCompare(String(b.full_name || ''), undefined, { sensitivity: 'base' }),
+        );
+        setRawEmployeeOptions(staff);
+      })
+      .catch(() => setRawEmployeeOptions([]));
   }, [reportMode]);
 
   useEffect(() => {
@@ -253,9 +273,26 @@ export function HRReports({ reportScope = 'all' }) {
     }
   }, [reportMode, fromDate, toDate, branchId, reportType, attendanceDepartment, attendanceUserId]);
 
+  const displayedRawLogs = useMemo(() => {
+    const q = rawEmployeeSearch.trim().toLowerCase();
+    if (!q) return logs;
+    return (logs || []).filter((l) => {
+      const name = l.users?.full_name || '';
+      const email = l.users?.email || '';
+      const department = l.users?.department || '';
+      const uid = l.user_id || '';
+      return (
+        String(name).toLowerCase().includes(q) ||
+        String(email).toLowerCase().includes(q) ||
+        String(department).toLowerCase().includes(q) ||
+        String(uid).toLowerCase().includes(q)
+      );
+    });
+  }, [logs, rawEmployeeSearch]);
+
   const exportCSV = () => {
     const headers = ['Date', 'Employee', 'Email', 'Department', 'Clock In', 'Clock Out', 'Minutes', 'Late (min)', 'Overtime (min)', 'Status', 'IP'];
-    const rows = logs.map((l) => [
+    const rows = displayedRawLogs.map((l) => [
       formatDate(l.clock_in_at),
       l.users?.full_name || '',
       l.users?.email || '',
@@ -274,7 +311,7 @@ export function HRReports({ reportScope = 'all' }) {
   };
 
   const exportRawAttendanceXlsx = () => {
-    const json = logs.map((l) => ({
+    const json = displayedRawLogs.map((l) => ({
       date: formatDate(l.clock_in_at),
       employee: l.users?.full_name || '',
       email: l.users?.email || '',
@@ -291,18 +328,35 @@ export function HRReports({ reportScope = 'all' }) {
     toast('Attendance XLSX downloaded', 'success');
   };
 
+  const filteredDailyTable = useMemo(() => {
+    const rows = dailySummary?.daily_table || [];
+    if (dailyTableFilter === 'all') return rows;
+    return rows.filter((r) => {
+      const s = String(r.status || '').toLowerCase();
+      if (dailyTableFilter === 'absent') return s === 'absent';
+      if (dailyTableFilter === 'late') return s === 'late';
+      if (dailyTableFilter === 'present') return s === 'present';
+      return true;
+    });
+  }, [dailySummary?.daily_table, dailyTableFilter]);
+
   const exportDailyReportCsv = () => {
     if (!dailySummary) return;
     const sum = dailySummary.summary || {};
+    const filterNote =
+      dailyTableFilter !== 'all'
+        ? [`Table filter (rows below),${escapeCsvCell(dailyTableFilter)}`, '']
+        : [];
     const lines = [
       `Daily Attendance Report,${escapeCsvCell(dailySummary.date)}`,
+      ...filterNote,
       'Summary',
       'Total employees,Present count,Present %,Absent count,Absent %,Late count,Late %',
       [sum.total_employees ?? dailySummary.total_staff, sum.present_count ?? dailySummary.present, sum.present_pct ?? dailySummary.pct_present, sum.absent_count ?? dailySummary.absent, sum.absent_pct ?? dailySummary.pct_absent, sum.late_count ?? dailySummary.late, sum.late_pct ?? dailySummary.pct_late].map(escapeCsvCell).join(','),
       '',
       'Daily table',
       'Employee name,Department,Check-in,Check-out,Status,Late minutes',
-      ...(dailySummary.daily_table || []).map((r) => [
+      ...filteredDailyTable.map((r) => [
         r.employee_name ?? '',
         r.department ?? '',
         r.check_in ?? '',
@@ -320,6 +374,7 @@ export function HRReports({ reportScope = 'all' }) {
     const sum = dailySummary.summary || {};
     const summaryAoa = [
       ['Daily attendance report', dailySummary.date],
+      ...(dailyTableFilter !== 'all' ? [['Table filter (rows sheet)', dailyTableFilter]] : []),
       [],
       ['Total employees', 'Present', 'Present %', 'Absent', 'Absent %', 'Late', 'Late %'],
       [
@@ -332,7 +387,7 @@ export function HRReports({ reportScope = 'all' }) {
         sum.late_pct ?? dailySummary.pct_late,
       ],
     ];
-    const tableJson = (dailySummary.daily_table || []).map((r) => ({
+    const tableJson = filteredDailyTable.map((r) => ({
       employee_name: r.employee_name ?? '',
       department: r.department ?? '',
       check_in: r.check_in ?? '',
@@ -984,7 +1039,7 @@ export function HRReports({ reportScope = 'all' }) {
     if (performanceExportType === 'print_pdf') return printReportSafe();
   };
 
-  const byDate = logs.reduce((acc, l) => {
+  const byDate = displayedRawLogs.reduce((acc, l) => {
     const d = (l.clock_in_at || '').slice(0, 10);
     if (!d) return acc;
     acc[d] = (acc[d] || 0) + 1;
@@ -1173,6 +1228,21 @@ export function HRReports({ reportScope = 'all' }) {
         {reportMode === REPORT_MODE.DAILY && (
           <>
             <input type="date" value={dailyDate} onChange={(e) => setDailyDate(e.target.value)} className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white" />
+            <label className="sr-only" htmlFor="daily-table-filter">
+              Table rows
+            </label>
+            <select
+              id="daily-table-filter"
+              value={dailyTableFilter}
+              onChange={(e) => setDailyTableFilter(e.target.value)}
+              className="rounded-xl border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 text-sm text-slate-900 dark:text-white shadow-sm max-w-[11rem]"
+              title="Filter which staff appear in the daily table and in CSV / XLSX (summary totals stay for the full day)"
+            >
+              <option value="all">All — table</option>
+              <option value="present">Present only</option>
+              <option value="late">Late only</option>
+              <option value="absent">Absent only</option>
+            </select>
             <button type="button" onClick={exportDailyReportXlsx} disabled={!dailySummary} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed">Download XLSX</button>
             <button type="button" onClick={exportDailyReportCsv} disabled={!dailySummary} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">CSV</button>
             <button type="button" onClick={printReportSafe} disabled={!dailySummary} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
@@ -1204,23 +1274,55 @@ export function HRReports({ reportScope = 'all' }) {
               <option value="late">Late only</option>
               <option value="overtime">Overtime only</option>
             </select>
-            <input
-              type="text"
+            <label className="sr-only" htmlFor="raw-dept-filter">
+              Department
+            </label>
+            <select
+              id="raw-dept-filter"
               value={attendanceDepartment}
               onChange={(e) => setAttendanceDepartment(e.target.value)}
-              placeholder="Department filter"
-              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
-            />
-            <input
-              type="text"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white max-w-[14rem]"
+              title="Filter by department"
+            >
+              <option value="">All departments</option>
+              {rawDepartmentOptions.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+            <label className="sr-only" htmlFor="raw-employee-filter">
+              Employee
+            </label>
+            <select
+              id="raw-employee-filter"
               value={attendanceUserId}
               onChange={(e) => setAttendanceUserId(e.target.value)}
-              placeholder="Employee ID filter"
-              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white max-w-[16rem]"
+              title="Filter by employee name"
+            >
+              <option value="">All employees</option>
+              {rawEmployeeOptions.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.full_name || u.email || u.id}
+                </option>
+              ))}
+            </select>
+            <label className="sr-only" htmlFor="raw-employee-search">
+              Search employee
+            </label>
+            <input
+              id="raw-employee-search"
+              type="text"
+              value={rawEmployeeSearch}
+              onChange={(e) => setRawEmployeeSearch(e.target.value)}
+              placeholder="Search employee..."
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm text-gray-900 dark:text-white max-w-[16rem]"
+              title="Search within returned rows by employee name/email/department"
             />
-            <button type="button" onClick={exportRawAttendanceXlsx} disabled={!logs.length} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50">Download XLSX</button>
-            <button type="button" onClick={exportCSV} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800">CSV</button>
-            <button type="button" onClick={printReportSafe} disabled={!logs.length} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
+            <button type="button" onClick={exportRawAttendanceXlsx} disabled={!displayedRawLogs.length} className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50">Download XLSX</button>
+            <button type="button" onClick={exportCSV} disabled={!displayedRawLogs.length} className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed">CSV</button>
+            <button type="button" onClick={printReportSafe} disabled={!displayedRawLogs.length} className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50">Print / PDF</button>
           </>
         )}
         {reportMode === REPORT_MODE.LEAVE && (
@@ -1471,6 +1573,15 @@ export function HRReports({ reportScope = 'all' }) {
               </div>
               {/* Daily table: Employee Name, Department, Check-In, Check-Out, Status, Late Minutes */}
               <h2 className="font-semibold text-gray-800 dark:text-white">Daily attendance</h2>
+              {dailyTableFilter !== 'all' && (
+                <p className="text-sm text-gray-500 dark:text-gray-400 -mt-3 mb-2">
+                  Showing {filteredDailyTable.length} of {(dailySummary.daily_table || []).length} rows
+                  {dailyTableFilter === 'present' && ' (on-time present)'}
+                  {dailyTableFilter === 'late' && ' (late)'}
+                  {dailyTableFilter === 'absent' && ' (absent)'}
+                  . Summary cards above are still for the full day.
+                </p>
+              )}
               <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-x-auto">
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                   <thead className="bg-gray-50 dark:bg-gray-700">
@@ -1484,7 +1595,7 @@ export function HRReports({ reportScope = 'all' }) {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                    {(dailySummary.daily_table || []).map((row, i) => (
+                    {filteredDailyTable.map((row, i) => (
                       <tr key={i} className="text-gray-700 dark:text-gray-300 text-sm">
                         <td className="px-4 py-2 font-medium">{row.employee_name || '-'}</td>
                         <td className="px-4 py-2">{row.department || '-'}</td>
@@ -1639,7 +1750,7 @@ export function HRReports({ reportScope = 'all' }) {
           )}
           {loading ? (
             <div className="flex justify-center py-8"><LoadingSpinner /></div>
-          ) : !logs.length ? (
+          ) : !displayedRawLogs.length ? (
             <EmptyState title="No records" message="No attendance in the selected period." />
           ) : (
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow overflow-hidden">
@@ -1660,7 +1771,7 @@ export function HRReports({ reportScope = 'all' }) {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                    {logs.map((log) => (
+                    {displayedRawLogs.map((log) => (
                       <tr key={log.id} className="text-gray-700 dark:text-gray-300">
                         <td className="px-4 py-2">{formatDate(log.clock_in_at)}</td>
                         <td className="px-4 py-2">{log.users?.full_name || '-'}</td>

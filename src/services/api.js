@@ -68,8 +68,9 @@ export async function getSession() {
   try {
     const { data } = await api.get('/auth/me', { headers: { Authorization: `Bearer ${token}` } });
     return { session: data.session, profile: data.profile };
-  } catch {
-    return null;
+  } catch (e) {
+    if (e?.response?.status === 401) return null;
+    throw e;
   }
 }
 
@@ -273,10 +274,11 @@ export async function exportEmployeeRecordsCsv() {
   return data || { filename: 'employee-records.csv', csv: '' };
 }
 
-export async function bulkUpsertEmployeeRecords(file) {
+export async function bulkUpsertEmployeeRecords(file, { dryRun = false } = {}) {
   const formData = new FormData();
   formData.append('file', file);
   const { data } = await api.post('/users/records/bulk-upsert', formData, {
+    params: { dry_run: dryRun ? 'true' : 'false' },
     headers: { 'Content-Type': 'multipart/form-data' },
   });
   return data;
@@ -290,6 +292,17 @@ export async function approveUserProbation(userId) {
 /** HR/Admin: workforce snapshot - departments, branches, gender mix, upcoming work anniversaries. */
 export async function getOrganizationOverview() {
   const { data } = await api.get('/hr/organization-overview');
+  return data;
+}
+
+/**
+ * HR/Admin: preview or send work-anniversary emails for hires celebrating on `runDate` (YYYY-MM-DD, defaults server-side to today UTC).
+ * Duplicate protection: same log as automatic job; already-sent users for that celebration year are skipped.
+ */
+export async function hrSendWorkAnniversaryEmails({ runDate, dryRun = true } = {}) {
+  const params = { dry_run: dryRun ? 'true' : 'false' };
+  if (runDate) params.run_date = String(runDate).slice(0, 10);
+  const { data } = await api.post('/hr/work-anniversaries/send', null, { params });
   return data;
 }
 
@@ -980,6 +993,19 @@ export async function createLeaveBalanceAdjustment(payload) {
 export async function assignLeaveTypeToEmployee(payload) {
   const { data } = await api.post('/leave/hr/assign-type', payload);
   return data;
+}
+
+export async function importLeaveBalancesCsv(file, { dryRun = true, defaultYear } = {}) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const params = { dry_run: dryRun ? 'true' : 'false' };
+  if (defaultYear != null) params.default_year = defaultYear;
+  const { data } = await api.post('/leave/hr/balances/import', formData, {
+    params,
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120000,
+  });
+  return data || {};
 }
 
 export async function approveLeaveBalanceAdjustment(adjustmentId, comment = '') {

@@ -44,6 +44,9 @@ export function HRLeaveBalances() {
   const [holidayForm, setHolidayForm] = useState({ day_date: '', reason: '' });
   const [holidayBusy, setHolidayBusy] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
+  const [importFile, setImportFile] = useState(null);
+  const [importingBalances, setImportingBalances] = useState(false);
+  const [importResult, setImportResult] = useState(null);
 
   const load = async () => {
     setLoading(true);
@@ -154,7 +157,7 @@ export function HRLeaveBalances() {
   };
 
   const exportCsv = () => {
-    const headers = ['Employee', 'Email', 'Department', 'Leave Type', 'Allocated Days', 'Used Days', 'Remaining Days'];
+    const headers = ['Employee', 'Email', 'Department', 'Leave Type', 'Allocated Days', 'Used Days', 'Remaining'];
     const body = filtered.map((r) => [
       r.full_name,
       r.email,
@@ -217,6 +220,60 @@ export function HRLeaveBalances() {
     a.click();
     URL.revokeObjectURL(url);
     toast('Adjustment audit CSV downloaded', 'success');
+  };
+
+  const downloadImportTemplateCsv = () => {
+    const headers = [
+      'No.',
+      'Last Name',
+      'First Name',
+      'Job Title',
+      'DEPARTMENT',
+      'Work anniversary (hire date)',
+      'Leave 2024',
+      'Leave 2025',
+      'TOTAL',
+      'Leave Taken 2025',
+      'Remaining',
+      'BRANCH',
+      'Year',
+      'Leave Type Code',
+    ];
+    const rowsCsv = [
+      [1, 'MUGANGA', 'David', 'Head of IT', 'IT', '2024-09-24', 0, 24, 24, 4, 20, 'HQ', year, 'ANNUAL'],
+      [2, 'DOE', 'Jane', 'Officer', 'HR', '2023-01-10', 0, 20, 20, 2, 18, 'Kigali Branch', year, 'ANNUAL'],
+    ];
+    const csv = [headers.join(','), ...rowsCsv.map((line) => line.map(toCsvCell).join(','))].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `leave-balance-import-template-${year}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('Template CSV downloaded', 'success');
+  };
+
+  const runBalanceImport = async (dryRun) => {
+    if (!importFile) {
+      toast('Choose a CSV file first', 'error');
+      return;
+    }
+    setImportingBalances(true);
+    try {
+      const result = await api.importLeaveBalancesCsv(importFile, { dryRun, defaultYear: year });
+      setImportResult(result || null);
+      if (dryRun) {
+        toast(`Preview complete: ${result?.rows_valid || 0} valid, ${result?.rows_invalid || 0} invalid`, result?.rows_invalid ? 'warning' : 'success');
+      } else {
+        toast(`Imported ${result?.rows_applied || 0} leave balance rows`, 'success');
+        await load();
+      }
+    } catch (e) {
+      toast(e?.response?.data?.detail || e?.message || 'Import failed', 'error');
+    } finally {
+      setImportingBalances(false);
+    }
   };
 
   const onAdjustTargetChange = (next) => {
@@ -442,6 +499,63 @@ export function HRLeaveBalances() {
         >
           {recoBusy ? 'Applying rollover…' : 'Apply year-end rollover (all staff)'}
         </button>
+      </div>
+
+      <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-5 shadow-sm space-y-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Legacy leave balances import (HR)</h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+            Upload balances exported from the old system (Excel saved as CSV). First run <strong>Preview</strong>, then <strong>Apply import</strong>.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-3 items-center">
+          <button type="button" onClick={downloadImportTemplateCsv} className="px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700">
+            Download template CSV
+          </button>
+          <input
+            type="file"
+            accept=".csv,text/csv"
+            onChange={(e) => setImportFile(e.target.files?.[0] || null)}
+            className="text-sm text-gray-700 dark:text-gray-300"
+          />
+          <button
+            type="button"
+            disabled={importingBalances || !importFile}
+            onClick={() => runBalanceImport(true)}
+            className="px-4 py-2 rounded-lg border border-primary-300 text-primary-700 dark:text-primary-300 bg-primary-50 dark:bg-primary-900/20 text-sm font-medium hover:bg-primary-100 dark:hover:bg-primary-900/30 disabled:opacity-50"
+          >
+            {importingBalances ? 'Working…' : 'Preview'}
+          </button>
+          <button
+            type="button"
+            disabled={importingBalances || !importFile}
+            onClick={() => {
+              if (!window.confirm('Apply this import to leave balances now? This will update existing balances for matching employee/type/year rows.')) return;
+              runBalanceImport(false);
+            }}
+            className="px-4 py-2 rounded-lg bg-primary-600 text-white text-sm font-semibold hover:bg-primary-700 disabled:opacity-50"
+          >
+            {importingBalances ? 'Applying…' : 'Apply import'}
+          </button>
+        </div>
+        {importResult && (
+          <div className="rounded-lg border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-900/30 p-3 text-sm space-y-2">
+            <p className="text-slate-700 dark:text-slate-300">
+              File: <strong>{importResult.filename || '-'}</strong> · Total: <strong>{importResult.rows_total || 0}</strong> ·
+              Valid: <strong>{importResult.rows_valid || 0}</strong> · Invalid: <strong>{importResult.rows_invalid || 0}</strong> ·
+              Applied: <strong>{importResult.rows_applied || 0}</strong>
+            </p>
+            {(importResult.errors || []).length > 0 && (
+              <div className="max-h-40 overflow-y-auto rounded border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-900/20 p-2">
+                {(importResult.errors || []).map((er, idx) => (
+                  <p key={`${er.line}-${idx}`} className="text-xs text-red-700 dark:text-red-300">
+                    Line {er.line}: {er.error}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-5 shadow-sm space-y-4">

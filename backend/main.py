@@ -15,6 +15,7 @@ import sqlite3
 import ssl
 import threading
 import time as _time
+import unicodedata
 from datetime import date, datetime, timedelta, time, timezone
 from email.message import EmailMessage
 
@@ -518,11 +519,39 @@ def startup():
         b.start()
     except Exception as e:
         logger.warning("Auto DB backup startup failed: %s", e)
+    try:
+        # Send once on startup (duplicate-protected), then continue daily in background.
+        _send_work_anniversary_emails_for_date(datetime.utcnow().date(), dry_run=False)
+        wa = threading.Thread(target=_work_anniversary_email_loop, daemon=True)
+        wa.start()
+    except Exception as e:
+        logger.warning("Work anniversary email startup failed: %s", e)
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/hr/work-anniversaries/send")
+def hr_send_work_anniversary_emails(
+    run_date: str | None = Query(None, description="Optional date in YYYY-MM-DD; defaults to today (UTC)"),
+    dry_run: bool = Query(True, description="Preview only; no emails/log writes when true"),
+    user_id: str = Depends(get_current_user_id),
+):
+    _require_roles(user_id, ("admin", "hr"))
+    target = datetime.utcnow().date()
+    if run_date:
+        try:
+            target = datetime.strptime(run_date[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="run_date must be YYYY-MM-DD")
+    # HR manual run: always evaluate candidates and respect duplicate log, even when automatic sends are disabled.
+    result = _send_work_anniversary_emails_for_date(
+        target, dry_run=bool(dry_run), respect_feature_flag=False
+    )
+    result["dry_run"] = bool(dry_run)
+    return result
 
 
 # ---------- Auth routes ----------
@@ -830,36 +859,50 @@ def _get_max_work_hours_auto_clock_out():
 
 
 def _run_auto_clock_out_over_max_hours():
-    """Find any open attendance sessions that have exceeded max work hours and auto clock-out."""
-    max_hours = _get_max_work_hours_auto_clock_out()
+    """Auto clock-out any open sessions at 22:00 local time (missing clock-out)."""
     lunch_deduction = _get_lunch_deduction_minutes()
+    tz_name = _get_timezone()
     now_utc = datetime.now(timezone.utc)
-    max_minutes = max_hours * 60
+
     with cursor() as c:
         c.execute("SELECT id, clock_in_at FROM attendance_logs WHERE clock_out_at IS NULL")
         rows = c.fetchall()
+
     for row in rows or []:
         log_id = row[0]
         clock_in_str = row[1]
         if not clock_in_str:
             continue
+
         in_dt = _parse_iso(clock_in_str)
         if in_dt.tzinfo is None:
             in_dt = in_dt.replace(tzinfo=timezone.utc)
-        elapsed_hours = (now_utc - in_dt).total_seconds() / 3600
-        if elapsed_hours < max_hours:
+
+        # Close at 22:00 on the local day the user clocked in.
+        if ZoneInfo and tz_name:
+            local_tz = ZoneInfo(tz_name)
+            in_local = in_dt.astimezone(local_tz)
+            out_local = in_local.replace(hour=22, minute=0, second=0, microsecond=0)
+            out_utc = out_local.astimezone(timezone.utc)
+        else:
+            # Fallback: assume UTC.
+            out_utc = in_dt.replace(hour=22, minute=0, second=0, microsecond=0)
+
+        # Only auto-clock once 22:00 has actually passed.
+        if now_utc < out_utc:
             continue
-        # Auto clock-out at exactly clock_in + max_hours (cap recorded shift)
-        out_dt = in_dt + timedelta(hours=max_hours)
-        out_iso = out_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        total_minutes = max(0, max_minutes - lunch_deduction)
+
+        out_iso = out_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        raw_minutes = int((out_utc - in_dt).total_seconds() / 60)
+        total_minutes = max(0, raw_minutes - lunch_deduction)
+
         try:
             with cursor() as c:
                 c.execute(
                     "UPDATE attendance_logs SET clock_out_at = ?, total_minutes = ?, updated_at = ? WHERE id = ?",
                     (out_iso, total_minutes, out_iso, log_id),
                 )
-            logger.info("Auto clock-out: log_id=%s exceeded %s hours", log_id, max_hours)
+            logger.info("Auto clock-out: log_id=%s set to 22:00 local", log_id)
         except Exception as e:
             logger.warning("Auto clock-out failed for log_id=%s: %s", log_id, e)
 
@@ -2147,6 +2190,8 @@ class CreateUserRequest(BaseModel):
     manager_id: str | None = None
     gender: str | None = None
     phone: str | None = None
+    grade: str | None = None
+    echelon: str | None = None
     employee_id: str | None = None
     employee_code: str | None = None
     division: str | None = None
@@ -2230,6 +2275,8 @@ def create_user(req: CreateUserRequest, current_user_id: str = Depends(get_curre
     manager_id = (req.manager_id or "").strip() or None
     gender = (req.gender or "").strip() or None
     phone = (req.phone or "").strip() or None
+    grade = (req.grade or "").strip() or None
+    echelon = (req.echelon or "").strip() or None
     emp_id = (req.employee_id or "").strip() or None
     emp_code = (req.employee_code or "").strip() or None
     division = (req.division or "").strip() or None
@@ -2282,11 +2329,11 @@ def create_user(req: CreateUserRequest, current_user_id: str = Depends(get_curre
             """
             INSERT INTO users (
                 id, email, password_hash, full_name, role, ad_username, branch_id, department, manager_id,
-                gender, phone, employee_id, employee_code, division, job_title, work_anniversary, hr_notes,
+                gender, phone, grade, echelon, employee_id, employee_code, division, job_title, work_anniversary, hr_notes,
                 position_category, employment_type, acting_for_user_id, acting_start_date, acting_end_date, probation_end_date,
                 rssb_number, national_id_or_passport, emergency_contact_name, emergency_contact_phone, emergency_contact_relationship
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 uid,
@@ -2300,6 +2347,8 @@ def create_user(req: CreateUserRequest, current_user_id: str = Depends(get_curre
                 manager_id,
                 gender,
                 phone,
+                grade,
+                echelon,
                 emp_id,
                 emp_code,
                 division,
@@ -2406,7 +2455,10 @@ def bulk_import_users(
     try:
         content = file.file.read()
         if isinstance(content, bytes):
-            content = content.decode("utf-8-sig")
+            try:
+                content = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                content = content.decode("latin-1")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
     domain = (_get_ldap_config().get("ldap_email_domain") or "copeduplc.rw").strip() or "copeduplc.rw"
@@ -2418,7 +2470,7 @@ def bulk_import_users(
     fieldnames = [f.strip().lower() for f in (reader.fieldnames or [])]
     if "username" not in fieldnames or "role" not in fieldnames:
         raise HTTPException(status_code=400, detail="CSV must have columns: username, role. Optional: full_name, email, department, branch")
-    for row in reader:
+    for line_no, row in enumerate(reader, start=2):
         raw = {k.strip(): v.strip() if isinstance(v, str) else "" for k, v in row.items() if k}
         row_lower = {k.lower(): v for k, v in raw.items()}
         username = (row_lower.get("username") or "").strip()
@@ -2476,7 +2528,7 @@ def export_user_records_csv(current_user_id: str = Depends(get_current_user_id))
     _require_roles(current_user_id, ("admin", "hr"))
     headers = [
         "id", "ad_username", "email", "full_name", "role", "is_active",
-        "employee_id", "employee_code", "job_title", "division", "department", "branch_id", "manager_id",
+        "employee_id", "employee_code", "job_title", "division", "department", "branch_id", "manager_id", "grade", "echelon",
         "position_category", "employment_type", "gender", "phone",
         "acting_for_user_id", "acting_start_date", "acting_end_date", "probation_end_date",
         "rssb_number", "national_id_or_passport",
@@ -2488,7 +2540,7 @@ def export_user_records_csv(current_user_id: str = Depends(get_current_user_id))
         c.execute(
             """
             SELECT id, ad_username, email, full_name, role, is_active,
-                   employee_id, employee_code, job_title, division, department, branch_id, manager_id,
+                   employee_id, employee_code, job_title, division, department, branch_id, manager_id, grade, echelon,
                    position_category, employment_type, gender, phone,
                    acting_for_user_id, acting_start_date, acting_end_date, probation_end_date,
                    rssb_number, national_id_or_passport,
@@ -2510,6 +2562,7 @@ def export_user_records_csv(current_user_id: str = Depends(get_current_user_id))
 @app.post("/users/records/bulk-upsert")
 def bulk_upsert_user_records(
     file: UploadFile = File(...),
+    dry_run: bool = Query(False, description="Preview only; no database writes when true"),
     current_user_id: str = Depends(get_current_user_id),
 ):
     _require_roles(current_user_id, ("admin", "hr"))
@@ -2518,7 +2571,13 @@ def bulk_upsert_user_records(
     try:
         content = file.file.read()
         if isinstance(content, bytes):
-            content = content.decode("utf-8-sig")
+            try:
+                content = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                try:
+                    content = content.decode("cp1252")
+                except UnicodeDecodeError:
+                    content = content.decode("latin-1")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
 
@@ -2542,17 +2601,25 @@ def bulk_upsert_user_records(
     failed = []
     domain = (_get_ldap_config().get("ldap_email_domain") or "copeduplc.rw").strip() or "copeduplc.rw"
 
-    for row in reader:
-        raw = {str(k).strip().lower(): (str(v).strip() if v is not None else "") for k, v in row.items() if k}
+    for line_no, row in enumerate(reader, start=2):
+        raw = _normalize_import_row_keys(row)
         rid = _v(raw, "id")
         ad_username = _v(raw, "ad_username")
         email = _v(raw, "email").lower()
         employee_id = _v(raw, "employee_id")
+        employee_code = _v(raw, "employee_code")
         full_name = _v(raw, "full_name")
-        role = (_v(raw, "role") or "employee").lower()
-        if role not in ("admin", "hr", "manager", "hod", "employee"):
+        first_name = _v(raw, "first_name")
+        last_name = _v(raw, "last_name")
+        if not full_name and (first_name or last_name):
+            full_name = f"{first_name} {last_name}".strip()
+        alt_full_name = f"{last_name} {first_name}".strip() if (first_name or last_name) else ""
+        role_raw = _v(raw, "role")
+        role = role_raw.lower() if role_raw else ""
+        if role and role not in ("admin", "hr", "manager", "hod", "employee"):
             role = "employee"
         target_uid = ""
+        created_this_row = False
         try:
             with cursor() as c:
                 if rid:
@@ -2575,42 +2642,83 @@ def bulk_upsert_user_records(
                     r = c.fetchone()
                     if r:
                         target_uid = str(r[0])
+            if not target_uid and (full_name or alt_full_name or employee_code):
+                matched_user = _leave_find_user_for_import(employee_code, employee_id, email, full_name, alt_full_name)
+                if matched_user and matched_user.get("id"):
+                    target_uid = str(matched_user["id"])
             if not target_uid:
                 if not full_name:
-                    failed.append({"row": raw, "error": "full_name is required for new user"})
+                    failed.append({"line": line_no, "row": raw, "error": "full_name is required for new user"})
                     continue
                 if not email and not ad_username:
-                    failed.append({"row": raw, "error": "email or ad_username is required for new user"})
+                    failed.append({"line": line_no, "row": raw, "error": "Employee not found for update (provide email/ad_username to create new user)."})
                     continue
                 if not email and ad_username:
                     email = f"{ad_username}@{domain}"
-                uid = new_id()
-                password_hash = LDAP_ONLY_PASSWORD_PLACEHOLDER if ad_username else hash_password(f"Temp#{int(_time.time())}{uid[:6]}")
-                with cursor() as c:
-                    c.execute(
-                        """
-                        INSERT INTO users (id, email, password_hash, full_name, role, ad_username, is_active, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (uid, email, password_hash, full_name, role, ad_username or None, 1, _now_iso(), _now_iso()),
-                    )
-                target_uid = uid
+                if not dry_run:
+                    uid = new_id()
+                    password_hash = LDAP_ONLY_PASSWORD_PLACEHOLDER if ad_username else hash_password(f"Temp#{int(_time.time())}{uid[:6]}")
+                    with cursor() as c:
+                        c.execute(
+                            """
+                            INSERT INTO users (id, email, password_hash, full_name, role, ad_username, is_active, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (uid, email, password_hash, full_name, role or "employee", ad_username or None, 1, _now_iso(), _now_iso()),
+                        )
+                    target_uid = uid
                 created += 1
+                created_this_row = True
 
             updates = {}
             for k in ALLOWED_RECORD_FIELDS:
                 val = _v(raw, k)
                 if val != "":
                     updates[k] = val
+            branch_raw = _v(raw, "branch")
+            if branch_raw and not updates.get("branch_id"):
+                resolved_branch_id = _resolve_branch_id_for_import(branch_raw, create_if_missing=(not dry_run))
+                if resolved_branch_id:
+                    updates["branch_id"] = resolved_branch_id
             if full_name:
                 updates["full_name"] = full_name
+            if "gender" in updates:
+                g = str(updates.get("gender") or "").strip().lower()
+                gender_map = {
+                    "m": "male",
+                    "male": "male",
+                    "f": "female",
+                    "female": "female",
+                    "other": "other",
+                    "o": "other",
+                    "prefer_not_say": "prefer_not_say",
+                    "prefer not say": "prefer_not_say",
+                    "prefer not to say": "prefer_not_say",
+                    "n/a": "prefer_not_say",
+                }
+                if g in gender_map:
+                    updates["gender"] = gender_map[g]
+            for dk in ("work_anniversary", "date_of_birth", "acting_start_date", "acting_end_date", "probation_end_date"):
+                if dk in updates:
+                    norm_date = _normalize_import_date_string(updates.get(dk))
+                    if not norm_date:
+                        failed.append({"line": line_no, "row": raw, "error": f"{dk} must be a valid date (YYYY-MM-DD, DD/MM/YYYY, MM/DD/YYYY, or Excel date serial)."})
+                        updates = None
+                        break
+                    updates[dk] = norm_date
+            if updates is None:
+                continue
+            if dry_run:
+                if target_uid and not created_this_row:
+                    updated += 1
+                continue
             if email:
                 with cursor() as c:
                     c.execute("UPDATE users SET email = ?, updated_at = ? WHERE id = ?", (email, _now_iso(), target_uid))
             if ad_username:
                 with cursor() as c:
                     c.execute("UPDATE users SET ad_username = ?, updated_at = ? WHERE id = ?", (ad_username, _now_iso(), target_uid))
-            if role:
+            if role_raw and role:
                 with cursor() as c:
                     c.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", (role, _now_iso(), target_uid))
             if "is_active" in raw:
@@ -2620,10 +2728,21 @@ def bulk_upsert_user_records(
                         c.execute("UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?", (1 if b else 0, _now_iso(), target_uid))
             if updates:
                 patch_user_record(target_uid, EmployeeRecordUpdate(**updates), current_user_id)
-            updated += 1
+            if target_uid and not created_this_row:
+                updated += 1
         except Exception as e:
-            failed.append({"row": raw, "error": str(e)})
-    return {"created": created, "updated": updated, "failed": failed, "total_rows": created + updated + len(failed)}
+            failed.append({"line": line_no, "row": raw, "error": str(e)})
+    return {
+        "dry_run": bool(dry_run),
+        "created": created,
+        "updated": updated,
+        "failed": failed,
+        "total_rows": created + updated + len(failed),
+        "rows_total": created + updated + len(failed),
+        "rows_valid": created + updated,
+        "rows_invalid": len(failed),
+        "rows_applied": 0 if dry_run else (created + updated),
+    }
 
 
 @app.get("/users")
@@ -2817,6 +2936,8 @@ class EmployeeRecordUpdate(BaseModel):
     full_name: str | None = None
     gender: str | None = None
     phone: str | None = None
+    grade: str | None = None
+    echelon: str | None = None
     employee_id: str | None = None
     employee_code: str | None = None
     department: str | None = None
@@ -2847,6 +2968,8 @@ ALLOWED_RECORD_FIELDS = frozenset({
     "full_name",
     "gender",
     "phone",
+    "grade",
+    "echelon",
     "employee_id",
     "employee_code",
     "department",
@@ -2880,6 +3003,8 @@ def _compute_age_stats_for_overview() -> dict:
     labels = {"18_24": "18–24", "25_34": "25–34", "35_44": "35–44", "45_54": "45–54", "55_plus": "55+"}
     ages: list[int] = []
     unknown = 0
+    retirement_due_count = 0
+    retiring_within_12_months_count = 0
     today = date.today()
     try:
         with cursor() as c:
@@ -2910,6 +3035,14 @@ def _compute_age_stats_for_overview() -> dict:
         if y < 16 or y > 100:
             unknown += 1
             continue
+        try:
+            retirement_date = date(b.year + 60, b.month, b.day)
+        except ValueError:
+            retirement_date = date(b.year + 60, 2, 28)
+        if retirement_date <= today:
+            retirement_due_count += 1
+        elif retirement_date <= (today + timedelta(days=365)):
+            retiring_within_12_months_count += 1
         ages.append(y)
         if y <= 24:
             buckets["18_24"] += 1
@@ -2931,7 +3064,31 @@ def _compute_age_stats_for_overview() -> dict:
         "avg": round(sum(ages) / known, 1) if ages else None,
         "known_count": known,
         "unknown_count": unknown,
+        "retirement_due_count": retirement_due_count,
+        "retiring_within_12_months_count": retiring_within_12_months_count,
     }
+
+
+def _derive_position_category_for_staff(role: str | None, job_title: str | None, saved_category: str | None = None) -> str:
+    title = str(job_title or "").strip().lower()
+    r = str(role or "").strip().lower()
+    saved = str(saved_category or "").strip()
+    if title:
+        if "ceo" in title:
+            return "CEO"
+        if "executive director" in title:
+            return "Executive Director"
+        if "branch manager" in title:
+            return "Manager"
+        if "senior officer" in title:
+            return "Senior Officer"
+        if "head" in title:
+            return "Head"
+    if r in ("manager", "hod"):
+        return "Manager" if r == "manager" else "Head"
+    if saved:
+        return saved
+    return "Officer"
 
 
 def _upcoming_work_anniversaries(days: int = 30) -> list[dict]:
@@ -2963,9 +3120,8 @@ def _upcoming_work_anniversaries(days: int = 30) -> list[dict]:
                 except ValueError:
                     next_a = datetime(today.year + 1, 2, 28).date()
             if today <= next_a <= end:
-                years = today.year - hire.year
-                if (today.month, today.day) < (hire.month, hire.day):
-                    years -= 1
+                # Show years reached on the upcoming celebration date (not as of today).
+                years = next_a.year - hire.year
                 out.append(
                     {
                         "user_id": d["id"],
@@ -3027,16 +3183,21 @@ def hr_organization_overview(current_user_id: str = Depends(get_current_user_id)
                 }
             )
     by_position_category: list[dict] = []
+    category_counts: dict[str, int] = {}
     with cursor() as c:
         c.execute(
             """
-            SELECT TRIM(COALESCE(position_category, '')) AS p, COUNT(*) AS n
-            FROM users WHERE is_active = 1
-            GROUP BY p ORDER BY n DESC, p COLLATE NOCASE
+            SELECT role, job_title, position_category
+            FROM users
+            WHERE is_active = 1
             """
         )
         for row in c.fetchall():
-            by_position_category.append({"position_category": (row[0] or "(Not set)"), "count": row[1]})
+            role, job_title, saved_category = row[0], row[1], row[2]
+            cat = _derive_position_category_for_staff(role, job_title, saved_category)
+            category_counts[cat] = int(category_counts.get(cat, 0)) + 1
+    for cat, count in sorted(category_counts.items(), key=lambda x: (-x[1], x[0].lower())):
+        by_position_category.append({"position_category": cat, "count": count})
     by_employment_type: list[dict] = []
     with cursor() as c:
         c.execute(
@@ -8052,6 +8213,185 @@ def _send_app_email(to_addrs: list[str], subject: str, body: str) -> None:
         logger.warning("App email failed (%s): %s", subject, e)
 
 
+def _work_anniversary_emails_enabled() -> bool:
+    env = (os.environ.get("WORK_ANNIVERSARY_EMAIL_ENABLED") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    with cursor() as c:
+        c.execute("SELECT value FROM settings WHERE key = ?", ("work_anniversary_email_enabled",))
+        row = c.fetchone()
+    if row and row[0] is not None and str(row[0]).strip() != "":
+        v = str(row[0]).strip().lower().strip('"')
+        return v in ("1", "true", "yes", "on")
+    # Default: enabled when SMTP is configured.
+    cfg = _get_smtp_config()
+    return bool((cfg.get("host") or "").strip() and (cfg.get("from") or "").strip())
+
+
+def _work_anniversary_target_date_for_hire(hire: date, year: int) -> date:
+    try:
+        return date(year, hire.month, hire.day)
+    except ValueError:
+        # Handle Feb-29 in non-leap years.
+        return date(year, 2, 28)
+
+
+def _work_anniversary_candidates_for_date(target: date) -> list[dict]:
+    rows_out: list[dict] = []
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, full_name, email, work_anniversary
+            FROM users
+            WHERE is_active = 1
+              AND work_anniversary IS NOT NULL
+              AND TRIM(work_anniversary) != ''
+              AND email IS NOT NULL
+              AND TRIM(email) != ''
+            """
+        )
+        for row in c.fetchall():
+            d = row_to_dict(row) or {}
+            raw_hire = str(d.get("work_anniversary") or "").strip()
+            try:
+                hire = datetime.strptime(raw_hire[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if _work_anniversary_target_date_for_hire(hire, target.year) != target:
+                continue
+            email = str(d.get("email") or "").strip()
+            if not _is_deliverable_notification_email(email):
+                continue
+            years = max(0, target.year - hire.year)
+            rows_out.append(
+                {
+                    "user_id": str(d.get("id") or ""),
+                    "full_name": str(d.get("full_name") or "Colleague"),
+                    "email": email,
+                    "work_anniversary": raw_hire,
+                    "years_of_service": years,
+                }
+            )
+    return rows_out
+
+
+def _work_anniversary_email_already_sent(user_id: str, celebration_year: int) -> bool:
+    with cursor() as c:
+        c.execute(
+            "SELECT 1 FROM work_anniversary_email_logs WHERE user_id = ? AND celebration_year = ? LIMIT 1",
+            (user_id, int(celebration_year)),
+        )
+        return bool(c.fetchone())
+
+
+def _record_work_anniversary_email_sent(user_id: str, celebration_year: int, sent_to: str) -> None:
+    with cursor() as c:
+        c.execute(
+            """
+            INSERT OR IGNORE INTO work_anniversary_email_logs (id, user_id, celebration_year, sent_to, sent_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (new_id(), user_id, int(celebration_year), sent_to, _now_iso()),
+        )
+
+
+def _send_work_anniversary_emails_for_date(
+    target: date, dry_run: bool = False, respect_feature_flag: bool = True
+) -> dict:
+    """Send (or preview) work-anniversary emails for hires whose celebration date is `target`.
+
+    When ``respect_feature_flag`` is True (daily job / startup), sending is skipped if automatic
+    anniversary emails are disabled. When False (HR manual endpoint), we still require SMTP to be
+    configured for actual sends; duplicate protection always uses ``work_anniversary_email_logs``.
+    """
+    auto_enabled = _work_anniversary_emails_enabled()
+    base = {
+        "target_date": target.isoformat(),
+        "eligible": 0,
+        "sent": 0,
+        "skipped_duplicate": 0,
+        "preview": [],
+        "automatic_emails_enabled": auto_enabled,
+        "respect_feature_flag": respect_feature_flag,
+    }
+    if respect_feature_flag and not auto_enabled:
+        return {
+            **base,
+            "enabled": False,
+            "detail": "Automatic work anniversary emails are off (settings or env). Use HR manual send to override.",
+        }
+    if not respect_feature_flag and not dry_run:
+        cfg = _get_smtp_config()
+        if not (cfg.get("host") or "").strip() or not (cfg.get("from") or "").strip():
+            return {
+                **base,
+                "enabled": False,
+                "smtp_configured": False,
+                "detail": "SMTP is not configured; cannot send emails.",
+            }
+    candidates = _work_anniversary_candidates_for_date(target)
+    sent = 0
+    skipped_duplicate = 0
+    preview: list[dict] = []
+    for cnd in candidates:
+        uid = cnd["user_id"]
+        if _work_anniversary_email_already_sent(uid, target.year):
+            skipped_duplicate += 1
+            continue
+        years = int(cnd.get("years_of_service") or 0)
+        person = cnd.get("full_name") or "Colleague"
+        year_word = "year" if years == 1 else "years"
+        body = "\n".join(
+            [
+                f"Dear {person},",
+                "",
+                "Happy Work Anniversary!",
+                "",
+                f"Today marks {years} {year_word} of your service with us.",
+                "Thank you for your hard work, dedication, and the value you bring to the team.",
+                "",
+                "Wishing you continued success and many more achievements ahead.",
+                "",
+                "Kind regards,",
+                "HR Suite",
+            ]
+        )
+        subject = f"Happy Work Anniversary, {person}!"
+        preview.append({"user_id": uid, "full_name": person, "email": cnd.get("email"), "years_of_service": years})
+        if not dry_run:
+            _send_app_email([str(cnd.get("email") or "")], subject, body)
+            _record_work_anniversary_email_sent(uid, target.year, str(cnd.get("email") or ""))
+        sent += 1
+    return {
+        "enabled": True,
+        "target_date": target.isoformat(),
+        "eligible": len(candidates),
+        "sent": sent,
+        "skipped_duplicate": skipped_duplicate,
+        "preview": preview[:200],
+        "automatic_emails_enabled": auto_enabled,
+        "respect_feature_flag": respect_feature_flag,
+    }
+
+
+def _work_anniversary_email_loop() -> None:
+    _time.sleep(120)
+    last_run = ""
+    while True:
+        try:
+            today_str = datetime.utcnow().date().isoformat()
+            if today_str != last_run:
+                res = _send_work_anniversary_emails_for_date(datetime.utcnow().date(), dry_run=False)
+                last_run = today_str
+                if res.get("sent"):
+                    logger.info("Work anniversary emails sent: %s", res.get("sent"))
+        except Exception as ex:
+            logger.warning("Work anniversary email loop failed: %s", ex)
+        _time.sleep(3600)
+
+
 def _notification_emails_enabled() -> bool:
     """Feature flag for mirroring in-app notifications to user email.
 
@@ -8411,6 +8751,382 @@ class LeaveTypeAssignCreate(BaseModel):
 
 class LeaveBalanceAdjustmentAction(BaseModel):
     comment: str | None = None
+
+
+LEGACY_IMPORT_HEADER_ALIASES = {
+    "no.": "row_no",
+    "no": "row_no",
+    "last_name": "last_name",
+    "lastname": "last_name",
+    "nom_de_famille": "last_name",
+    "first_name": "first_name",
+    "firstname": "first_name",
+    "prenom": "first_name",
+    "matricule": "employee_code",
+    "code_employe": "employee_code",
+    "code_employe_": "employee_code",
+    "code_employe__": "employee_code",
+    "employee_code": "employee_code",
+    "id_employe": "employee_id",
+    "employee_id": "employee_id",
+    "mail": "email",
+    "e_mail": "email",
+    "adresse_mail": "email",
+    "adresse_email": "email",
+    "nom": "full_name",
+    "noms": "full_name",
+    "nom_et_prenom": "full_name",
+    "nom_prenom": "full_name",
+    "employee_name": "full_name",
+    "employee_names": "full_name",
+    "staff_name": "full_name",
+    "names_and_middle_name": "full_name",
+    "name_and_middle_name": "full_name",
+    "noms_et_prenoms": "full_name",
+    "full_names": "full_name",
+    "name": "full_name",
+    "full_name": "full_name",
+    "departement": "department",
+    "department": "department",
+    "departm": "department",
+    "workplace": "branch",
+    "work_place": "branch",
+    "position": "job_title",
+    "phone_number": "phone",
+    "phone_no": "phone",
+    "grade": "grade",
+    "echelon": "echelon",
+    "fonction": "job_title",
+    "poste": "job_title",
+    "telephone": "phone",
+    "tel": "phone",
+    "sex": "gender",
+    "sexe": "gender",
+    "genre": "gender",
+    "type_conge": "leave_type_code",
+    "conge_type": "leave_type_code",
+    "leave_type": "leave_type_code",
+    "conge_annuel_restant": "remaining_days",
+    "solde_conge": "remaining_days",
+    "remaining": "remaining_days",
+    "remaining_days": "remaining_days",
+    "conge_annuel_utilise": "used_days",
+    "jours_utilises": "used_days",
+    "used": "used_days",
+    "used_days": "used_days",
+    "conge_annuel_alloue": "allocated_days",
+    "jours_alloues": "allocated_days",
+    "allocation": "allocated_days",
+    "allocated": "allocated_days",
+    "allocated_days": "allocated_days",
+    "annee": "year",
+    "year": "year",
+    "date_of_start_of_service": "work_anniversary",
+    "start_of_service": "work_anniversary",
+    "work_ann": "work_anniversary",
+    "work_anni": "work_anniversary",
+    "work_anniv": "work_anniversary",
+    "work_anniversary_(hire_date)": "work_anniversary",
+    "work_anniversary_hire_date": "work_anniversary",
+    "leave_2025": "leave_2025",
+    "leave_taken_2025": "leave_taken_2025",
+    "total": "total",
+    "branch": "branch",
+}
+
+
+def _normalize_import_header_name(raw_key: str) -> str:
+    key = str(raw_key or "").strip().lower()
+    if not key:
+        return ""
+    key = key.replace("-", "_").replace("/", "_")
+    key = re.sub(r"\s+", "_", key)
+    return LEGACY_IMPORT_HEADER_ALIASES.get(key, key)
+
+
+def _normalize_import_row_keys(row: dict) -> dict:
+    out: dict = {}
+    for k, v in (row or {}).items():
+        nk = _normalize_import_header_name(k)
+        if not nk:
+            continue
+        if nk in out and str(out[nk]).strip():
+            continue
+        out[nk] = str(v).strip() if v is not None else ""
+    return out
+
+
+def _csv_num_or_none(v) -> float | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_identifier_token(v: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    # Excel often exports numeric IDs as 12345.0; strip trailing .0 safely.
+    if re.fullmatch(r"\d+\.0+", s):
+        return s.split(".", 1)[0]
+    return s
+
+
+def _normalize_import_date_string(v: str) -> str | None:
+    s = str(v or "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    # Excel serial date support (days since 1899-12-30).
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        try:
+            serial = float(s)
+            base = datetime(1899, 12, 30)
+            d = base + timedelta(days=serial)
+            return d.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    # Common legacy formats.
+    fmts = (
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%m-%d-%Y",
+        "%Y-%m-%d",
+        "%d/%m/%y",
+        "%m/%d/%y",
+    )
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_branch_id_for_import(branch_value: str, create_if_missing: bool = False) -> str | None:
+    v = str(branch_value or "").strip()
+    if not v:
+        return None
+    v_norm = re.sub(r"[^a-z0-9]", "", v.lower())
+    with cursor() as c:
+        c.execute(
+            """
+            SELECT id, name, code
+            FROM branches
+            WHERE COALESCE(TRIM(name), '') != '' OR COALESCE(TRIM(code), '') != ''
+            """,
+        )
+        rows = c.fetchall() or []
+    # strict equality by name/code first
+    for row in rows:
+        name = str(row[1] or "").strip()
+        code = str(row[2] or "").strip()
+        if name.lower() == v.lower() or code.lower() == v.lower():
+            return str(row[0])
+    # normalized fallback: ignore spaces/hyphens/underscores
+    if v_norm:
+        for row in rows:
+            name_norm = re.sub(r"[^a-z0-9]", "", str(row[1] or "").lower())
+            code_norm = re.sub(r"[^a-z0-9]", "", str(row[2] or "").lower())
+            if name_norm == v_norm or code_norm == v_norm:
+                return str(row[0])
+        # contains fallback for legacy short forms like "NYABUGOGO"
+        for row in rows:
+            name_norm = re.sub(r"[^a-z0-9]", "", str(row[1] or "").lower())
+            if name_norm and (v_norm in name_norm or name_norm in v_norm):
+                return str(row[0])
+    if create_if_missing:
+        now = _now_iso()
+        bid = new_id()
+        code_guess = re.sub(r"[^A-Za-z0-9]", "", v).upper()[:6]
+        with cursor() as c:
+            code_to_use = code_guess or None
+            if code_to_use:
+                c.execute("SELECT id FROM branches WHERE LOWER(TRIM(COALESCE(code, ''))) = LOWER(TRIM(?)) LIMIT 1", (code_to_use,))
+                if c.fetchone():
+                    code_to_use = None
+            c.execute(
+                "INSERT INTO branches (id, name, code, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (bid, v, code_to_use, "", now, now),
+            )
+        return bid
+    return None
+
+
+def _normalize_person_name(v: str) -> str:
+    s = str(v or "").strip().lower()
+    if not s:
+        return ""
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _name_tokens(v: str) -> set[str]:
+    n = _normalize_person_name(v)
+    if not n:
+        return set()
+    return {t for t in n.split(" ") if t}
+
+
+def _normalize_person_name_compact(v: str) -> str:
+    return _normalize_person_name(v).replace(" ", "")
+
+
+def _leave_find_user_for_import(employee_code: str, employee_id: str, email: str, full_name: str = "", alt_full_name: str = "") -> dict | None:
+    employee_code = _normalize_identifier_token(employee_code)
+    employee_id = _normalize_identifier_token(employee_id)
+    with cursor() as c:
+        if employee_code:
+            c.execute(
+                """
+                SELECT id, full_name, email, employee_id, employee_code
+                FROM users
+                WHERE is_active = 1 AND LOWER(TRIM(COALESCE(employee_code, ''))) = LOWER(TRIM(?))
+                LIMIT 1
+                """,
+                (employee_code,),
+            )
+            row = c.fetchone()
+            if row:
+                return row_to_dict(row)
+        if employee_id:
+            c.execute(
+                """
+                SELECT id, full_name, email, employee_id, employee_code
+                FROM users
+                WHERE is_active = 1 AND LOWER(TRIM(COALESCE(employee_id, ''))) = LOWER(TRIM(?))
+                LIMIT 1
+                """,
+                (employee_id,),
+            )
+            row = c.fetchone()
+            if row:
+                return row_to_dict(row)
+        if email:
+            c.execute(
+                """
+                SELECT id, full_name, email, employee_id, employee_code
+                FROM users
+                WHERE is_active = 1 AND LOWER(TRIM(COALESCE(email, ''))) = LOWER(TRIM(?))
+                LIMIT 1
+                """,
+                (email,),
+            )
+            row = c.fetchone()
+            if row:
+                return row_to_dict(row)
+        candidate_names = [str(full_name or "").strip(), str(alt_full_name or "").strip()]
+        candidate_names = [n for n in candidate_names if n]
+        if candidate_names:
+            # direct full_name exact match first
+            for nm in candidate_names:
+                c.execute(
+                    """
+                    SELECT id, full_name, email, employee_id, employee_code
+                    FROM users
+                    WHERE is_active = 1 AND LOWER(TRIM(COALESCE(full_name, ''))) = LOWER(TRIM(?))
+                    LIMIT 1
+                    """,
+                    (nm,),
+                )
+                row = c.fetchone()
+                if row:
+                    return row_to_dict(row)
+
+            c.execute(
+                """
+                SELECT id, full_name, email, employee_id, employee_code
+                FROM users
+                WHERE is_active = 1 AND full_name IS NOT NULL AND TRIM(full_name) != ''
+                """,
+            )
+            candidates = c.fetchall() or []
+            for nm in candidate_names:
+                full_name_norm = _normalize_person_name(nm)
+                full_name_compact = _normalize_person_name_compact(nm)
+                if not full_name_norm:
+                    continue
+                exact_hit = None
+                contains_hit = None
+                for candidate in candidates:
+                    cdict = row_to_dict(candidate) or {}
+                    cand_name_norm = _normalize_person_name(cdict.get("full_name") or "")
+                    cand_name_compact = _normalize_person_name_compact(cdict.get("full_name") or "")
+                    if not cand_name_norm:
+                        continue
+                    if cand_name_norm == full_name_norm:
+                        exact_hit = cdict
+                        break
+                    if full_name_compact and cand_name_compact and cand_name_compact == full_name_compact:
+                        exact_hit = cdict
+                        break
+                    if full_name_norm in cand_name_norm or cand_name_norm in full_name_norm:
+                        if contains_hit is None:
+                            contains_hit = cdict
+                if contains_hit:
+                    return contains_hit
+                # Lastname/firstname order can differ between legacy files and system.
+                # Fall back to token-overlap matching and accept only a unique strong hit.
+                src_tokens = _name_tokens(nm)
+                if src_tokens:
+                    token_hits: list[dict] = []
+                    for candidate in candidates:
+                        cdict = row_to_dict(candidate) or {}
+                        cand_tokens = _name_tokens(cdict.get("full_name") or "")
+                        if not cand_tokens:
+                            continue
+                        overlap = len(src_tokens.intersection(cand_tokens))
+                        if overlap >= 2 or (len(src_tokens) == 1 and overlap == 1):
+                            token_hits.append(cdict)
+                    if len(token_hits) == 1:
+                        return token_hits[0]
+                if exact_hit:
+                    return exact_hit
+    return None
+
+
+def _leave_find_type_for_import(leave_type_code: str, leave_type_name: str) -> dict | None:
+    with cursor() as c:
+        if leave_type_code:
+            c.execute(
+                """
+                SELECT id, code, name
+                FROM leave_types
+                WHERE COALESCE(CAST(is_active AS INTEGER), 0) = 1
+                  AND LOWER(TRIM(COALESCE(code, ''))) = LOWER(TRIM(?))
+                LIMIT 1
+                """,
+                (leave_type_code,),
+            )
+            row = c.fetchone()
+            if row:
+                return row_to_dict(row)
+        if leave_type_name:
+            c.execute(
+                """
+                SELECT id, code, name
+                FROM leave_types
+                WHERE COALESCE(CAST(is_active AS INTEGER), 0) = 1
+                  AND LOWER(TRIM(COALESCE(name, ''))) = LOWER(TRIM(?))
+                LIMIT 1
+                """,
+                (leave_type_name,),
+            )
+            row = c.fetchone()
+            if row:
+                return row_to_dict(row)
+    return None
 
 
 def _leave_balance_adjustment_row(adjustment_id: str) -> dict | None:
@@ -10234,6 +10950,204 @@ def leave_hr_recompute_statutory_annual(
         "ok": True,
         "year": y,
         "detail": "Year-end rollover applied: each leave type now uses current-year base entitlement plus carry-over from previous-year remaining days.",
+    }
+
+
+@app.post("/leave/hr/balances/import")
+async def leave_hr_import_balances(
+    file: UploadFile = File(...),
+    dry_run: bool = Query(True, description="Preview only; no database writes when true"),
+    default_year: int | None = Query(None, description="Fallback year when CSV row year is blank"),
+    user_id: str = Depends(get_current_user_id),
+):
+    current = _get_user_profile_min(user_id)
+    if not current or current.get("role") not in ("hr", "admin"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    name = (file.filename or "").lower()
+    if not name.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a CSV file exported from Excel.")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV header row is missing.")
+
+    year_fallback = int(default_year or datetime.utcnow().year)
+    if year_fallback < 1990 or year_fallback > 2100:
+        raise HTTPException(status_code=400, detail="default_year out of range.")
+
+    rows = list(reader)
+    if not rows:
+        raise HTTPException(status_code=400, detail="No data rows found in CSV.")
+
+    errors: list[dict] = []
+    updates: list[dict] = []
+    seen_keys: set[tuple] = set()
+    for idx, row in enumerate(rows, start=2):
+        row = _normalize_import_row_keys(row)
+        if not any(str(v or "").strip() for v in row.values()):
+            continue
+        employee_code = (row.get("employee_code") or "").strip()
+        employee_id = (row.get("employee_id") or "").strip()
+        email = (row.get("email") or "").strip()
+        first_name = (row.get("first_name") or "").strip()
+        last_name = (row.get("last_name") or "").strip()
+        full_name = (row.get("full_name") or "").strip() or f"{first_name} {last_name}".strip()
+        alt_full_name = f"{last_name} {first_name}".strip() if (first_name or last_name) else ""
+        if not full_name:
+            for k, v in row.items():
+                kk = str(k or "").lower()
+                if ("name" in kk or "nom" in kk) and str(v or "").strip():
+                    full_name = str(v).strip()
+                    break
+        leave_type_code = (row.get("leave_type_code") or "").strip() or "ANNUAL"
+        leave_type_name = (row.get("leave_type_name") or "").strip()
+        total_val = _csv_num_or_none(row.get("total"))
+        leave_2025_val = _csv_num_or_none(row.get("leave_2025"))
+        leave_taken_2025_val = _csv_num_or_none(row.get("leave_taken_2025"))
+
+        if not (employee_code or employee_id or email or full_name):
+            errors.append({"line": idx, "error": "Provide employee_id, email, or full name."})
+            continue
+        if not (leave_type_code or leave_type_name):
+            errors.append({"line": idx, "error": "Provide leave_type_code or leave_type_name (or leave blank to default to ANNUAL)."})
+            continue
+
+        yr_raw = (row.get("year") or "").strip()
+        try:
+            yr = int(yr_raw) if yr_raw else year_fallback
+        except ValueError:
+            errors.append({"line": idx, "error": "Year must be a number."})
+            continue
+        if yr < 1990 or yr > 2100:
+            errors.append({"line": idx, "error": "Year out of range (1990-2100)."})
+            continue
+
+        remaining = _csv_num_or_none(row.get("remaining_days"))
+        allocated = _csv_num_or_none(row.get("allocated_days"))
+        used = _csv_num_or_none(row.get("used_days"))
+        has_explicit_allocated = str(row.get("allocated_days") or "").strip() != ""
+        has_explicit_used = str(row.get("used_days") or "").strip() != ""
+        if allocated is None:
+            # Legacy sheet uses TOTAL as annual allocation baseline.
+            allocated = total_val if total_val is not None else leave_2025_val
+        if used is None:
+            used = leave_taken_2025_val
+        if remaining is None:
+            errors.append({"line": idx, "error": "remaining_days is required and must be numeric."})
+            continue
+        if remaining < 0:
+            errors.append({"line": idx, "error": "remaining_days cannot be negative."})
+            continue
+
+        user_row = _leave_find_user_for_import(employee_code, employee_id, email, full_name, alt_full_name)
+        if not user_row:
+            errors.append({"line": idx, "error": "Employee not found or inactive."})
+            continue
+        leave_type_row = _leave_find_type_for_import(leave_type_code, leave_type_name)
+        if not leave_type_row:
+            errors.append({"line": idx, "error": "Leave type not found or inactive."})
+            continue
+
+        key = (str(user_row["id"]), str(leave_type_row["id"]), int(yr))
+        if key in seen_keys:
+            errors.append({"line": idx, "error": "Duplicate employee/leave_type/year row in the same file."})
+            continue
+        seen_keys.add(key)
+
+        if used is None:
+            with cursor() as c:
+                c.execute(
+                    "SELECT used_days FROM leave_balances WHERE user_id = ? AND leave_type_id = ? AND year = ?",
+                    (user_row["id"], leave_type_row["id"], yr),
+                )
+                ex = c.fetchone()
+            used = float((ex[0] if ex else 0) or 0)
+        if used < 0:
+            errors.append({"line": idx, "error": "used_days cannot be negative."})
+            continue
+        # Migration default: when explicit allocated/used columns are not provided,
+        # store the uploaded remaining as the usable balance in-system.
+        if not has_explicit_allocated and not has_explicit_used:
+            used = 0.0
+            alloc = float(remaining)
+        else:
+            # If explicit values are provided, keep accounting identity.
+            alloc = remaining + used
+        if alloc < 0:
+            errors.append({"line": idx, "error": "allocated_days cannot be negative after recompute."})
+            continue
+
+        updates.append(
+            {
+                "line": idx,
+                "user_id": user_row["id"],
+                "employee_code": user_row.get("employee_code"),
+                "employee_name": user_row.get("full_name"),
+                "leave_type_id": leave_type_row["id"],
+                "leave_type_code": leave_type_row.get("code"),
+                "leave_type_name": leave_type_row.get("name"),
+                "year": yr,
+                "allocated_days": round(float(alloc), 2),
+                "used_days": round(float(used), 2),
+                "remaining_days": round(float(remaining), 2),
+            }
+        )
+
+    applied = 0
+    if not dry_run and updates:
+        now = _now_iso()
+        with cursor() as c:
+            for u in updates:
+                c.execute(
+                    """
+                    SELECT id FROM leave_balances
+                    WHERE user_id = ? AND leave_type_id = ? AND year = ?
+                    """,
+                    (u["user_id"], u["leave_type_id"], u["year"]),
+                )
+                row_id = c.fetchone()
+                if row_id:
+                    c.execute(
+                        """
+                        UPDATE leave_balances
+                        SET allocated_days = ?, used_days = ?, remaining_days = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (u["allocated_days"], u["used_days"], u["remaining_days"], now, row_id[0]),
+                    )
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO leave_balances (
+                            id, user_id, leave_type_id, year, allocated_days, used_days, remaining_days, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (new_id(), u["user_id"], u["leave_type_id"], u["year"], u["allocated_days"], u["used_days"], u["remaining_days"], now, now),
+                    )
+                applied += 1
+        _audit_log(
+            "leave_balance_import_applied",
+            "leave_balances",
+            user_id,
+            None,
+            {"rows_applied": applied, "rows_invalid": len(errors), "filename": file.filename},
+        )
+
+    return {
+        "dry_run": bool(dry_run),
+        "filename": file.filename,
+        "rows_total": len(rows),
+        "rows_valid": len(updates),
+        "rows_invalid": len(errors),
+        "rows_applied": applied,
+        "errors": errors[:200],
+        "preview": updates[:200],
     }
 
 

@@ -65,8 +65,8 @@ const authSlice = createSlice({
       })
       .addCase(loadSession.rejected, (state, { payload }) => {
         state.loading = false;
-        state.user = null;
-        state.profile = null;
+        // Preserve current session on transient API/network errors.
+        // Real logout is still handled on explicit 401 flow.
         state.error = payload;
       })
       .addCase(login.pending, (state) => { state.loading = true; state.error = null; })
